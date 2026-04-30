@@ -1,0 +1,42 @@
+# Dependencies and package manager state
+node_modules/
+package-lock.json
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local configuration and secrets
+.env
+.env.*
+.npmrc
+
+# VCS and editor files
+.git/
+.github/
+.gitignore
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build, cache, coverage, and temporary output
+dist/
+build/
+coverage/
+.nyc_output/
+.cache/
+.vite/
+.next/
+tmp/
+temp/
+*.tgz
+imgs/
+
+# Tests and local-only fixtures
+test/
+tests/
+__tests__/
+*.test.js
+*.spec.js

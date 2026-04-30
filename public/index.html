@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Codex Remote</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <div class="title">Codex Remote</div>
+        <div id="subtitle" class="subtitle">Connecting</div>
+      </div>
+      <button id="refreshButton" class="icon-button" type="button" title="Refresh screenshot">↻</button>
+    </header>
+
+    <main class="viewport">
+      <div id="screenWrap" class="screen-wrap">
+        <canvas id="screen" class="screen" aria-label="Codex app screen" hidden></canvas>
+        <div id="emptyState" class="empty-state">Waiting for CDP screencast</div>
+      </div>
+    </main>
+
+    <textarea
+      id="keyboardProxy"
+      class="keyboard-proxy"
+      aria-label="Keyboard input proxy"
+      autocomplete="off"
+      autocapitalize="none"
+      spellcheck="false"
+      inputmode="text"
+    ></textarea>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

@@ -1,0 +1,36 @@
+{
+  "name": "codex-app-remotely",
+  "version": "1.0.0",
+  "description": "Launch and control the local Codex Electron app remotely from a mobile browser.",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "car": "src/server.js"
+  },
+  "files": [
+    "imgs",
+    "public",
+    "src",
+    "README.md",
+    "README.zh-CN.md"
+  ],
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "check": "node --check src/*.js public/app.js"
+  },
+  "keywords": [
+    "codex",
+    "electron",
+    "cdp",
+    "remote-control"
+  ],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  }
+}
