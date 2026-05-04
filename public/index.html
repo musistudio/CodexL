@@ -3,16 +3,21 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <title>Codex Remote</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <title>Remote Control</title>
+    <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <header class="topbar">
-      <div>
-        <div class="title">Codex Remote</div>
-        <div id="subtitle" class="subtitle">Connecting</div>
+      <div id="subtitle" class="subtitle">Connecting</div>
+      <div class="topbar-actions">
+        <select id="qualitySelect" class="quality-select" aria-label="Quality">
+          <option value="auto">Auto</option>
+          <option value="good">Quality</option>
+          <option value="medium">Smooth</option>
+          <option value="bad">Saver</option>
+        </select>
+        <button id="refreshButton" class="icon-button" type="button" title="Refresh screenshot">↻</button>
       </div>
-      <button id="refreshButton" class="icon-button" type="button" title="Refresh screenshot">↻</button>
     </header>
 
     <main class="viewport">
@@ -32,6 +37,6 @@
       inputmode="text"
     ></textarea>
 
-    <script src="/app.js" type="module"></script>
+    <script src="app.js" type="module"></script>
   </body>
 </html>

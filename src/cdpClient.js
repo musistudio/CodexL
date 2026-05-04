@@ -4,30 +4,67 @@ const CONNECT_RETRY_MS = 1200;
 const COMMAND_TIMEOUT_MS = 7000;
 const EDITABLE_RECTS_CACHE_MS = 800;
 const METRICS_CACHE_MS = 3000;
+const SCREENCAST_RESTART_DEBOUNCE_MS = 250;
+const SCREENCAST_PROFILE_HYSTERESIS_MS = 4000;
+const SCREENCAST_PROFILES = {
+  good: {
+    everyNthFrame: 2,
+    maxHeight: 900,
+    maxWidth: 1440,
+    name: "good",
+    quality: 74,
+  },
+  medium: {
+    everyNthFrame: 2,
+    maxHeight: 720,
+    maxWidth: 1080,
+    name: "medium",
+    quality: 60,
+  },
+  bad: {
+    everyNthFrame: 4,
+    maxHeight: 480,
+    maxWidth: 720,
+    name: "bad",
+    quality: 42,
+  },
+};
 
 export class CdpBridge extends EventEmitter {
   constructor(config, logger = console) {
     super();
+    this.activeScreencastProfileName = null;
     this.config = config;
     this.logger = logger;
     this.connected = false;
     this.connecting = false;
     this.currentTarget = null;
+    this.clientViewport = null;
+    this.desiredScreencastProfileName = "good";
     this.editableRectsPromise = null;
     this.lastEditableRects = [];
     this.lastEditableRectsAt = 0;
     this.lastMetrics = null;
     this.lastMetricsAt = 0;
     this.lastScreenshotAt = 0;
-    this.lastScreencastAckAt = 0;
+    this.lastViewportOverrideKey = "";
     this.pending = new Map();
-    this.pendingScreencastAck = null;
+    this.pendingScreencastProfileName = null;
+    this.pendingScreencastProfileSince = 0;
+    this.profileRestartPromise = null;
     this.requestId = 1;
     this.retryTimer = null;
     this.screencastActive = false;
-    this.screencastAckTimer = null;
+    this.screencastProfileMode = "auto";
+    this.screencastRestartTimer = null;
     this.screencastStartPromise = null;
     this.streamingEnabled = false;
+    this.networkStats = {
+      bufferedAmount: 0,
+      droppedFramesInLast5s: 0,
+      frameClientCount: 0,
+      rtt: null,
+    };
     this.warningState = { key: "", ts: 0 };
     this.ws = null;
   }
@@ -38,14 +75,22 @@ export class CdpBridge extends EventEmitter {
 
   stop() {
     clearTimeout(this.retryTimer);
+    clearTimeout(this.screencastRestartTimer);
+    this.screencastRestartTimer = null;
     this.closeSocket();
   }
 
   status() {
     return {
       cdpUrl: `http://${this.config.cdpHost}:${this.config.cdpPort}`,
+      captureViewport: this.captureViewportSize(),
+      clientViewport: this.clientViewport,
       connected: this.connected,
+      network: this.networkStats,
       screencastActive: this.screencastActive,
+      screencastProfile: this.activeScreencastProfileName || this.desiredScreencastProfileName,
+      screencastProfileMode: this.screencastProfileMode,
+      screencastProfileSettings: this.screencastProfile(),
       streamingEnabled: this.streamingEnabled,
       target: this.currentTarget,
     };
@@ -129,6 +174,16 @@ export class CdpBridge extends EventEmitter {
     await this.send("Input.dispatchKeyEvent", { ...event, type: "keyUp" });
   }
 
+  async pointerMove(normalizedX, normalizedY) {
+    const point = await this.pointFromNormalized(normalizedX, normalizedY);
+    await this.send("Input.dispatchMouseEvent", {
+      button: "none",
+      type: "mouseMoved",
+      x: point.x,
+      y: point.y,
+    });
+  }
+
   async isEditableAt(normalizedX, normalizedY) {
     const point = await this.pointFromNormalized(normalizedX, normalizedY);
     const result = await this.send("Runtime.evaluate", {
@@ -190,7 +245,7 @@ export class CdpBridge extends EventEmitter {
       this.lastScreenshotAt = Date.now();
 
       this.emit("screenshot", {
-        data: screenshot.data,
+        bytes: Buffer.from(screenshot.data, "base64"),
         format: "jpeg",
         metrics,
         target: this.currentTarget,
@@ -300,22 +355,28 @@ export class CdpBridge extends EventEmitter {
       return;
     }
 
-    this.screencastStartPromise = this.send("Page.startScreencast", {
-      everyNthFrame: this.config.screencastEveryNthFrame,
-      format: "jpeg",
-      maxHeight: this.config.screenshotMaxHeight,
-      maxWidth: this.config.screenshotMaxWidth,
-      quality: this.config.screenshotQuality,
-    }).then(async () => {
+    this.screencastStartPromise = (async () => {
+      await this.applyClientViewportOverride();
+      const profile = this.screencastProfile();
+      await this.send("Page.startScreencast", {
+        everyNthFrame: profile.everyNthFrame,
+        format: profile.format,
+        maxHeight: profile.maxHeight,
+        maxWidth: profile.maxWidth,
+        quality: profile.quality,
+      });
+
       this.screencastActive = true;
+      this.activeScreencastProfileName = profile.name;
+      this.emit("profile", profile);
       this.emit("status", this.status());
-      this.logger.log("[cdp] screencast started");
+      this.logger.log(`[cdp] screencast started (${profile.name}: ${profile.maxWidth}x${profile.maxHeight}, q${profile.quality}, every ${profile.everyNthFrame})`);
       this.scheduleInitialScreenshotFallback();
 
       if (!this.streamingEnabled) {
         await this.stopScreencast();
       }
-    }).finally(() => {
+    })().finally(() => {
       this.screencastStartPromise = null;
     });
 
@@ -332,11 +393,8 @@ export class CdpBridge extends EventEmitter {
     }
 
     if (!this.screencastActive) {
-      this.clearScreencastAck();
       return;
     }
-
-    await this.flushScreencastAck();
 
     try {
       await this.send("Page.stopScreencast");
@@ -344,7 +402,7 @@ export class CdpBridge extends EventEmitter {
       this.emitWarning(`screencast stop failed: ${error.message}`);
     } finally {
       this.screencastActive = false;
-      this.clearScreencastAck();
+      this.activeScreencastProfileName = null;
       this.emit("status", this.status());
       this.logger.log("[cdp] screencast stopped");
     }
@@ -362,6 +420,173 @@ export class CdpBridge extends EventEmitter {
     }
 
     await this.startScreencast();
+  }
+
+  updateNetworkStats(stats = {}) {
+    const rtt = stats.rtt;
+    this.networkStats = {
+      bufferedAmount: Math.max(0, Number(stats.bufferedAmount || 0)),
+      droppedFramesInLast5s: Math.max(0, Number(stats.droppedFramesInLast5s || 0)),
+      frameClientCount: Math.max(0, Number(stats.frameClientCount || 0)),
+      rtt: rtt !== null && rtt !== undefined && Number.isFinite(Number(rtt)) ? Math.max(0, Number(rtt)) : null,
+    };
+    this.maybeUpdateScreencastProfile();
+  }
+
+  maybeUpdateScreencastProfile() {
+    const networkProfileName = profileNameForNetwork(this.networkStats);
+    const profileName = profileNameForMode(this.screencastProfileMode, networkProfileName);
+    const now = Date.now();
+
+    if (profileName === this.desiredScreencastProfileName) {
+      this.pendingScreencastProfileName = null;
+      this.pendingScreencastProfileSince = 0;
+      return;
+    }
+
+    if (profileName !== this.pendingScreencastProfileName) {
+      this.pendingScreencastProfileName = profileName;
+      this.pendingScreencastProfileSince = now;
+      return;
+    }
+
+    if (now - this.pendingScreencastProfileSince < SCREENCAST_PROFILE_HYSTERESIS_MS) {
+      return;
+    }
+
+    void this.switchScreencastProfile(profileName);
+  }
+
+  async setScreencastProfileMode(mode) {
+    const normalizedMode = String(mode || "auto");
+    if (normalizedMode !== "auto" && !SCREENCAST_PROFILES[normalizedMode]) {
+      throw new Error(`unknown screencast profile mode: ${mode}`);
+    }
+
+    this.screencastProfileMode = normalizedMode;
+    this.pendingScreencastProfileName = null;
+    this.pendingScreencastProfileSince = 0;
+
+    if (normalizedMode === "auto") {
+      this.emit("status", this.status());
+      this.maybeUpdateScreencastProfile();
+      return;
+    }
+
+    await this.switchScreencastProfile(profileNameForMode(normalizedMode, profileNameForNetwork(this.networkStats)));
+  }
+
+  setClientViewport(viewport) {
+    const nextViewport = normalizeClientViewport(viewport);
+    if (!nextViewport) {
+      return;
+    }
+
+    const currentProfile = this.screencastProfile();
+    const currentCaptureViewport = this.captureViewportSize();
+    if (sameClientViewport(this.clientViewport, nextViewport)) {
+      return;
+    }
+
+    this.clientViewport = nextViewport;
+    const nextProfile = this.screencastProfile();
+    const nextCaptureViewport = this.captureViewportSize();
+    this.emit("status", this.status());
+
+    if (profileSizeChanged(currentProfile, nextProfile) || profileSizeChanged(currentCaptureViewport, nextCaptureViewport)) {
+      this.scheduleScreencastRestart("viewport");
+    }
+  }
+
+  async switchScreencastProfile(profileName) {
+    if (!SCREENCAST_PROFILES[profileName]) {
+      return;
+    }
+
+    if (profileName === this.desiredScreencastProfileName && profileName === this.activeScreencastProfileName) {
+      this.emit("status", this.status());
+      return;
+    }
+
+    this.desiredScreencastProfileName = profileName;
+    this.pendingScreencastProfileName = null;
+    this.pendingScreencastProfileSince = 0;
+
+    if (this.profileRestartPromise) {
+      this.emit("status", this.status());
+      return;
+    }
+
+    if (!this.connected || !this.streamingEnabled || !this.screencastActive) {
+      this.emit("status", this.status());
+      return;
+    }
+
+    this.profileRestartPromise = (async () => {
+      const profile = this.screencastProfile();
+      this.logger.log(`[cdp] switching screencast profile to ${profile.name}`);
+      await this.stopScreencast();
+      if (this.connected && this.streamingEnabled) {
+        await this.startScreencast();
+      }
+    })().catch((error) => {
+      this.emitWarning(`screencast profile switch failed: ${error.message}`);
+    }).finally(() => {
+      this.profileRestartPromise = null;
+    });
+
+    await this.profileRestartPromise;
+  }
+
+  scheduleScreencastRestart(reason) {
+    if (!this.connected || !this.streamingEnabled || !this.screencastActive) {
+      return;
+    }
+
+    clearTimeout(this.screencastRestartTimer);
+    this.screencastRestartTimer = setTimeout(() => {
+      this.screencastRestartTimer = null;
+      if (this.profileRestartPromise || this.screencastStartPromise || !this.connected || !this.streamingEnabled || !this.screencastActive) {
+        return;
+      }
+
+      this.logger.log(`[cdp] restarting screencast for ${reason}`);
+      void this.restartScreencast();
+    }, SCREENCAST_RESTART_DEBOUNCE_MS);
+    this.screencastRestartTimer.unref?.();
+  }
+
+  async applyClientViewportOverride() {
+    const size = this.captureViewportSize();
+    if (!this.connected || !size) {
+      return;
+    }
+
+    const key = `${size.width}x${size.height}`;
+    if (key === this.lastViewportOverrideKey) {
+      return;
+    }
+
+    try {
+      await this.send("Emulation.setDeviceMetricsOverride", {
+        deviceScaleFactor: 1,
+        height: size.height,
+        mobile: false,
+        screenHeight: size.height,
+        screenOrientation: {
+          angle: size.height >= size.width ? 0 : 90,
+          type: size.height >= size.width ? "portraitPrimary" : "landscapePrimary",
+        },
+        screenWidth: size.width,
+        width: size.width,
+      });
+      this.lastViewportOverrideKey = key;
+      this.lastMetrics = null;
+      this.lastMetricsAt = 0;
+      this.logger.log(`[cdp] viewport override ${key}`);
+    } catch (error) {
+      this.emitWarning(`viewport override failed: ${error.message}`);
+    }
   }
 
   async pointFromNormalized(normalizedX, normalizedY) {
@@ -406,13 +631,14 @@ export class CdpBridge extends EventEmitter {
   }
 
   screenshotParams(metrics) {
-    const maxWidth = this.config.screenshotMaxWidth || metrics.width;
-    const maxHeight = this.config.screenshotMaxHeight || metrics.height;
+    const profile = this.screencastProfile();
+    const maxWidth = profile.maxWidth || metrics.width;
+    const maxHeight = profile.maxHeight || metrics.height;
     const imageScale = Math.min(1, maxWidth / metrics.width, maxHeight / metrics.height);
     const params = {
       captureBeyondViewport: false,
       format: "jpeg",
-      quality: this.config.screenshotQuality,
+      quality: profile.quality,
     };
 
     if (imageScale < 0.999) {
@@ -500,7 +726,7 @@ export class CdpBridge extends EventEmitter {
 
   handleScreencastFrame({ data, metadata = {}, sessionId }) {
     if (sessionId !== undefined) {
-      this.scheduleScreencastAck(sessionId, { immediate: !this.streamingEnabled });
+      void this.sendScreencastAck(sessionId);
     }
 
     if (!data || !this.streamingEnabled) {
@@ -515,7 +741,7 @@ export class CdpBridge extends EventEmitter {
     this.refreshEditableRects();
 
     this.emit("screenshot", {
-      data,
+      bytes: Buffer.from(data, "base64"),
       editableRects,
       format: "jpeg",
       metadata,
@@ -548,14 +774,17 @@ export class CdpBridge extends EventEmitter {
   }
 
   closeSocket() {
+    clearTimeout(this.screencastRestartTimer);
+    this.screencastRestartTimer = null;
     this.screencastActive = false;
-    this.clearScreencastAck();
+    this.activeScreencastProfileName = null;
     this.editableRectsPromise = null;
     this.lastEditableRects = [];
     this.lastEditableRectsAt = 0;
     this.lastMetrics = null;
     this.lastMetricsAt = 0;
     this.lastScreenshotAt = 0;
+    this.lastViewportOverrideKey = "";
 
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timeout);
@@ -574,58 +803,12 @@ export class CdpBridge extends EventEmitter {
     }
   }
 
-  scheduleScreencastAck(sessionId, { immediate = false } = {}) {
-    if (this.pendingScreencastAck !== null && this.pendingScreencastAck !== sessionId) {
-      void this.sendScreencastAck(this.pendingScreencastAck);
-    }
-
-    this.pendingScreencastAck = sessionId;
-    clearTimeout(this.screencastAckTimer);
-    this.screencastAckTimer = null;
-
-    const maxFps = Math.max(1, Number(this.config.screencastMaxFps || 1));
-    const minInterval = immediate ? 0 : Math.floor(1000 / maxFps);
-    const elapsed = Date.now() - this.lastScreencastAckAt;
-    const delay = Math.max(0, minInterval - elapsed);
-
-    if (delay === 0) {
-      void this.flushScreencastAck();
-      return;
-    }
-
-    this.screencastAckTimer = setTimeout(() => {
-      this.screencastAckTimer = null;
-      void this.flushScreencastAck();
-    }, delay);
-    this.screencastAckTimer.unref?.();
-  }
-
-  async flushScreencastAck() {
-    clearTimeout(this.screencastAckTimer);
-    this.screencastAckTimer = null;
-
-    const sessionId = this.pendingScreencastAck;
-    this.pendingScreencastAck = null;
-    if (sessionId === null) {
-      return;
-    }
-
-    await this.sendScreencastAck(sessionId);
-  }
-
   async sendScreencastAck(sessionId) {
-    this.lastScreencastAckAt = Date.now();
     try {
       await this.send("Page.screencastFrameAck", { sessionId });
     } catch (error) {
       this.emitWarning(`screencast ack failed: ${error.message}`);
     }
-  }
-
-  clearScreencastAck() {
-    clearTimeout(this.screencastAckTimer);
-    this.screencastAckTimer = null;
-    this.pendingScreencastAck = null;
   }
 
   scheduleInitialScreenshotFallback() {
@@ -646,6 +829,23 @@ export class CdpBridge extends EventEmitter {
   cdpUrl(pathname) {
     return `http://${this.config.cdpHost}:${this.config.cdpPort}${pathname}`;
   }
+
+  captureViewportSize() {
+    return captureViewportSizeForClient(this.config, this.clientViewport);
+  }
+
+  screencastProfile() {
+    const base = SCREENCAST_PROFILES[this.desiredScreencastProfileName] || SCREENCAST_PROFILES.good;
+    const size = screencastSizeForViewport(base, this.config, this.clientViewport);
+    return {
+      everyNthFrame: Math.max(base.everyNthFrame, Number(this.config.screencastEveryNthFrame || 1)),
+      format: "jpeg",
+      maxHeight: size.height,
+      maxWidth: size.width,
+      name: base.name,
+      quality: Math.min(base.quality, clamp(Number(this.config.screenshotQuality || base.quality), 30, 90)),
+    };
+  }
 }
 
 function selectTarget(targets) {
@@ -662,6 +862,115 @@ function normalizeTarget(target) {
     url: target.url || "",
     webSocketDebuggerUrl: target.webSocketDebuggerUrl || "",
   };
+}
+
+function normalizeClientViewport(viewport) {
+  const width = Number(viewport?.width);
+  const height = Number(viewport?.height);
+  const dpr = Number(viewport?.dpr || 1);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width < 100 || height < 100) {
+    return null;
+  }
+
+  return {
+    aspect: width / height,
+    dpr: clamp(dpr, 1, 4),
+    height: Math.round(height),
+    width: Math.round(width),
+  };
+}
+
+function sameClientViewport(current, next) {
+  if (!current || !next) {
+    return false;
+  }
+
+  const aspectDelta = Math.abs(current.aspect - next.aspect);
+  return Math.abs(current.width - next.width) < 8 && Math.abs(current.height - next.height) < 8 && aspectDelta < 0.015;
+}
+
+function profileSizeChanged(current, next) {
+  const currentWidth = Number(current?.maxWidth ?? current?.width ?? 0);
+  const currentHeight = Number(current?.maxHeight ?? current?.height ?? 0);
+  const nextWidth = Number(next?.maxWidth ?? next?.width ?? 0);
+  const nextHeight = Number(next?.maxHeight ?? next?.height ?? 0);
+  return Math.abs(currentWidth - nextWidth) >= 16 || Math.abs(currentHeight - nextHeight) >= 16;
+}
+
+function captureViewportSizeForClient(config, viewport) {
+  if (!viewport) {
+    return null;
+  }
+
+  return screencastSizeForViewport(SCREENCAST_PROFILES.good, config, viewport);
+}
+
+function screencastSizeForViewport(base, config, viewport) {
+  if (!viewport) {
+    return {
+      height: Math.min(base.maxHeight, Number(config.screenshotMaxHeight || base.maxHeight)),
+      width: Math.min(base.maxWidth, Number(config.screenshotMaxWidth || base.maxWidth)),
+    };
+  }
+
+  const configLongEdge = Math.max(
+    Number(config.screenshotMaxWidth || base.maxWidth),
+    Number(config.screenshotMaxHeight || base.maxHeight),
+  );
+  const longEdge = Math.round(Math.min(Math.max(base.maxWidth, base.maxHeight), configLongEdge));
+  const aspect = clamp(viewport.aspect, 0.25, 4);
+  let width;
+  let height;
+
+  if (aspect >= 1) {
+    width = longEdge;
+    height = Math.round(longEdge / aspect);
+  } else {
+    height = longEdge;
+    width = Math.round(longEdge * aspect);
+  }
+
+  return {
+    height: Math.max(320, height),
+    width: Math.max(320, width),
+  };
+}
+
+function profileNameForNetwork(stats) {
+  const bufferedAmount = Number(stats.bufferedAmount || 0);
+  const droppedFramesInLast5s = Number(stats.droppedFramesInLast5s || 0);
+  const rtt = Number(stats.rtt);
+
+  if (bufferedAmount > 2_000_000 || droppedFramesInLast5s > 20 || (Number.isFinite(rtt) && rtt > 400)) {
+    return "bad";
+  }
+
+  if (bufferedAmount > 500_000 || (Number.isFinite(rtt) && rtt > 180)) {
+    return "medium";
+  }
+
+  return "good";
+}
+
+function profileNameForMode(mode, networkProfileName) {
+  if (mode === "good") {
+    return networkProfileName === "bad" ? "medium" : "good";
+  }
+
+  if (mode === "bad") {
+    return "bad";
+  }
+
+  if (mode === "medium") {
+    return worseProfileName("medium", networkProfileName);
+  }
+
+  return networkProfileName;
+}
+
+function worseProfileName(first, second) {
+  const ranks = { good: 0, medium: 1, bad: 2 };
+  return ranks[first] >= ranks[second] ? first : second;
 }
 
 function editableProbeExpression(x, y) {

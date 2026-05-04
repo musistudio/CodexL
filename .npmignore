@@ -32,7 +32,6 @@ coverage/
 tmp/
 temp/
 *.tgz
-imgs/
 
 # Tests and local-only fixtures
 test/

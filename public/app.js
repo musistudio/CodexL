@@ -1,11 +1,16 @@
-const token = new URLSearchParams(location.search).get("token") || "";
+const urlParams = new URLSearchParams(location.search);
+const token = urlParams.get("token") || "";
+const remoteRoom = urlParams.get("room") || "default";
+const wsBasePath = websocketBasePath();
 const MAX_SCREEN_ZOOM = 4;
 const MIN_SCREEN_ZOOM = 1;
+const POINTER_MOVE_SEND_INTERVAL_MS = 33;
 const SCROLL_SEND_INTERVAL_MS = 45;
-const textDecoder = new TextDecoder();
+const VIEWPORT_SEND_DEBOUNCE_MS = 120;
 
 const state = {
   connected: false,
+  controlSocket: null,
   composing: false,
   ignoreNextClick: false,
   ignoreNextInput: false,
@@ -16,20 +21,25 @@ const state = {
   provisionalText: "",
   provisionalTextAt: 0,
   editableRects: [],
-  frameDrawInProgress: false,
-  frameDrawScheduled: false,
+  frameConnected: false,
+  frameFormat: "jpeg",
+  frameProfile: null,
   lastTouch: null,
+  lastSentViewportKey: "",
+  latestFrame: null,
+  latestFrameMeta: null,
+  latestPointer: null,
   pendingScroll: null,
-  pendingFrame: null,
   pinch: null,
   scrollTimer: null,
-  socket: null,
+  frameSocket: null,
   screenBaseSize: null,
   screenPanX: 0,
   screenPanY: 0,
   screenSize: null,
   statusText: "",
   touchMoved: false,
+  viewportTimer: null,
   zoom: 1,
 };
 
@@ -38,21 +48,36 @@ const screen = document.querySelector("#screen");
 const screenContext = screen.getContext("2d", { alpha: false });
 const emptyState = document.querySelector("#emptyState");
 const keyboardProxy = document.querySelector("#keyboardProxy");
+const qualitySelect = document.querySelector("#qualitySelect");
 const subtitle = document.querySelector("#subtitle");
 
 document.querySelector("#refreshButton").addEventListener("click", () => {
   send({ type: "refresh" });
 });
 
+qualitySelect.addEventListener("change", () => {
+  send({ type: "profileMode", mode: qualitySelect.value });
+});
+
 if (window.ResizeObserver) {
   const screenResizeObserver = new ResizeObserver(() => {
     fitScreenToWrap();
+    queueViewportUpdate();
   });
   screenResizeObserver.observe(screenWrap);
 }
-window.addEventListener("resize", fitScreenToWrap);
-window.visualViewport?.addEventListener("resize", fitScreenToWrap);
-window.addEventListener("orientationchange", fitScreenToWrap);
+window.addEventListener("resize", () => {
+  fitScreenToWrap();
+  queueViewportUpdate();
+});
+window.visualViewport?.addEventListener("resize", () => {
+  fitScreenToWrap();
+  queueViewportUpdate();
+});
+window.addEventListener("orientationchange", () => {
+  fitScreenToWrap();
+  queueViewportUpdate();
+});
 
 screenWrap.addEventListener("click", (event) => {
   if (state.ignoreNextClick) {
@@ -72,6 +97,17 @@ screenWrap.addEventListener("click", (event) => {
   }
   send({ type: "click", ...point });
 });
+
+screenWrap.addEventListener(
+  "mousemove",
+  (event) => {
+    const point = normalizedPoint(event);
+    if (point) {
+      state.latestPointer = point;
+    }
+  },
+  { passive: true },
+);
 
 keyboardProxy.addEventListener("keydown", (event) => {
   if (state.composing) {
@@ -250,34 +286,44 @@ screenWrap.addEventListener(
   { passive: true },
 );
 
-connect();
+connectControl();
+connectFrame();
+setInterval(flushPointerMove, POINTER_MOVE_SEND_INTERVAL_MS);
+requestAnimationFrame(renderFrameLoop);
 
-function connect() {
+function connectControl() {
   if (!token) {
     setStatus("Missing token");
     return;
   }
 
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(`${protocol}//${location.host}/ws?token=${encodeURIComponent(token)}`);
-  socket.binaryType = "arraybuffer";
-  state.socket = socket;
+  const socket = new WebSocket(wsUrl("/ws/control"));
+  state.controlSocket = socket;
   setStatus("Connecting");
 
   socket.addEventListener("open", () => {
     state.connected = true;
+    state.lastSentViewportKey = "";
     setStatus("Connected");
+    sendViewport();
     send({ type: "refresh" });
   });
 
   socket.addEventListener("message", (event) => {
-    handleSocketMessage(event.data);
+    if (typeof event.data === "string") {
+      handleControlMessage(JSON.parse(event.data));
+    }
   });
 
   socket.addEventListener("close", () => {
+    if (state.controlSocket !== socket) {
+      return;
+    }
+
     state.connected = false;
-    setStatus("Disconnected, retrying");
-    setTimeout(connect, 1000);
+    state.lastSentViewportKey = "";
+    setStatus("Control disconnected, retrying");
+    setTimeout(connectControl, 1000);
   });
 
   socket.addEventListener("error", () => {
@@ -285,22 +331,88 @@ function connect() {
   });
 }
 
-function handleSocketMessage(data) {
-  if (typeof data === "string") {
-    handleMessage(JSON.parse(data));
+function connectFrame() {
+  if (!token) {
     return;
   }
 
-  handleMessage(parseBinaryFrame(data));
+  const socket = new WebSocket(wsUrl("/ws/frame"));
+  socket.binaryType = "arraybuffer";
+  state.frameSocket = socket;
+
+  socket.addEventListener("open", () => {
+    state.frameConnected = true;
+  });
+
+  socket.addEventListener("message", (event) => {
+    if (typeof event.data !== "string") {
+      state.latestFrame = event.data;
+    }
+  });
+
+  socket.addEventListener("close", () => {
+    if (state.frameSocket !== socket) {
+      return;
+    }
+
+    state.frameConnected = false;
+    state.latestFrame = null;
+    setTimeout(connectFrame, 1000);
+  });
+
+  socket.addEventListener("error", () => {
+    socket.close();
+  });
 }
 
-function handleMessage(message) {
-  if (message.type === "screenshot") {
-    scheduleScreenshot(message);
+function wsUrl(pathname) {
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const params = new URLSearchParams({ token });
+  if (remoteRoom) {
+    params.set("room", remoteRoom);
+  }
+  return `${protocol}//${location.host}${wsBasePath}${pathname}?${params.toString()}`;
+}
+
+function websocketBasePath() {
+  if (location.pathname === "/" || location.pathname === "/index.html") {
+    return "";
+  }
+
+  if (location.pathname.endsWith("/index.html")) {
+    return location.pathname.slice(0, -"/index.html".length);
+  }
+
+  return location.pathname.endsWith("/") ? location.pathname.slice(0, -1) : "";
+}
+
+function handleControlMessage(message) {
+  if (message.type === "heartbeat") {
+    send({ type: "pong", ts: message.ts });
+    return;
+  }
+
+  if (message.type === "frameMeta") {
+    state.latestFrameMeta = message;
+    state.frameFormat = message.format || state.frameFormat;
+    if (Array.isArray(message.editableRects)) {
+      state.editableRects = message.editableRects;
+    }
+    return;
+  }
+
+  if (message.type === "profile") {
+    state.frameProfile = message.profile || null;
     return;
   }
 
   if (message.type === "status") {
+    if (message.status?.screencastProfileMode) {
+      qualitySelect.value = message.status.screencastProfileMode;
+    }
+    if (message.status?.screencastProfileSettings) {
+      state.frameProfile = message.status.screencastProfileSettings;
+    }
     setStatus(message.status?.connected ? "CDP connected" : "Waiting for CDP");
     return;
   }
@@ -314,55 +426,25 @@ function handleMessage(message) {
     if (!message.focus) {
       blurKeyboardProxy();
     }
-    return;
   }
 }
 
-function parseBinaryFrame(buffer) {
-  const bytes = new Uint8Array(buffer);
-  const view = new DataView(buffer);
-  const headerLength = view.getUint32(0);
-  const headerStart = 4;
-  const headerEnd = headerStart + headerLength;
-  const header = JSON.parse(textDecoder.decode(bytes.subarray(headerStart, headerEnd)));
-  const image = bytes.subarray(headerEnd);
-  const blob = new Blob([image], { type: `image/${header.format || "jpeg"}` });
-  return {
-    ...header,
-    blob,
-  };
+async function renderFrameLoop() {
+  const frame = state.latestFrame;
+  state.latestFrame = null;
+
+  if (frame) {
+    await drawFrameBytes(frame);
+  }
+
+  requestAnimationFrame(renderFrameLoop);
 }
 
-function scheduleScreenshot(message) {
-  if (Array.isArray(message.editableRects)) {
-    state.editableRects = message.editableRects;
-  }
-
-  cleanupFrame(state.pendingFrame);
-  state.pendingFrame = message;
-  if (state.frameDrawScheduled || state.frameDrawInProgress) {
-    return;
-  }
-
-  state.frameDrawScheduled = true;
-  requestAnimationFrame(drawLatestFrame);
-}
-
-async function drawLatestFrame() {
-  state.frameDrawScheduled = false;
-  const frame = state.pendingFrame;
-  state.pendingFrame = null;
-  if (!frame) {
-    return;
-  }
-
-  state.frameDrawInProgress = true;
+async function drawFrameBytes(frame) {
   let image = null;
   try {
-    image = await decodeFrame(frame.blob || frame.blobUrl || frame.dataUrl);
-    if (state.pendingFrame) {
-      return;
-    }
+    const blob = frame instanceof Blob ? frame : new Blob([frame], { type: `image/${state.frameFormat || "jpeg"}` });
+    image = await decodeFrame(blob);
 
     const width = image.width || image.naturalWidth;
     const height = image.height || image.naturalHeight;
@@ -376,18 +458,15 @@ async function drawLatestFrame() {
     screenContext.drawImage(image, 0, 0);
     screen.hidden = false;
     emptyState.hidden = true;
-    const title = frame.target?.title || "Codex";
-    setStatus(`${title} · ${frame.metrics?.width || 0}x${frame.metrics?.height || 0}`);
+
+    const meta = state.latestFrameMeta || {};
+    const title = meta.target?.title || "Codex";
+    const profile = state.frameProfile?.name ? ` · ${state.frameProfile.name}` : "";
+    setStatus(`${title} · ${meta.metrics?.width || width}x${meta.metrics?.height || height}${profile}`);
   } catch {
     setStatus("Frame decode failed");
   } finally {
     cleanupDecodedImage(image);
-    cleanupFrame(frame);
-    state.frameDrawInProgress = false;
-    if (state.pendingFrame && !state.frameDrawScheduled) {
-      state.frameDrawScheduled = true;
-      requestAnimationFrame(drawLatestFrame);
-    }
   }
 }
 
@@ -424,12 +503,6 @@ async function decodeFrame(source) {
     image.onerror = reject;
   });
   return image;
-}
-
-function cleanupFrame(frame) {
-  if (frame?.blobUrl) {
-    URL.revokeObjectURL(frame.blobUrl);
-  }
 }
 
 function cleanupDecodedImage(image) {
@@ -581,11 +654,62 @@ function cancelPendingScroll() {
 }
 
 function send(payload) {
-  if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
+  if (!state.controlSocket || state.controlSocket.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+
+  state.controlSocket.send(JSON.stringify(payload));
+  return true;
+}
+
+function queueViewportUpdate() {
+  if (state.viewportTimer) {
+    clearTimeout(state.viewportTimer);
+  }
+
+  state.viewportTimer = setTimeout(() => {
+    state.viewportTimer = null;
+    sendViewport();
+  }, VIEWPORT_SEND_DEBOUNCE_MS);
+}
+
+function sendViewport() {
+  const rect = screenWrap.getBoundingClientRect();
+  const width = Math.round(rect.width);
+  const height = Math.round(rect.height);
+  if (width <= 0 || height <= 0) {
     return;
   }
 
-  state.socket.send(JSON.stringify(payload));
+  const dpr = Math.round((window.devicePixelRatio || 1) * 100) / 100;
+  const key = `${width}x${height}@${dpr}`;
+  if (key === state.lastSentViewportKey) {
+    return;
+  }
+
+  const sent = send({
+    type: "viewport",
+    dpr,
+    height,
+    width,
+  });
+  if (sent) {
+    state.lastSentViewportKey = key;
+  }
+}
+
+function flushPointerMove() {
+  const point = state.latestPointer;
+  state.latestPointer = null;
+  if (!point) {
+    return;
+  }
+
+  send({
+    type: "pointerMove",
+    ...point,
+    ts: Date.now(),
+  });
 }
 
 function queueScroll(point, deltaX, deltaY) {

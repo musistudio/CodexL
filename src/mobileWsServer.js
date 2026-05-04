@@ -2,19 +2,36 @@ import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const FRAME_BACKPRESSURE_BYTES = 1_000_000;
+const FRAME_META_INTERVAL_MS = 250;
+const FRAME_PUMP_RETRY_MS = 30;
+const HEARTBEAT_INTERVAL_MS = 5000;
+const NETWORK_SAMPLE_MS = 1000;
 
 export class MobileWsServer extends EventEmitter {
   constructor({ server, token }, logger = console) {
     super();
-    this.clients = new Set();
+    this.controlClients = new Set();
+    this.frameClients = new Set();
     this.heartbeatTimer = null;
+    this.lastFrameMetaAt = 0;
     this.logger = logger;
+    this.networkTimer = null;
+    this.rttMs = null;
     this.server = server;
     this.token = token;
   }
 
   get clientCount() {
-    return this.clients.size;
+    return this.controlClients.size + this.frameClients.size;
+  }
+
+  get controlClientCount() {
+    return this.controlClients.size;
+  }
+
+  get frameClientCount() {
+    return this.frameClients.size;
   }
 
   start() {
@@ -24,37 +41,95 @@ export class MobileWsServer extends EventEmitter {
 
     this.heartbeatTimer = setInterval(() => {
       this.broadcast({ type: "heartbeat", ts: Date.now() });
-    }, 15000).unref();
+    }, HEARTBEAT_INTERVAL_MS).unref();
+
+    this.networkTimer = setInterval(() => {
+      this.emit("network", this.networkSnapshot());
+    }, NETWORK_SAMPLE_MS).unref();
   }
 
   stop() {
     clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = null;
+    clearInterval(this.networkTimer);
+    this.networkTimer = null;
 
-    for (const client of this.clients) {
+    for (const client of this.controlClients) {
       client.close();
     }
-    this.clients.clear();
+    for (const client of this.frameClients) {
+      client.close();
+    }
+    this.controlClients.clear();
+    this.frameClients.clear();
   }
 
   broadcast(payload) {
     const message = JSON.stringify(payload);
-    for (const client of this.clients) {
+    for (const client of this.controlClients) {
       client.send(message);
     }
   }
 
   broadcastFrame(payload) {
-    const packet = encodeFramePacket(payload);
-    for (const client of this.clients) {
-      client.sendBinary(packet);
+    if (this.frameClients.size === 0) {
+      return;
     }
+
+    const frame = frameBytesFromPayload(payload);
+    if (!frame) {
+      return;
+    }
+
+    for (const client of this.frameClients) {
+      client.sendLatestBinary(frame);
+    }
+
+    this.maybeBroadcastFrameMeta(payload);
+  }
+
+  notePong(message) {
+    const ts = Number(message?.ts);
+    if (!Number.isFinite(ts) || ts <= 0) {
+      return;
+    }
+
+    this.rttMs = Math.max(0, Date.now() - ts);
+  }
+
+  networkSnapshot() {
+    let bufferedAmount = 0;
+    let droppedFramesInLast5s = 0;
+    const now = Date.now();
+    for (const client of this.frameClients) {
+      bufferedAmount = Math.max(bufferedAmount, client.bufferedAmount);
+      droppedFramesInLast5s += client.droppedFramesSince(now - 5000);
+    }
+
+    return {
+      bufferedAmount,
+      droppedFramesInLast5s,
+      frameClientCount: this.frameClients.size,
+      rtt: this.controlClients.size > 0 ? this.rttMs : null,
+    };
+  }
+
+  maybeBroadcastFrameMeta(payload) {
+    const now = Date.now();
+    if (now - this.lastFrameMetaAt < FRAME_META_INTERVAL_MS) {
+      return;
+    }
+
+    this.lastFrameMetaAt = now;
+    const { bytes, data, dataUrl, ...meta } = payload;
+    this.broadcast({ ...meta, type: "frameMeta" });
   }
 
   handleUpgrade(request, socket) {
     const url = new URL(request.url || "/", "http://localhost");
+    const channel = channelFromPath(url.pathname);
 
-    if (url.pathname !== "/ws") {
+    if (!channel) {
       socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
       return;
     }
@@ -79,32 +154,41 @@ export class MobileWsServer extends EventEmitter {
       "\r\n",
     ].join("\r\n"));
 
-    const client = new WsClient(socket);
-    this.clients.add(client);
-    this.logger.log(`[mobile] connected clients: ${this.clients.size}`);
+    const client = new WsClient(socket, { channel });
+    const clients = channel === "frame" ? this.frameClients : this.controlClients;
+    clients.add(client);
+    if (channel === "control") {
+      this.rttMs = null;
+    }
+    this.logger.log(`[mobile] connected ${channel} clients: ${clients.size}`);
 
     client.on("message", (message) => {
-      this.emit("message", client, message);
+      if (channel === "control") {
+        this.emit("message", client, message);
+      }
     });
 
     client.on("close", () => {
-      this.clients.delete(client);
-      this.logger.log(`[mobile] connected clients: ${this.clients.size}`);
-      this.emit("disconnect", client);
+      clients.delete(client);
+      this.logger.log(`[mobile] connected ${channel} clients: ${clients.size}`);
+      this.emit("disconnect", client, channel);
     });
 
-    this.emit("connection", client);
+    this.emit("connection", client, channel);
   }
 }
 
 class WsClient extends EventEmitter {
-  constructor(socket) {
+  constructor(socket, { channel }) {
     super();
     this.buffer = Buffer.alloc(0);
+    this.channel = channel;
     this.closed = false;
-    this.pendingBinary = null;
+    this.droppedFrameTimestamps = [];
+    this.latestBinary = null;
+    this.pumpTimer = null;
+    this.sendingBinary = false;
     this.socket = socket;
-    this.waitingForDrain = false;
 
     socket.setNoDelay?.(true);
 
@@ -113,13 +197,12 @@ class WsClient extends EventEmitter {
       this.readFrames();
     });
 
-    socket.on("drain", () => {
-      this.waitingForDrain = false;
-      this.flushPendingBinary();
-    });
-
     socket.on("close", () => this.close());
     socket.on("error", () => this.close());
+  }
+
+  get bufferedAmount() {
+    return this.socket.writableLength + (this.latestBinary?.length || 0);
   }
 
   send(message) {
@@ -130,17 +213,17 @@ class WsClient extends EventEmitter {
     this.socket.write(encodeFrame(Buffer.from(message)));
   }
 
-  sendBinary(message) {
+  sendLatestBinary(message) {
     if (this.closed || this.socket.destroyed) {
       return;
     }
 
-    if (this.waitingForDrain) {
-      this.pendingBinary = message;
-      return;
+    if (this.latestBinary) {
+      this.recordDroppedFrame();
     }
 
-    this.writeBinary(message);
+    this.latestBinary = message;
+    this.pumpLatestBinary();
   }
 
   close() {
@@ -149,7 +232,9 @@ class WsClient extends EventEmitter {
     }
 
     this.closed = true;
-    this.pendingBinary = null;
+    clearTimeout(this.pumpTimer);
+    this.pumpTimer = null;
+    this.latestBinary = null;
     this.emit("close");
     try {
       this.socket.end();
@@ -218,20 +303,51 @@ class WsClient extends EventEmitter {
     }
   }
 
-  flushPendingBinary() {
-    if (this.closed || this.socket.destroyed || !this.pendingBinary) {
+  pumpLatestBinary() {
+    if (this.closed || this.socket.destroyed || this.sendingBinary || !this.latestBinary) {
       return;
     }
 
-    const message = this.pendingBinary;
-    this.pendingBinary = null;
-    this.writeBinary(message);
+    if (this.socket.writableLength > FRAME_BACKPRESSURE_BYTES) {
+      this.schedulePump();
+      return;
+    }
+
+    const message = this.latestBinary;
+    this.latestBinary = null;
+    this.sendingBinary = true;
+    this.socket.write(encodeFrame(message, 0x2), () => {
+      this.sendingBinary = false;
+      this.pumpLatestBinary();
+    });
   }
 
-  writeBinary(message) {
-    const canContinue = this.socket.write(encodeFrame(message, 0x2));
-    if (!canContinue) {
-      this.waitingForDrain = true;
+  schedulePump() {
+    if (this.pumpTimer) {
+      return;
+    }
+
+    this.pumpTimer = setTimeout(() => {
+      this.pumpTimer = null;
+      this.pumpLatestBinary();
+    }, FRAME_PUMP_RETRY_MS);
+    this.pumpTimer.unref?.();
+  }
+
+  recordDroppedFrame() {
+    const now = Date.now();
+    this.droppedFrameTimestamps.push(now);
+    this.pruneDroppedFrames(now - 5000);
+  }
+
+  droppedFramesSince(since) {
+    this.pruneDroppedFrames(since);
+    return this.droppedFrameTimestamps.length;
+  }
+
+  pruneDroppedFrames(since) {
+    while (this.droppedFrameTimestamps.length > 0 && this.droppedFrameTimestamps[0] < since) {
+      this.droppedFrameTimestamps.shift();
     }
   }
 }
@@ -258,17 +374,32 @@ function encodeFrame(payload, opcode = 0x1) {
   return Buffer.concat([header, payload]);
 }
 
-function encodeFramePacket(payload) {
-  const imageBase64 = payload.data || dataUrlToBase64(payload.dataUrl || "");
-  const image = Buffer.from(imageBase64, "base64");
-  const headerPayload = { ...payload, data: undefined, dataUrl: undefined };
-  const header = Buffer.from(JSON.stringify(headerPayload), "utf8");
-  const length = Buffer.alloc(4);
-  length.writeUInt32BE(header.length, 0);
-  return Buffer.concat([length, header, image]);
+function frameBytesFromPayload(payload) {
+  if (Buffer.isBuffer(payload.bytes)) {
+    return payload.bytes;
+  }
+
+  if (Buffer.isBuffer(payload.data)) {
+    return payload.data;
+  }
+
+  const imageBase64 = typeof payload.data === "string" ? payload.data : dataUrlToBase64(payload.dataUrl || "");
+  return imageBase64 ? Buffer.from(imageBase64, "base64") : null;
 }
 
 function dataUrlToBase64(dataUrl) {
   const commaIndex = dataUrl.indexOf(",");
   return commaIndex >= 0 ? dataUrl.slice(commaIndex + 1) : dataUrl;
+}
+
+function channelFromPath(pathname) {
+  if (pathname === "/ws/control" || pathname === "/ws") {
+    return "control";
+  }
+
+  if (pathname === "/ws/frame") {
+    return "frame";
+  }
+
+  return "";
 }
