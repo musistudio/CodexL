@@ -10,6 +10,35 @@
     <header class="topbar">
       <div id="subtitle" class="subtitle">Connecting</div>
       <div class="topbar-actions">
+        <div id="pageZoomControl" class="zoom-control">
+          <button
+            id="pageZoomButton"
+            class="zoom-button"
+            type="button"
+            title="Page zoom"
+            aria-label="Page zoom"
+            aria-haspopup="true"
+            aria-expanded="false"
+          >
+            <span id="pageZoomLabel">1x</span>
+          </button>
+          <div id="pageZoomMenu" class="zoom-menu" hidden>
+            <input
+              id="pageZoomSlider"
+              class="zoom-slider"
+              type="range"
+              min="1"
+              max="3"
+              step="0.05"
+              value="1"
+              aria-label="Page zoom"
+            />
+            <div class="zoom-ticks" aria-hidden="true">
+              <span>1x</span>
+              <span>3x</span>
+            </div>
+          </div>
+        </div>
         <select id="qualitySelect" class="quality-select" aria-label="Quality">
           <option value="auto">Auto</option>
           <option value="good">Quality</option>

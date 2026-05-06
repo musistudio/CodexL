@@ -11,7 +11,7 @@ Remotely control Codex.app on your computer from a mobile browser. This tool sta
 ## Requirements
 
 - Node.js 22+
-- Codex Electron app on macOS
+- Codex Electron app on macOS or Windows
 - Cloudflare Workers + Durable Objects when using remote mode
 
 ## Installation and Usage
@@ -63,9 +63,30 @@ npm run start remote "https://codex-app-remotely-remote.<account>.workers.dev"
 
 The CLI prints a remote URL containing `room` and `token`. Open or scan that URL from the remote browser. If `room` is omitted, both sides use `default`. The local process opens an outbound WebSocket to `/ws/host`; remote browsers use `/ws/control` and `/ws/frame`; one Durable Object instance per `room` relays control JSON and binary frames.
 
+### Debugger Mode
+
+Debugger mode starts or connects to Codex with CDP enabled and opens DevTools for the selected Codex target:
+
+```bash
+car debugger
+```
+
+Equivalent forms:
+
+```bash
+car --mode debugger
+car --open-devtools
+```
+
+When launching Codex itself, this mode also passes `--auto-open-devtools-for-tabs`. When connecting to an already running Codex process, it opens the CDP DevTools frontend in your default browser:
+
+```bash
+car debugger --no-launch --cdp-port 9222
+```
+
 ### Specify the Codex App Path
 
-If the Codex app is not in the default location, pass the app path explicitly:
+If the Codex app is not in the default location, pass the app path explicitly. On macOS this can be the `.app` bundle:
 
 ```bash
 npx codex-app-remotely --app "/Applications/Codex.app"
@@ -76,6 +97,15 @@ Equivalent command after global installation:
 ```bash
 car --app "/Applications/Codex.app"
 ```
+
+On Windows this can be the install directory or the executable:
+
+```powershell
+npx codex-app-remotely --app "$env:LOCALAPPDATA\Programs\Codex"
+npx codex-app-remotely --executable "$env:LOCALAPPDATA\Programs\Codex\Codex.exe"
+```
+
+By default, Windows auto-launch checks common Electron install locations, including `%LOCALAPPDATA%\Programs\Codex\Codex.exe` and `%LOCALAPPDATA%\Programs\OpenAI Codex\OpenAI Codex.exe`.
 
 ### Connect to an Already Running Codex App
 
@@ -94,7 +124,23 @@ car --no-launch --cdp-port 9222
 The manual Electron CDP launch command usually looks like this:
 
 ```bash
-"/Applications/Codex.app/Contents/MacOS/Codex" --remote-debugging-port=9222 --remote-allow-origins=*
+"/Applications/Codex.app/Contents/MacOS/Codex" \
+  --remote-debugging-port=9222 \
+  --remote-allow-origins=* \
+  --disable-renderer-backgrounding \
+  --disable-background-timer-throttling \
+  --disable-backgrounding-occluded-windows
+```
+
+On Windows:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\Codex\Codex.exe" `
+  --remote-debugging-port=9222 `
+  --remote-allow-origins=* `
+  --disable-renderer-backgrounding `
+  --disable-background-timer-throttling `
+  --disable-backgrounding-occluded-windows
 ```
 
 ## Common Options
@@ -128,6 +174,8 @@ You can also configure the server with environment variables:
 - `SCREENSHOT_MAX_WIDTH`
 - `SCREENSHOT_MAX_HEIGHT`
 - `SCREENSHOT_QUALITY`
+- `OPEN_DEVTOOLS=1`
+- `CODEX_DEBUGGER=1`
 - `NO_LAUNCH=1`
 
 ## Architecture

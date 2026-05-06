@@ -53,7 +53,12 @@ const server = createStaticServer({ bridge, token: config.token });
 const mobileWs = new MobileWsServer({ server, token: config.token });
 const remoteRelay = config.mode === "remote" ? new RemoteRelayClient(config) : null;
 const networkStatsByTransport = new Map();
+let devToolsOpened = false;
 let shuttingDown = false;
+
+if (config.openDevTools) {
+  console.log("[debugger] Codex DevTools will open when the CDP target is ready");
+}
 
 if (remoteRelay) {
   console.log(`[remote] full URL: ${remoteRelay.mobileUrl}`);
@@ -69,6 +74,7 @@ bridge.on("screenshot", (payload) => {
 
 bridge.on("status", (status) => {
   broadcast({ type: "status", status });
+  maybeOpenDevTools(status);
 });
 
 bridge.on("warning", (message) => {
@@ -140,6 +146,8 @@ server.listen(config.port, config.host, () => {
     console.log("[server] remote mode enabled:");
     console.log(`  full URL: ${remoteRelay.mobileUrl}`);
     console.log("[server] local LAN URLs still available:");
+  } else if (config.mode === "debugger") {
+    console.log("[server] debugger mode enabled; local LAN URLs are also available:");
   } else {
     console.log("[server] open one of these URLs on your mobile device:");
   }
@@ -206,6 +214,16 @@ async function handleMobileMessage(transport, client, message) {
     return;
   }
 
+  if (message.type === "sidebarSwipe") {
+    await bridge.applySidebarSwipe(message.direction);
+    return;
+  }
+
+  if (message.type === "sidebar") {
+    await bridge.setSidebar(message.side, message.action);
+    return;
+  }
+
   if (message.type === "refresh") {
     if (totalFrameClientCount() > 0) {
       await bridge.restartScreencast();
@@ -216,6 +234,11 @@ async function handleMobileMessage(transport, client, message) {
   if (message.type === "profileMode") {
     await bridge.setScreencastProfileMode(message.mode);
     broadcast({ type: "status", status: bridge.status() });
+    return;
+  }
+
+  if (message.type === "pageZoom") {
+    await bridge.setPageZoomScale(message.scale);
     return;
   }
 
@@ -278,6 +301,54 @@ function aggregateNetworkStats() {
   };
 }
 
+function maybeOpenDevTools(status) {
+  if (!config.openDevTools || devToolsOpened || !status?.connected) {
+    return;
+  }
+
+  const devToolsUrl = devToolsUrlForTarget(status.target);
+  if (!devToolsUrl) {
+    return;
+  }
+
+  devToolsOpened = true;
+  console.log(`[debugger] opening Codex DevTools: ${devToolsUrl}`);
+  openUrl(devToolsUrl);
+}
+
+function devToolsUrlForTarget(target) {
+  if (!target) {
+    return "";
+  }
+
+  const baseUrl = cdpBaseUrl();
+  if (target.devtoolsFrontendUrl) {
+    const devToolsUrl = new URL(target.devtoolsFrontendUrl, baseUrl).toString();
+    if (/^https?:\/\//i.test(devToolsUrl)) {
+      return devToolsUrl;
+    }
+  }
+
+  if (!target.id) {
+    return "";
+  }
+
+  const ws = `${cdpBrowserHost()}:${config.cdpPort}/devtools/page/${encodeURIComponent(target.id)}`;
+  return `${baseUrl}/devtools/inspector.html?ws=${encodeURIComponent(ws)}`;
+}
+
+function cdpBaseUrl() {
+  return `http://${cdpBrowserHost()}:${config.cdpPort}`;
+}
+
+function cdpBrowserHost() {
+  if (config.cdpHost === "0.0.0.0") {
+    return "127.0.0.1";
+  }
+
+  return config.cdpHost;
+}
+
 async function printQrCode(url) {
   try {
     const qr = await QRCode.toString(url, {
@@ -334,11 +405,12 @@ function closeServer() {
 }
 
 function openUrl(url) {
-  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd.exe" : "xdg-open";
+  const args = process.platform === "win32" ? ["/d", "/s", "/c", `start "" "${url.replaceAll('"', "")}"`] : [url];
   const child = spawn(command, args, {
     detached: true,
     stdio: "ignore",
+    windowsHide: true,
   });
   child.unref();
 }

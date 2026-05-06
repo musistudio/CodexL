@@ -9,7 +9,7 @@
 ## 要求
 
 - Node.js 22+
-- macOS 上的 Codex Electron App
+- macOS 或 Windows 上的 Codex Electron App
 - 使用 remote 模式时需要 Cloudflare Workers + Durable Objects
 
 ## 安装和使用
@@ -61,9 +61,30 @@ npm run start remote "https://codex-app-remotely-remote.<account>.workers.dev"
 
 CLI 会输出带 `room` 和 `token` 的远端 URL，手机浏览器打开或扫码即可。如果 URL 没有 `room`，两端都会使用 `default`。本机进程会向 `/ws/host` 建立出站 WebSocket；远端浏览器使用 `/ws/control` 和 `/ws/frame`；每个 `room` 对应一个 Durable Object，用来中继控制 JSON 和二进制画面帧。
 
+### debugger 模式
+
+debugger 模式会启动或连接 Codex，并为选中的 Codex target 打开 DevTools：
+
+```bash
+car debugger
+```
+
+等价写法：
+
+```bash
+car --mode debugger
+car --open-devtools
+```
+
+如果由本工具启动 Codex，这个模式还会追加 `--auto-open-devtools-for-tabs`。如果连接的是已经启动的 Codex 进程，则会在默认浏览器里打开 CDP DevTools frontend：
+
+```bash
+car debugger --no-launch --cdp-port 9222
+```
+
 ### 指定 Codex App 路径
 
-如果 Codex app 不在默认位置，显式指定路径：
+如果 Codex app 不在默认位置，可以显式指定路径。macOS 上可以传 `.app` bundle：
 
 ```bash
 npx codex-app-remotely --app "/Applications/Codex.app"
@@ -74,6 +95,15 @@ npx codex-app-remotely --app "/Applications/Codex.app"
 ```bash
 car --app "/Applications/Codex.app"
 ```
+
+Windows 上可以传安装目录或可执行文件路径：
+
+```powershell
+npx codex-app-remotely --app "$env:LOCALAPPDATA\Programs\Codex"
+npx codex-app-remotely --executable "$env:LOCALAPPDATA\Programs\Codex\Codex.exe"
+```
+
+默认情况下，Windows 自动启动会检查常见 Electron 安装路径，包括 `%LOCALAPPDATA%\Programs\Codex\Codex.exe` 和 `%LOCALAPPDATA%\Programs\OpenAI Codex\OpenAI Codex.exe`。
 
 ### 连接已启动的 Codex
 
@@ -92,7 +122,23 @@ car --no-launch --cdp-port 9222
 手动启动 Electron CDP 的参数形式通常是：
 
 ```bash
-"/Applications/Codex.app/Contents/MacOS/Codex" --remote-debugging-port=9222 --remote-allow-origins=*
+"/Applications/Codex.app/Contents/MacOS/Codex" \
+  --remote-debugging-port=9222 \
+  --remote-allow-origins=* \
+  --disable-renderer-backgrounding \
+  --disable-background-timer-throttling \
+  --disable-backgrounding-occluded-windows
+```
+
+Windows 上：
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\Codex\Codex.exe" `
+  --remote-debugging-port=9222 `
+  --remote-allow-origins=* `
+  --disable-renderer-backgrounding `
+  --disable-background-timer-throttling `
+  --disable-backgrounding-occluded-windows
 ```
 
 ## 常用配置
@@ -126,6 +172,8 @@ car \
 - `SCREENSHOT_MAX_WIDTH`
 - `SCREENSHOT_MAX_HEIGHT`
 - `SCREENSHOT_QUALITY`
+- `OPEN_DEVTOOLS=1`
+- `CODEX_DEBUGGER=1`
 - `NO_LAUNCH=1`
 
 ## 架构

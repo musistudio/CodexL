@@ -4,7 +4,9 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { resolvePath } from "./config.js";
 
-const DEFAULT_APP_NAMES = ["Codex.app", "OpenAI Codex.app"];
+const DEFAULT_MAC_APP_NAMES = ["Codex.app", "OpenAI Codex.app"];
+const DEFAULT_WINDOWS_APP_DIR_NAMES = ["Codex", "OpenAI Codex"];
+const DEFAULT_WINDOWS_EXECUTABLE_NAMES = ["Codex.exe", "OpenAI Codex.exe"];
 const DEFAULT_QUIT_GRACE_MS = 3000;
 
 export async function launchCodexApp(config, logger = console) {
@@ -23,10 +25,19 @@ export async function launchCodexApp(config, logger = console) {
   const args = [
     `--remote-debugging-port=${config.cdpPort}`,
     "--remote-allow-origins=*",
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
   ];
+  if (config.openDevTools) {
+    args.push("--auto-open-devtools-for-tabs");
+  }
 
   logger.log(`[launcher] starting ${executablePath}`);
   logger.log(`[launcher] CDP port: ${config.cdpPort}`);
+  if (config.openDevTools) {
+    logger.log("[launcher] DevTools auto-open enabled");
+  }
 
   const child = spawn(executablePath, args, {
     detached: true,
@@ -35,6 +46,7 @@ export async function launchCodexApp(config, logger = console) {
       ELECTRON_ENABLE_LOGGING: process.env.ELECTRON_ENABLE_LOGGING || "1",
     },
     stdio: "ignore",
+    windowsHide: true,
   });
 
   child.unref();
@@ -91,22 +103,45 @@ export function resolveExecutablePath(config) {
     return fileExists(executable) ? executable : "";
   }
 
-  const appPath = findAppBundle(config.appPath);
-  if (!appPath) {
+  if (config.appPath) {
+    return executableFromAppPath(resolvePath(config.appPath));
+  }
+
+  if (process.platform === "win32") {
+    return findWindowsExecutable();
+  }
+
+  if (process.platform === "darwin") {
+    const appPath = findMacAppBundle();
+    return appPath ? executableFromAppBundle(appPath) : "";
+  }
+
+  return "";
+}
+
+function executableFromAppPath(appPath) {
+  if (fileExists(appPath)) {
+    return appPath;
+  }
+
+  if (!directoryExists(appPath)) {
     return "";
   }
 
-  return executableFromAppBundle(appPath);
-}
-
-function findAppBundle(explicitPath) {
-  if (explicitPath) {
-    const resolved = resolvePath(explicitPath);
-    return directoryExists(resolved) ? resolved : "";
+  if (process.platform === "darwin" || appPath.endsWith(".app")) {
+    return executableFromAppBundle(appPath);
   }
 
+  if (process.platform === "win32") {
+    return executableFromWindowsInstallDir(appPath);
+  }
+
+  return "";
+}
+
+function findMacAppBundle() {
   const candidates = [];
-  for (const appName of DEFAULT_APP_NAMES) {
+  for (const appName of DEFAULT_MAC_APP_NAMES) {
     candidates.push(path.join("/Applications", appName));
     candidates.push(path.join(os.homedir(), "Applications", appName));
   }
@@ -153,6 +188,89 @@ function readBundleExecutable(infoPath) {
   }
 }
 
+function findWindowsExecutable() {
+  const candidates = [];
+  for (const root of windowsInstallRoots()) {
+    for (const appDirName of DEFAULT_WINDOWS_APP_DIR_NAMES) {
+      for (const executableName of DEFAULT_WINDOWS_EXECUTABLE_NAMES) {
+        candidates.push(path.join(root, appDirName, executableName));
+      }
+    }
+  }
+
+  return candidates.find(fileExists) || "";
+}
+
+function executableFromWindowsInstallDir(installDir) {
+  for (const executableName of DEFAULT_WINDOWS_EXECUTABLE_NAMES) {
+    const executablePath = path.join(installDir, executableName);
+    if (fileExists(executablePath)) {
+      return executablePath;
+    }
+  }
+
+  for (const appDirName of DEFAULT_WINDOWS_APP_DIR_NAMES) {
+    for (const executableName of DEFAULT_WINDOWS_EXECUTABLE_NAMES) {
+      const executablePath = path.join(installDir, appDirName, executableName);
+      if (fileExists(executablePath)) {
+        return executablePath;
+      }
+    }
+  }
+
+  try {
+    const firstCodexExecutable = fs
+      .readdirSync(installDir)
+      .filter((entry) => /\.exe$/i.test(entry) && /codex/i.test(entry))
+      .map((entry) => path.join(installDir, entry))
+      .find(fileExists);
+    return firstCodexExecutable || "";
+  } catch {
+    return "";
+  }
+}
+
+function windowsInstallRoots() {
+  return uniquePaths([
+    envPath("LOCALAPPDATA") && path.join(envPath("LOCALAPPDATA"), "Programs"),
+    envPath("LOCALAPPDATA"),
+    envPath("PROGRAMFILES"),
+    envPath("ProgramFiles"),
+    envPath("ProgramFiles(x86)"),
+  ]);
+}
+
+function envPath(name) {
+  const directValue = process.env[name];
+  if (directValue) {
+    return directValue;
+  }
+
+  const key = Object.keys(process.env).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+  return key ? process.env[key] : "";
+}
+
+function uniquePaths(paths) {
+  const seen = new Set();
+  const result = [];
+
+  for (const candidate of paths) {
+    if (!candidate) {
+      continue;
+    }
+
+    const key = candidate.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(candidate);
+  }
+
+  return result;
+}
+
 function fileExists(filePath) {
   try {
     return fs.statSync(filePath).isFile();
@@ -179,6 +297,7 @@ function signalProcessTree(pid, signal) {
     const child = spawn("taskkill", args, {
       detached: true,
       stdio: "ignore",
+      windowsHide: true,
     });
     child.unref();
     return;

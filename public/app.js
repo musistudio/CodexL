@@ -7,6 +7,22 @@ const MIN_SCREEN_ZOOM = 1;
 const POINTER_MOVE_SEND_INTERVAL_MS = 33;
 const SCROLL_SEND_INTERVAL_MS = 45;
 const VIEWPORT_SEND_DEBOUNCE_MS = 120;
+const PAGE_ZOOM_SEND_DEBOUNCE_MS = 120;
+const PAGE_ZOOM_STORAGE_KEY = "codex-app-remotely.pageZoomScale";
+const MIN_PAGE_ZOOM_SCALE = 1;
+const MAX_PAGE_ZOOM_SCALE = 3;
+const SIDEBAR_SWIPE_EDGE_MAX_PX = 80;
+const SIDEBAR_SWIPE_EDGE_MIN_PX = 44;
+const SIDEBAR_SWIPE_EDGE_RATIO = 0.08;
+const SIDEBAR_SWIPE_CLOSE_REGION_MAX_PX = 360;
+const SIDEBAR_SWIPE_CLOSE_REGION_MIN_PX = 96;
+const SIDEBAR_SWIPE_CLOSE_REGION_RATIO = 0.36;
+const SIDEBAR_SWIPE_RIGHT_OPEN_REGION_MAX_PX = 220;
+const SIDEBAR_SWIPE_RIGHT_OPEN_REGION_MIN_PX = 76;
+const SIDEBAR_SWIPE_RIGHT_OPEN_REGION_RATIO = 0.22;
+const SIDEBAR_SWIPE_MIN_DISTANCE_PX = 72;
+const SIDEBAR_SWIPE_MAX_VERTICAL_PX = 52;
+const SIDEBAR_SWIPE_DIRECTION_RATIO = 1.35;
 
 const state = {
   connected: false,
@@ -30,13 +46,19 @@ const state = {
   latestFrameMeta: null,
   latestPointer: null,
   pendingScroll: null,
+  hasStoredPageZoom: false,
+  pageZoomMenuOpen: false,
+  pageZoomScale: MIN_PAGE_ZOOM_SCALE,
+  pageZoomTimer: null,
   pinch: null,
   scrollTimer: null,
   frameSocket: null,
+  lastSentPageZoomKey: "",
   screenBaseSize: null,
   screenPanX: 0,
   screenPanY: 0,
   screenSize: null,
+  sidebarSwipe: null,
   statusText: "",
   touchMoved: false,
   viewportTimer: null,
@@ -48,6 +70,11 @@ const screen = document.querySelector("#screen");
 const screenContext = screen.getContext("2d", { alpha: false });
 const emptyState = document.querySelector("#emptyState");
 const keyboardProxy = document.querySelector("#keyboardProxy");
+const pageZoomButton = document.querySelector("#pageZoomButton");
+const pageZoomControl = document.querySelector("#pageZoomControl");
+const pageZoomLabel = document.querySelector("#pageZoomLabel");
+const pageZoomMenu = document.querySelector("#pageZoomMenu");
+const pageZoomSlider = document.querySelector("#pageZoomSlider");
 const qualitySelect = document.querySelector("#qualitySelect");
 const subtitle = document.querySelector("#subtitle");
 
@@ -57,6 +84,32 @@ document.querySelector("#refreshButton").addEventListener("click", () => {
 
 qualitySelect.addEventListener("change", () => {
   send({ type: "profileMode", mode: qualitySelect.value });
+});
+
+pageZoomButton.addEventListener("click", () => {
+  togglePageZoomMenu();
+});
+
+pageZoomSlider.addEventListener("input", () => {
+  setPageZoomScale(pageZoomSlider.value, { remember: true });
+  queuePageZoomUpdate();
+});
+
+pageZoomSlider.addEventListener("change", () => {
+  setPageZoomScale(pageZoomSlider.value, { remember: true });
+  sendPageZoom({ force: true });
+});
+
+document.addEventListener("pointerdown", (event) => {
+  if (state.pageZoomMenuOpen && !pageZoomControl.contains(event.target)) {
+    closePageZoomMenu();
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.pageZoomMenuOpen) {
+    closePageZoomMenu();
+  }
 });
 
 if (window.ResizeObserver) {
@@ -213,6 +266,7 @@ screenWrap.addEventListener(
 
     const touch = event.touches[0];
     state.lastTouch = touch ? { x: touch.clientX, y: touch.clientY, ts: Date.now() } : null;
+    beginSidebarSwipe(touch);
     state.touchMoved = false;
   },
   { passive: false },
@@ -234,6 +288,12 @@ screenWrap.addEventListener(
 
     const touch = event.touches[0];
     if (!touch || !state.lastTouch) {
+      return;
+    }
+
+    const sidebarSwipeState = updateSidebarSwipe(touch);
+    if (sidebarSwipeState === "handled" || sidebarSwipeState === "tracking") {
+      event.preventDefault();
       return;
     }
 
@@ -266,11 +326,13 @@ screenWrap.addEventListener(
     if (state.touchMoved) {
       state.ignoreNextClick = true;
       state.lastTouch = null;
+      state.sidebarSwipe = null;
       event.preventDefault();
       return;
     }
 
     state.lastTouch = null;
+    state.sidebarSwipe = null;
   },
   { passive: false },
 );
@@ -282,10 +344,12 @@ screenWrap.addEventListener(
       endPinch();
     }
     state.lastTouch = null;
+    state.sidebarSwipe = null;
   },
   { passive: true },
 );
 
+initializePageZoomControl();
 connectControl();
 connectFrame();
 setInterval(flushPointerMove, POINTER_MOVE_SEND_INTERVAL_MS);
@@ -304,8 +368,10 @@ function connectControl() {
   socket.addEventListener("open", () => {
     state.connected = true;
     state.lastSentViewportKey = "";
+    state.lastSentPageZoomKey = "";
     setStatus("Connected");
     sendViewport();
+    sendPageZoom({ force: true });
     send({ type: "refresh" });
   });
 
@@ -322,6 +388,7 @@ function connectControl() {
 
     state.connected = false;
     state.lastSentViewportKey = "";
+    state.lastSentPageZoomKey = "";
     setStatus("Control disconnected, retrying");
     setTimeout(connectControl, 1000);
   });
@@ -412,6 +479,9 @@ function handleControlMessage(message) {
     }
     if (message.status?.screencastProfileSettings) {
       state.frameProfile = message.status.screencastProfileSettings;
+    }
+    if (message.status?.pageZoomScale && !state.hasStoredPageZoom && !state.pageZoomMenuOpen) {
+      setPageZoomScale(message.status.pageZoomScale);
     }
     setStatus(message.status?.connected ? "CDP connected" : "Waiting for CDP");
     return;
@@ -520,6 +590,7 @@ function startPinch(event) {
 
   cancelPendingScroll();
   state.lastTouch = null;
+  state.sidebarSwipe = null;
   state.touchMoved = true;
   const center = touchCenter(touches);
   const centerPoint = pointRelativeToWrap(center.x, center.y);
@@ -645,6 +716,106 @@ function pointRelativeToWrap(clientX, clientY) {
   };
 }
 
+function beginSidebarSwipe(touch) {
+  if (!touch) {
+    state.sidebarSwipe = null;
+    return;
+  }
+
+  const rect = screenWrap.getBoundingClientRect();
+  if (!rect.width || !rect.height) {
+    state.sidebarSwipe = null;
+    return;
+  }
+
+  const edgeWidth = sidebarSwipeEdgeWidth(rect);
+  const closeRegionWidth = sidebarSwipeCloseRegionWidth(rect);
+  const rightOpenRegionWidth = sidebarSwipeRightOpenRegionWidth(rect);
+  const rightGestureWidth = Math.max(closeRegionWidth, rightOpenRegionWidth);
+  const x = touch.clientX - rect.left;
+  let side = null;
+  if (x <= Math.max(edgeWidth, closeRegionWidth)) {
+    side = "left";
+  } else if (rect.width - x <= rightGestureWidth) {
+    side = "right";
+  }
+
+  state.sidebarSwipe = side
+    ? {
+        handled: false,
+        side,
+        startX: touch.clientX,
+        startY: touch.clientY,
+      }
+    : null;
+}
+
+function updateSidebarSwipe(touch) {
+  const swipe = state.sidebarSwipe;
+  if (!swipe) {
+    return "inactive";
+  }
+  if (swipe.handled) {
+    return "handled";
+  }
+
+  const dx = touch.clientX - swipe.startX;
+  const dy = touch.clientY - swipe.startY;
+  const absDx = Math.abs(dx);
+  const absDy = Math.abs(dy);
+
+  if (absDy > 18 && absDy > absDx) {
+    state.sidebarSwipe = null;
+    state.lastTouch = { x: touch.clientX, y: touch.clientY, ts: Date.now() };
+    return "inactive";
+  }
+
+  if (absDx < 8 && absDy < 8) {
+    return "inactive";
+  }
+
+  const isHorizontal = absDx >= absDy * SIDEBAR_SWIPE_DIRECTION_RATIO;
+  const direction = dx > 0 ? "right" : "left";
+  if (!isHorizontal) {
+    return "inactive";
+  }
+
+  state.touchMoved = true;
+  state.ignoreNextClick = true;
+
+  if (absDx < SIDEBAR_SWIPE_MIN_DISTANCE_PX || absDy > SIDEBAR_SWIPE_MAX_VERTICAL_PX) {
+    return "tracking";
+  }
+
+  swipe.handled = true;
+  state.lastTouch = { x: touch.clientX, y: touch.clientY, ts: Date.now() };
+  cancelPendingScroll();
+  send({ direction, type: "sidebarSwipe" });
+  return "handled";
+}
+
+function sidebarSwipeEdgeWidth(rect) {
+  return clamp(rect.width * SIDEBAR_SWIPE_EDGE_RATIO, SIDEBAR_SWIPE_EDGE_MIN_PX, SIDEBAR_SWIPE_EDGE_MAX_PX);
+}
+
+function sidebarSwipeCloseRegionWidth(rect) {
+  const width = clamp(
+    rect.width * SIDEBAR_SWIPE_CLOSE_REGION_RATIO,
+    SIDEBAR_SWIPE_CLOSE_REGION_MIN_PX,
+    SIDEBAR_SWIPE_CLOSE_REGION_MAX_PX,
+  );
+  return Math.min(width, rect.width * 0.45);
+}
+
+function sidebarSwipeRightOpenRegionWidth(rect) {
+  const width = clamp(
+    rect.width * SIDEBAR_SWIPE_RIGHT_OPEN_REGION_RATIO,
+    SIDEBAR_SWIPE_RIGHT_OPEN_REGION_MIN_PX,
+    SIDEBAR_SWIPE_RIGHT_OPEN_REGION_MAX_PX,
+  );
+  return Math.min(width, rect.width * 0.35);
+}
+
 function cancelPendingScroll() {
   state.pendingScroll = null;
   if (state.scrollTimer) {
@@ -671,6 +842,105 @@ function queueViewportUpdate() {
     state.viewportTimer = null;
     sendViewport();
   }, VIEWPORT_SEND_DEBOUNCE_MS);
+}
+
+function queuePageZoomUpdate() {
+  if (state.pageZoomTimer) {
+    clearTimeout(state.pageZoomTimer);
+  }
+
+  state.pageZoomTimer = setTimeout(() => {
+    state.pageZoomTimer = null;
+    sendPageZoom();
+  }, PAGE_ZOOM_SEND_DEBOUNCE_MS);
+}
+
+function sendPageZoom({ force = false } = {}) {
+  const scale = state.pageZoomScale;
+  const key = pageZoomKey(scale);
+  if (!force && key === state.lastSentPageZoomKey) {
+    return;
+  }
+
+  const sent = send({
+    scale,
+    type: "pageZoom",
+  });
+  if (sent) {
+    state.lastSentPageZoomKey = key;
+  }
+}
+
+function initializePageZoomControl() {
+  const storedScale = readStoredPageZoomScale();
+  state.hasStoredPageZoom = storedScale !== null;
+  setPageZoomScale(storedScale ?? MIN_PAGE_ZOOM_SCALE);
+}
+
+function togglePageZoomMenu() {
+  if (state.pageZoomMenuOpen) {
+    closePageZoomMenu();
+    return;
+  }
+
+  openPageZoomMenu();
+}
+
+function openPageZoomMenu() {
+  state.pageZoomMenuOpen = true;
+  pageZoomMenu.hidden = false;
+  pageZoomButton.setAttribute("aria-expanded", "true");
+}
+
+function closePageZoomMenu() {
+  state.pageZoomMenuOpen = false;
+  pageZoomMenu.hidden = true;
+  pageZoomButton.setAttribute("aria-expanded", "false");
+}
+
+function setPageZoomScale(scale, { remember = false } = {}) {
+  const normalizedScale = normalizePageZoomScale(scale);
+  state.pageZoomScale = normalizedScale;
+  pageZoomSlider.value = formatPageZoomScale(normalizedScale);
+  pageZoomLabel.textContent = `${formatPageZoomScale(normalizedScale)}x`;
+  if (remember) {
+    rememberPageZoomScale(normalizedScale);
+  }
+}
+
+function rememberPageZoomScale(scale) {
+  state.hasStoredPageZoom = true;
+  try {
+    localStorage.setItem(PAGE_ZOOM_STORAGE_KEY, pageZoomKey(scale));
+  } catch {
+    // Storage can be blocked in private browsing modes.
+  }
+}
+
+function readStoredPageZoomScale() {
+  try {
+    const value = localStorage.getItem(PAGE_ZOOM_STORAGE_KEY);
+    if (!value) {
+      return null;
+    }
+
+    const scale = Number(value);
+    return Number.isFinite(scale) ? normalizePageZoomScale(scale) : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizePageZoomScale(scale) {
+  return Math.round(clamp(Number(scale) || MIN_PAGE_ZOOM_SCALE, MIN_PAGE_ZOOM_SCALE, MAX_PAGE_ZOOM_SCALE) * 100) / 100;
+}
+
+function formatPageZoomScale(scale) {
+  return Number.isInteger(scale) ? String(scale) : scale.toFixed(2).replace(/0$/, "");
+}
+
+function pageZoomKey(scale) {
+  return normalizePageZoomScale(scale).toFixed(2);
 }
 
 function sendViewport() {

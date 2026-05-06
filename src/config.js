@@ -33,6 +33,14 @@ export function parseConfig(argv = process.argv.slice(2), env = process.env) {
   const rawMode = stringValue(args.mode) || env.REMOTE_MODE || "";
   const explicitMode = normalizeMode(rawMode);
   const mode = explicitMode || (args.remote === true || env.REMOTE === "1" || remoteWorkerUrl ? "remote" : "lan");
+  const openDevTools =
+    explicitMode === "debugger" ||
+    args.debug === true ||
+    args.debugger === true ||
+    args.devtools === true ||
+    args["open-devtools"] === true ||
+    env.CODEX_DEBUGGER === "1" ||
+    env.OPEN_DEVTOOLS === "1";
   const cdpPortExplicit = args["cdp-port"] !== undefined || env.CDP_PORT !== undefined;
   const cdpPort = numberValue(args["cdp-port"], env.CDP_PORT, DEFAULT_CDP_PORT);
   const screencastEveryNthFrame = clampNumber(
@@ -68,6 +76,7 @@ export function parseConfig(argv = process.argv.slice(2), env = process.env) {
     mode,
     modeError: rawMode && !explicitMode ? `unknown mode: ${rawMode}` : "",
     openBrowser: args.open === true || env.OPEN_BROWSER === "1",
+    openDevTools,
     port,
     remoteRoom: stringValue(args["remote-room"]) || stringValue(args.room) || env.REMOTE_ROOM || DEFAULT_REMOTE_ROOM,
     remoteWorkerUrl,
@@ -88,23 +97,25 @@ serves a mobile web controller on the LAN.
 Usage:
   car [options]
   car deploy [wrangler options]
+  car debugger [options]
   car remote <worker-url>
   npx codex-app-remotely deploy
   npx codex-app-remotely [options]
 
 Options:
   deploy                         Deploy the bundled Cloudflare Worker relay.
-  --app <path>                    Codex .app bundle path on macOS.
-  --executable <path>             Electron executable path.
+  --app <path>                    Codex app bundle/install directory path.
+  --executable <path>             Electron executable path, such as Codex.exe on Windows.
   --no-launch                     Do not launch Codex; connect to existing CDP.
   --cdp-host <host>               CDP host. Default: 127.0.0.1
   --cdp-port <port>               CDP port. Default: first free port from 9222
   --host <host>                   Web server bind host. Default: 0.0.0.0
   --port <port>                   Web server port. Default: 3147
-  --mode <lan|remote>             Access mode. Default: lan, or remote when --remote-url is set
+  --mode <lan|remote|debugger>    Access mode. Default: lan, or remote when --remote-url is set
   --remote                        Shortcut for --mode remote.
   --remote-url <url>              Cloudflare Worker URL for remote mode.
   --remote-room <room>            Remote session room. Default: default
+  --debugger, --open-devtools     Open Codex DevTools for the selected CDP target.
   --token <token>                 Mobile auth token. Default: random per run
   --screencast-every-nth-frame <n> Minimum screencast frame skip. Default: 1
   --screenshot-max-width <px>     Cap good-profile screenshots to this width. Default: 1440
@@ -117,7 +128,7 @@ Environment:
   CODEX_APP_PATH, CODEX_EXECUTABLE, CDP_HOST, CDP_PORT, HOST, PORT,
   REMOTE_TOKEN, REMOTE_MODE, REMOTE_WORKER_URL, REMOTE_ROOM,
   SCREENCAST_EVERY_NTH_FRAME, SCREENSHOT_MAX_WIDTH, SCREENSHOT_MAX_HEIGHT, SCREENSHOT_QUALITY,
-  NO_LAUNCH=1, OPEN_BROWSER=1
+  NO_LAUNCH=1, OPEN_BROWSER=1, OPEN_DEVTOOLS=1, CODEX_DEBUGGER=1
 `;
 }
 
@@ -147,11 +158,34 @@ export function resolvePath(input) {
     return "";
   }
 
-  if (input.startsWith("~/")) {
-    return path.join(os.homedir(), input.slice(2));
+  const expanded = expandPathVariables(input);
+
+  if (expanded === "~") {
+    return os.homedir();
   }
 
-  return path.resolve(input);
+  if (expanded.startsWith("~/") || expanded.startsWith("~\\")) {
+    return path.join(os.homedir(), expanded.slice(2));
+  }
+
+  return path.resolve(expanded);
+}
+
+function expandPathVariables(input) {
+  return input
+    .replace(/%([^%]+)%/g, (match, name) => envValue(name) || match)
+    .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/gi, (match, name) => envValue(name) || match)
+    .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (match, name) => envValue(name) || match);
+}
+
+function envValue(name) {
+  const directValue = process.env[name];
+  if (directValue) {
+    return directValue;
+  }
+
+  const key = Object.keys(process.env).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+  return key ? process.env[key] : "";
 }
 
 function parseArgs(argv) {
@@ -247,6 +281,10 @@ function stringValue(value) {
 function normalizeMode(value) {
   if (value === "local") {
     return "lan";
+  }
+
+  if (value === "debug" || value === "debugger" || value === "devtools") {
+    return "debugger";
   }
 
   if (value === "lan" || value === "remote") {
