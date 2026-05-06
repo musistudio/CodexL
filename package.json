@@ -1,6 +1,6 @@
 {
   "name": "codex-app-remotely",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Launch and control the local Codex Electron app remotely from a mobile browser.",
   "type": "module",
   "main": "src/server.js",
