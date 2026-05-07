@@ -744,6 +744,7 @@ function beginSidebarSwipe(touch) {
     ? {
         handled: false,
         side,
+        startPoint: normalizedPointFromClient(touch.clientX, touch.clientY),
         startX: touch.clientX,
         startY: touch.clientY,
       }
@@ -790,7 +791,12 @@ function updateSidebarSwipe(touch) {
   swipe.handled = true;
   state.lastTouch = { x: touch.clientX, y: touch.clientY, ts: Date.now() };
   cancelPendingScroll();
-  send({ direction, type: "sidebarSwipe" });
+  send({
+    direction,
+    type: "sidebarSwipe",
+    x: swipe.startPoint?.x,
+    y: swipe.startPoint?.y,
+  });
   return "handled";
 }
 

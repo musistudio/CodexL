@@ -198,6 +198,7 @@ export class CdpBridge extends EventEmitter {
         this.emitWarning(`${normalizedSide} sidebar ${normalizedAction} failed: ${reason}`);
       }
       return {
+        ...response,
         action: normalizedAction,
         ok: false,
         reason,
@@ -216,7 +217,7 @@ export class CdpBridge extends EventEmitter {
     };
   }
 
-  async applySidebarSwipe(direction) {
+  async applySidebarSwipe(direction, startPoint = null) {
     const normalizedDirection = direction === "left" ? "left" : "right";
     const closeSide = normalizedDirection === "right" ? "right" : "left";
     const openSide = normalizedDirection === "right" ? "left" : "right";
@@ -230,6 +231,14 @@ export class CdpBridge extends EventEmitter {
 
     if (closeResult?.sideOpen) {
       return closeResult;
+    }
+
+    if (await this.isScrollableAt(startPoint?.x, startPoint?.y)) {
+      return {
+        ok: true,
+        reason: "gesture started on a scrollable component",
+        skipped: true,
+      };
     }
 
     return this.setSidebar(openSide, "open");
@@ -249,6 +258,21 @@ export class CdpBridge extends EventEmitter {
     const point = await this.pointFromNormalized(normalizedX, normalizedY);
     const result = await this.send("Runtime.evaluate", {
       expression: editableProbeExpression(point.x, point.y),
+      returnByValue: true,
+    });
+    return Boolean(result.result?.value);
+  }
+
+  async isScrollableAt(normalizedX, normalizedY) {
+    const x = Number(normalizedX);
+    const y = Number(normalizedY);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      return false;
+    }
+
+    const point = await this.pointFromNormalized(x, y);
+    const result = await this.send("Runtime.evaluate", {
+      expression: scrollableProbeExpression(point.x, point.y),
       returnByValue: true,
     });
     return Boolean(result.result?.value);
@@ -1815,6 +1839,21 @@ function editableFocusExpression() {
   })()`;
 }
 
+function scrollableProbeExpression(x, y) {
+  return `(() => {
+    ${scrollableHelpers()}
+    let element = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
+    while (element && element.shadowRoot) {
+      const nested = element.shadowRoot.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
+      if (!nested || nested === element) {
+        break;
+      }
+      element = nested;
+    }
+    return closestScrollable(element);
+  })()`;
+}
+
 function editableRectsExpression() {
   return `(() => {
     ${editableHelpers()}
@@ -1870,6 +1909,71 @@ function editableRectsExpression() {
 
     return rects.slice(0, 200);
   })()`;
+}
+
+function scrollableHelpers() {
+  return `
+    const viewportWidth = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+    const viewportHeight = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+    const scrollableOverflowValues = new Set(["auto", "scroll", "overlay"]);
+
+    function composedParent(element) {
+      if (!element) {
+        return null;
+      }
+
+      if (element.parentElement) {
+        return element.parentElement;
+      }
+
+      const root = element.getRootNode && element.getRootNode();
+      return root && root.host ? root.host : null;
+    }
+
+    function canScrollAxis(scrollSize, clientSize, overflowValue) {
+      return scrollSize - clientSize > 2 && scrollableOverflowValues.has(overflowValue);
+    }
+
+    function isScrollableElement(element) {
+      if (!element || element.nodeType !== Node.ELEMENT_NODE) {
+        return false;
+      }
+
+      if (element === document.documentElement || element === document.body) {
+        return false;
+      }
+
+      const style = window.getComputedStyle(element);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+        return false;
+      }
+
+      const rect = element.getBoundingClientRect();
+      if (rect.width < 16 || rect.height < 16) {
+        return false;
+      }
+
+      if (rect.width >= viewportWidth * 0.96 && rect.height >= viewportHeight * 0.96) {
+        return false;
+      }
+
+      return (
+        canScrollAxis(element.scrollWidth, element.clientWidth, style.overflowX) ||
+        canScrollAxis(element.scrollHeight, element.clientHeight, style.overflowY)
+      );
+    }
+
+    function closestScrollable(element) {
+      let current = element;
+      while (current) {
+        if (isScrollableElement(current)) {
+          return true;
+        }
+        current = composedParent(current);
+      }
+      return false;
+    }
+  `;
 }
 
 function editableHelpers() {

@@ -215,7 +215,10 @@ async function handleMobileMessage(transport, client, message) {
   }
 
   if (message.type === "sidebarSwipe") {
-    await bridge.applySidebarSwipe(message.direction);
+    await bridge.applySidebarSwipe(message.direction, {
+      x: message.x,
+      y: message.y,
+    });
     return;
   }
 
