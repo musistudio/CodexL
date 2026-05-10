@@ -1,11 +1,16 @@
+import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js";
+
 const urlParams = new URLSearchParams(location.search);
 const token = urlParams.get("token") || "";
 const remoteRoom = urlParams.get("room") || "default";
 const wsBasePath = websocketBasePath();
+const transportPreference = (urlParams.get("transport") || "auto").toLowerCase();
 const MAX_SCREEN_ZOOM = 4;
 const MIN_SCREEN_ZOOM = 1;
 const POINTER_MOVE_SEND_INTERVAL_MS = 33;
+const RECONNECT_MS = 1000;
 const SCROLL_SEND_INTERVAL_MS = 45;
+const TRANSPORT_CONNECT_TIMEOUT_MS = 2500;
 const VIEWPORT_SEND_DEBOUNCE_MS = 120;
 const PAGE_ZOOM_SEND_DEBOUNCE_MS = 120;
 const PAGE_ZOOM_STORAGE_KEY = "codex-app-remotely.pageZoomScale";
@@ -23,6 +28,8 @@ const SIDEBAR_SWIPE_RIGHT_OPEN_REGION_RATIO = 0.22;
 const SIDEBAR_SWIPE_MIN_DISTANCE_PX = 72;
 const SIDEBAR_SWIPE_MAX_VERTICAL_PX = 52;
 const SIDEBAR_SWIPE_DIRECTION_RATIO = 1.35;
+
+let webTransportFallbackLogged = false;
 
 const state = {
   connected: false,
@@ -61,6 +68,8 @@ const state = {
   sidebarSwipe: null,
   statusText: "",
   touchMoved: false,
+  transportConnectAttempt: 0,
+  transportSession: null,
   viewportTimer: null,
   zoom: 1,
 };
@@ -350,86 +359,88 @@ screenWrap.addEventListener(
 );
 
 initializePageZoomControl();
-connectControl();
-connectFrame();
+connectRealtime();
 setInterval(flushPointerMove, POINTER_MOVE_SEND_INTERVAL_MS);
 requestAnimationFrame(renderFrameLoop);
 
-function connectControl() {
+async function connectRealtime() {
   if (!token) {
     setStatus("Missing token");
     return;
   }
 
-  const socket = new WebSocket(wsUrl("/ws/control"));
-  state.controlSocket = socket;
+  const attempt = ++state.transportConnectAttempt;
   setStatus("Connecting");
 
-  socket.addEventListener("open", () => {
-    state.connected = true;
-    state.lastSentViewportKey = "";
-    state.lastSentPageZoomKey = "";
-    setStatus("Connected");
-    sendViewport();
-    sendPageZoom({ force: true });
-    send({ type: "refresh" });
-  });
+  let session;
+  try {
+    session = await openRealtimeSession({
+      controlWebSocketUrl: wsUrl("/ws/control"),
+      frameWebSocketUrl: wsUrl("/ws/frame"),
+      onWebTransportFallback: logWebTransportFallback,
+      timeoutMs: TRANSPORT_CONNECT_TIMEOUT_MS,
+      transportPreference,
+      webTransportUrl: webTransportUrl(),
+    });
+  } catch {
+    if (state.transportConnectAttempt === attempt) {
+      handleTransportDisconnect("Control disconnected, retrying");
+    }
+    return;
+  }
 
-  socket.addEventListener("message", (event) => {
+  if (state.transportConnectAttempt !== attempt) {
+    session.close();
+    return;
+  }
+
+  state.transportSession = session;
+  state.controlSocket = session.control;
+  state.frameSocket = session.frame;
+
+  session.control.addEventListener("message", (event) => {
     if (typeof event.data === "string") {
       handleControlMessage(JSON.parse(event.data));
     }
   });
 
-  socket.addEventListener("close", () => {
-    if (state.controlSocket !== socket) {
-      return;
-    }
-
-    state.connected = false;
-    state.lastSentViewportKey = "";
-    state.lastSentPageZoomKey = "";
-    setStatus("Control disconnected, retrying");
-    setTimeout(connectControl, 1000);
-  });
-
-  socket.addEventListener("error", () => {
-    socket.close();
-  });
-}
-
-function connectFrame() {
-  if (!token) {
-    return;
-  }
-
-  const socket = new WebSocket(wsUrl("/ws/frame"));
-  socket.binaryType = "arraybuffer";
-  state.frameSocket = socket;
-
-  socket.addEventListener("open", () => {
-    state.frameConnected = true;
-  });
-
-  socket.addEventListener("message", (event) => {
+  session.frame.addEventListener("message", (event) => {
     if (typeof event.data !== "string") {
       state.latestFrame = event.data;
     }
   });
 
-  socket.addEventListener("close", () => {
-    if (state.frameSocket !== socket) {
+  session.frame.addEventListener("metadata", (event) => {
+    if (event.detail && typeof event.detail === "object") {
+      handleControlMessage({ ...event.detail, type: "frameMeta" });
+    }
+  });
+
+  session.addEventListener("close", () => {
+    if (state.transportSession !== session) {
       return;
     }
 
-    state.frameConnected = false;
-    state.latestFrame = null;
-    setTimeout(connectFrame, 1000);
+    handleTransportDisconnect("Control disconnected, retrying");
   });
 
-  socket.addEventListener("error", () => {
-    socket.close();
+  session.addEventListener("error", () => {
+    session.close();
   });
+
+  if (session.control.readyState !== TRANSPORT_OPEN || session.frame.readyState !== TRANSPORT_OPEN) {
+    session.close();
+    return;
+  }
+
+  state.connected = true;
+  state.frameConnected = true;
+  state.lastSentViewportKey = "";
+  state.lastSentPageZoomKey = "";
+  setStatus("Connected");
+  sendViewport();
+  sendPageZoom({ force: true });
+  send({ type: "refresh" });
 }
 
 function wsUrl(pathname) {
@@ -439,6 +450,41 @@ function wsUrl(pathname) {
     params.set("room", remoteRoom);
   }
   return `${protocol}//${location.host}${wsBasePath}${pathname}?${params.toString()}`;
+}
+
+function webTransportUrl() {
+  const params = new URLSearchParams({ token });
+  if (remoteRoom) {
+    params.set("room", remoteRoom);
+  }
+  return `https://${webTransportHost()}${wsBasePath}/wt/session?${params.toString()}`;
+}
+
+function webTransportHost() {
+  const hostname = location.hostname.includes(":") ? `[${location.hostname.replace(/^\[|\]$/g, "")}]` : location.hostname;
+  return `${hostname}:${location.port || "443"}`;
+}
+
+function handleTransportDisconnect(statusText) {
+  state.connected = false;
+  state.controlSocket = null;
+  state.frameConnected = false;
+  state.frameSocket = null;
+  state.lastSentViewportKey = "";
+  state.lastSentPageZoomKey = "";
+  state.latestFrame = null;
+  state.transportSession = null;
+  setStatus(statusText);
+  setTimeout(connectRealtime, RECONNECT_MS);
+}
+
+function logWebTransportFallback(error) {
+  if (webTransportFallbackLogged) {
+    return;
+  }
+
+  webTransportFallbackLogged = true;
+  console.info("[transport] WebTransport unavailable, falling back to WebSocket", error);
 }
 
 function websocketBasePath() {
@@ -831,7 +877,7 @@ function cancelPendingScroll() {
 }
 
 function send(payload) {
-  if (!state.controlSocket || state.controlSocket.readyState !== WebSocket.OPEN) {
+  if (!state.controlSocket || state.controlSocket.readyState !== TRANSPORT_OPEN) {
     return false;
   }
 

@@ -11,6 +11,7 @@
   "files": [
     "imgs",
     "public",
+    "selfhost",
     "src",
     "worker",
     "LICENSE",
@@ -21,7 +22,8 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "check": "node --check src/*.js worker/*.js public/app.js"
+    "check": "node --check src/*.js worker/*.js public/*.js selfhost/*.js",
+    "relay:selfhost": "deno run --allow-net --allow-read --allow-env --unstable-net selfhost/relay.js"
   },
   "keywords": [
     "codex",

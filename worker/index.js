@@ -312,15 +312,21 @@ function isRelayRequest(pathname) {
 }
 
 function roleFromPath(pathname) {
-  if (pathname === "/ws" || pathname.endsWith("/ws/control")) {
+  if (
+    pathname === "/ws" ||
+    pathname === "/wt" ||
+    pathname.endsWith("/ws/control") ||
+    pathname.endsWith("/wt/control") ||
+    pathname.endsWith("/wt/session")
+  ) {
     return "control";
   }
 
-  if (pathname.endsWith("/ws/frame")) {
+  if (pathname.endsWith("/ws/frame") || pathname.endsWith("/wt/frame")) {
     return "frame";
   }
 
-  if (pathname.endsWith("/ws/host")) {
+  if (pathname.endsWith("/ws/host") || pathname.endsWith("/wt/host")) {
     return "host";
   }
 

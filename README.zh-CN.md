@@ -59,7 +59,107 @@ npm run start -- --mode remote --remote-url "https://codex-app-remotely-remote.<
 npm run start remote "https://codex-app-remotely-remote.<account>.workers.dev"
 ```
 
-CLI 会输出带 `room` 和 `token` 的远端 URL，手机浏览器打开或扫码即可。如果 URL 没有 `room`，两端都会使用 `default`。本机进程会向 `/ws/host` 建立出站 WebSocket；远端浏览器使用 `/ws/control` 和 `/ws/frame`；每个 `room` 对应一个 Durable Object，用来中继控制 JSON 和二进制画面帧。
+CLI 会输出带 `room` 和 `token` 的远端 URL，手机浏览器打开或扫码即可。如果 URL 没有 `room`，两端都会使用 `default`。本机进程会向 `/ws/host` 建立出站 WebSocket；远端浏览器会在浏览器和 HTTPS 源支持时优先尝试 `/wt/session` 的低延迟 WebTransport 单会话，失败后回退到 `/ws/control` 和 `/ws/frame`；每个 `room` 对应一个 Durable Object，用来中继控制 JSON 和二进制画面帧。
+
+### 自托管 WebTransport 中继
+
+Cloudflare Worker remote 模式仍以 WebSocket 为主。要在自己的服务器上启用低延迟 WebTransport 中继，可以部署项目内置的 Deno relay。服务器需要真实 TLS 证书，并且同一个公网端口同时开放 TCP 和 UDP：
+
+```bash
+docker build -f selfhost/Dockerfile -t codex-app-remotely-relay .
+
+docker run -d --name codex-app-remotely-relay \
+  --restart unless-stopped \
+  -p 443:8443/tcp \
+  -p 443:8443/udp \
+  -v /etc/letsencrypt:/etc/letsencrypt:ro \
+  -e TLS_CERT=/etc/letsencrypt/live/remote.example.com/fullchain.pem \
+  -e TLS_KEY=/etc/letsencrypt/live/remote.example.com/privkey.pem \
+  codex-app-remotely-relay
+```
+
+然后把本机 host 指向你的 relay：
+
+```bash
+car --mode remote --remote-url "https://remote.example.com"
+```
+
+自托管 relay 会负责提供移动端页面、接受本机 host 的 `/ws/host` 连接、提供 `/ws/control` 和 `/ws/frame` 的 WebSocket 回退，并在 `/wt/session` 上接受 WebTransport。WebTransport 需要 HTTPS 和可访问的 UDP 端口；如果 UDP/HTTP3 被网络拦截，浏览器会自动回退到 WebSocket。
+
+#### 搭配 Nginx 使用
+
+WebTransport 不能按普通 WebSocket 反代来处理。建议用 Nginx 的 HTTP 反代处理页面和 WebSocket 回退，同时用顶层 `stream {}` 把 UDP/443 透传给 relay。除非由 Nginx 自己终止并服务 WebTransport，否则不要给这个域名配置 `listen 443 quic`，因为内置 relay 需要直接收到 HTTP/3/QUIC 流量。
+
+先让 relay 监听本机端口，并挂载同一份 TLS 证书：
+
+```bash
+docker run -d --name codex-app-remotely-relay \
+  --restart unless-stopped \
+  -p 127.0.0.1:8443:8443/tcp \
+  -p 127.0.0.1:8443:8443/udp \
+  -v /etc/letsencrypt:/etc/letsencrypt:ro \
+  -e TLS_CERT=/etc/letsencrypt/live/remote.example.com/fullchain.pem \
+  -e TLS_KEY=/etc/letsencrypt/live/remote.example.com/privkey.pem \
+  codex-app-remotely-relay
+```
+
+然后添加类似下面的 Nginx 配置。`http {}` 负责 HTTPS 和 WebSocket upgrade 头；顶层 `stream {}` 负责把 QUIC/WebTransport 的 UDP 包转发到 relay：
+
+```nginx
+# /etc/nginx/nginx.conf
+stream {
+    server {
+        listen 443 udp reuseport;
+        proxy_pass 127.0.0.1:8443;
+        proxy_timeout 10m;
+    }
+}
+
+http {
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    server {
+        listen 443 ssl;
+        server_name remote.example.com;
+
+        ssl_certificate     /etc/letsencrypt/live/remote.example.com/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/remote.example.com/privkey.pem;
+
+        location / {
+            proxy_pass https://127.0.0.1:8443;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 1h;
+
+            # relay 本身也会在本机终止 TLS，用于 UDP 上的 WebTransport。
+            proxy_ssl_server_name on;
+            proxy_ssl_name remote.example.com;
+        }
+    }
+}
+```
+
+重载 Nginx 后，确认防火墙同时放行 `443/tcp` 和 `443/udp`。本机 host 仍然使用普通 HTTPS URL：
+
+```bash
+car --mode remote --remote-url "https://remote.example.com"
+```
+
+如果不使用 Docker，也可以安装 Deno 2.2+ 后直接启动：
+
+```bash
+TLS_CERT=/etc/letsencrypt/live/remote.example.com/fullchain.pem \
+TLS_KEY=/etc/letsencrypt/live/remote.example.com/privkey.pem \
+PORT=443 \
+npm run relay:selfhost
+```
 
 ### debugger 模式
 
@@ -186,7 +286,8 @@ car \
 - `src/staticServer.js`：静态页面和少量状态 API。
 - `src/workerDeploy.js`：部署内置 Cloudflare Worker 中继的命令封装。
 - `worker/index.js`：Cloudflare Worker + Durable Object 远端 room 中继。
-- `public/`：移动端控制页面。
+- `selfhost/relay.js`：基于 Deno 的自托管中继，提供 HTTPS、WebSocket 回退和 HTTP/3 WebTransport。
+- `public/`：移动端控制页面，内置 WebTransport 优先的传输适配器和 WebSocket 回退。WebTransport 协议用可靠双向流传控制 JSON，用服务端单向流或分片 datagram 独立传画面帧，过期帧可直接丢弃，不阻塞输入。
 
 ## 安全说明
 

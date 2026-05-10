@@ -61,7 +61,107 @@ npm run start -- --mode remote --remote-url "https://codex-app-remotely-remote.<
 npm run start remote "https://codex-app-remotely-remote.<account>.workers.dev"
 ```
 
-The CLI prints a remote URL containing `room` and `token`. Open or scan that URL from the remote browser. If `room` is omitted, both sides use `default`. The local process opens an outbound WebSocket to `/ws/host`; remote browsers use `/ws/control` and `/ws/frame`; one Durable Object instance per `room` relays control JSON and binary frames.
+The CLI prints a remote URL containing `room` and `token`. Open or scan that URL from the remote browser. If `room` is omitted, both sides use `default`. The local process opens an outbound WebSocket to `/ws/host`; remote browsers first try one low-latency WebTransport session on `/wt/session` when supported by the browser and HTTPS origin, then fall back to `/ws/control` and `/ws/frame`; one Durable Object instance per `room` relays control JSON and binary frames.
+
+### Self-Hosted WebTransport Relay
+
+Cloudflare Worker remote mode remains WebSocket-based. To run the low-latency WebTransport relay on your own server, deploy the bundled Deno relay with a real TLS certificate and open both TCP and UDP on the same public port:
+
+```bash
+docker build -f selfhost/Dockerfile -t codex-app-remotely-relay .
+
+docker run -d --name codex-app-remotely-relay \
+  --restart unless-stopped \
+  -p 443:8443/tcp \
+  -p 443:8443/udp \
+  -v /etc/letsencrypt:/etc/letsencrypt:ro \
+  -e TLS_CERT=/etc/letsencrypt/live/remote.example.com/fullchain.pem \
+  -e TLS_KEY=/etc/letsencrypt/live/remote.example.com/privkey.pem \
+  codex-app-remotely-relay
+```
+
+Then point the local host at your relay:
+
+```bash
+car --mode remote --remote-url "https://remote.example.com"
+```
+
+The self-hosted relay serves the mobile page, accepts the local host on `/ws/host`, accepts WebSocket fallback clients on `/ws/control` and `/ws/frame`, and accepts WebTransport clients on `/wt/session`. WebTransport requires HTTPS and a reachable UDP port; if UDP/HTTP3 is blocked, browsers automatically fall back to WebSocket.
+
+#### Using Nginx In Front
+
+WebTransport is not the same as WebSocket proxying. Use normal Nginx HTTP reverse proxying for the page and WebSocket fallback, and pass UDP/443 through to the relay for WebTransport. Do not configure Nginx `listen 443 quic` for this hostname unless Nginx itself is terminating and serving WebTransport; the bundled relay needs to receive the HTTP/3/QUIC traffic.
+
+Run the relay on localhost with its TLS certificate:
+
+```bash
+docker run -d --name codex-app-remotely-relay \
+  --restart unless-stopped \
+  -p 127.0.0.1:8443:8443/tcp \
+  -p 127.0.0.1:8443:8443/udp \
+  -v /etc/letsencrypt:/etc/letsencrypt:ro \
+  -e TLS_CERT=/etc/letsencrypt/live/remote.example.com/fullchain.pem \
+  -e TLS_KEY=/etc/letsencrypt/live/remote.example.com/privkey.pem \
+  codex-app-remotely-relay
+```
+
+Then add an Nginx config like this. The `http {}` block handles HTTPS and WebSocket upgrade headers; the top-level `stream {}` block passes QUIC/WebTransport UDP packets to the relay:
+
+```nginx
+# /etc/nginx/nginx.conf
+stream {
+    server {
+        listen 443 udp reuseport;
+        proxy_pass 127.0.0.1:8443;
+        proxy_timeout 10m;
+    }
+}
+
+http {
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    server {
+        listen 443 ssl;
+        server_name remote.example.com;
+
+        ssl_certificate     /etc/letsencrypt/live/remote.example.com/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/remote.example.com/privkey.pem;
+
+        location / {
+            proxy_pass https://127.0.0.1:8443;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 1h;
+
+            # The relay also terminates TLS locally so it can serve WebTransport on UDP.
+            proxy_ssl_server_name on;
+            proxy_ssl_name remote.example.com;
+        }
+    }
+}
+```
+
+After reloading Nginx, make sure the firewall allows both `443/tcp` and `443/udp`. You can still point the local host at the normal HTTPS URL:
+
+```bash
+car --mode remote --remote-url "https://remote.example.com"
+```
+
+If you run without Docker, install Deno 2.2+ and start the relay directly:
+
+```bash
+TLS_CERT=/etc/letsencrypt/live/remote.example.com/fullchain.pem \
+TLS_KEY=/etc/letsencrypt/live/remote.example.com/privkey.pem \
+PORT=443 \
+npm run relay:selfhost
+```
 
 ### Debugger Mode
 
@@ -188,7 +288,8 @@ You can also configure the server with environment variables:
 - `src/staticServer.js`: static file server plus small status APIs.
 - `src/workerDeploy.js`: deploy command wrapper for the bundled Cloudflare Worker relay.
 - `worker/index.js`: Cloudflare Worker + Durable Object relay for remote rooms.
-- `public/`: mobile control page.
+- `selfhost/relay.js`: Deno-based self-hosted relay with HTTPS, WebSocket fallback, and WebTransport over HTTP/3.
+- `public/`: mobile control page with a WebTransport-first transport adapter and WebSocket fallback. The WebTransport protocol uses a reliable bidirectional stream for control JSON and independent frame delivery via server unidirectional streams or chunked datagrams so stale frames can be dropped without blocking input.
 
 ## Security Notes
 
