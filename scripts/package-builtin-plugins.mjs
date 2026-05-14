@@ -6,12 +6,8 @@ import { fileURLToPath } from "node:url";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const builtinPluginsDir = join(repoRoot, "extensions", "builtins");
 const packageDir = join(repoRoot, "src-tauri", "builtin-plugin-packages");
-const nextAiGatewaySourceDir = resolve(
-  process.env.NEXT_AI_GATEWAY_SOURCE_DIR,
-);
-const botGatewaySourceDir = resolve(
-  process.env.BOT_GATEWAY_SOURCE_DIR,
-);
+const nextAiGatewaySourceDir = optionalResolveEnvPath("NEXT_AI_GATEWAY_SOURCE_DIR");
+const botGatewaySourceDir = optionalResolveEnvPath("BOT_GATEWAY_SOURCE_DIR");
 
 const plugins = [
   {
@@ -56,10 +52,20 @@ function readManifest(pluginDir) {
   return manifest;
 }
 
+function optionalResolveEnvPath(name) {
+  const value = process.env[name];
+  return value ? resolve(value) : undefined;
+}
+
 function syncBotGateway(pluginDir) {
-  const sourceBundle = join(botGatewaySourceDir, "dist-bundle", "stdio", "stdio.js");
   const outputFile = join(pluginDir, "stdio", "stdio.js");
 
+  if (!botGatewaySourceDir) {
+    reuseExistingBundleOrThrow(outputFile, "BOT_GATEWAY_SOURCE_DIR");
+    return;
+  }
+
+  const sourceBundle = join(botGatewaySourceDir, "dist-bundle", "stdio", "stdio.js");
   if (!existsSync(sourceBundle)) {
     if (existsSync(outputFile)) {
       console.warn(`Bot Gateway source bundle skipped; reusing existing bundle: ${outputFile}`);
@@ -113,6 +119,13 @@ function patchBotGatewayFeishuCardActions(content, outputFile) {
 }
 
 function buildNextAiGateway(pluginDir) {
+  const outputFile = join(pluginDir, "gateway", "index.cjs");
+
+  if (!nextAiGatewaySourceDir) {
+    reuseExistingBundleOrThrow(outputFile, "NEXT_AI_GATEWAY_SOURCE_DIR");
+    return;
+  }
+
   const entryPoint = join(nextAiGatewaySourceDir, "src", "index.ts");
   const esbuild = join(
     nextAiGatewaySourceDir,
@@ -120,7 +133,6 @@ function buildNextAiGateway(pluginDir) {
     ".bin",
     process.platform === "win32" ? "esbuild.cmd" : "esbuild",
   );
-  const outputFile = join(pluginDir, "gateway", "index.cjs");
 
   if (!existsSync(entryPoint) || !existsSync(esbuild)) {
     if (existsSync(outputFile)) {
@@ -153,4 +165,12 @@ function buildNextAiGateway(pluginDir) {
       stdio: "inherit",
     },
   );
+}
+
+function reuseExistingBundleOrThrow(outputFile, envName) {
+  if (existsSync(outputFile)) {
+    console.warn(`${envName} is not set; reusing existing bundle: ${outputFile}`);
+    return;
+  }
+  throw new Error(`${envName} is not set and no existing bundle was found: ${outputFile}`);
 }
