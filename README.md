@@ -2,6 +2,8 @@
 
 CodexL is a Tauri desktop launcher for managing multiple local Codex App workspaces, with LAN remote control, optional cloud relay, and built-in extension integrations.
 
+![https://codexl.io/_next/static/media/ui-preview.0-xm_pna~f-hv.webp](https://codexl.io/_next/static/media/ui-preview.0-xm_pna~f-hv.webp)
+
 中文文档见 [README_zh.md](README_zh.md).
 
 ## Overview

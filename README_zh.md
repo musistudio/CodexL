@@ -2,6 +2,8 @@
 
 CodexL 是一个 Tauri 桌面启动器，用来管理本机 Codex App 的多个工作空间，并为每个工作空间提供 LAN 远控、可选云中继和内置扩展集成。
 
+![https://codexl.io/_next/static/media/ui-preview.0-xm_pna~f-hv.webp](https://codexl.io/_next/static/media/ui-preview.0-xm_pna~f-hv.webp)
+
 English documentation is available in [README.md](README.md).
 
 ## 项目概览
