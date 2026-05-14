@@ -1,0 +1,172 @@
+@import "tailwindcss";
+
+@theme inline {
+    --color-background: var(--app-background);
+    --color-foreground: var(--app-foreground);
+    --color-card: var(--app-card);
+    --color-card-foreground: var(--app-card-foreground);
+    --color-primary: var(--app-primary);
+    --color-primary-foreground: var(--app-primary-foreground);
+    --color-secondary: var(--app-secondary);
+    --color-secondary-foreground: var(--app-secondary-foreground);
+    --color-muted: var(--app-muted);
+    --color-muted-foreground: var(--app-muted-foreground);
+    --color-accent: var(--app-accent);
+    --color-accent-foreground: var(--app-accent-foreground);
+    --color-destructive: var(--app-destructive);
+    --color-border: var(--app-border);
+    --color-input: var(--app-input);
+    --color-ring: var(--app-ring);
+    --color-emerald: var(--app-emerald);
+    --color-emerald-foreground: var(--app-emerald-foreground);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+}
+
+:root {
+    --radius: 0.5rem;
+}
+
+:root,
+html[data-theme="dark"] {
+    color-scheme: dark;
+    --app-background: oklch(0.11 0 0);
+    --app-foreground: oklch(0.95 0 0);
+    --app-card: oklch(0.13 0 0);
+    --app-card-foreground: oklch(0.985 0 0);
+    --app-primary: oklch(0.98 0 0);
+    --app-primary-foreground: oklch(0.1 0 0);
+    --app-secondary: oklch(0.18 0 0);
+    --app-secondary-foreground: oklch(0.985 0 0);
+    --app-muted: oklch(0.18 0 0);
+    --app-muted-foreground: oklch(0.708 0 0);
+    --app-accent: oklch(0.18 0 0);
+    --app-accent-foreground: oklch(0.985 0 0);
+    --app-destructive: oklch(0.6 0.2 22);
+    --app-border: oklch(0.22 0 0);
+    --app-input: oklch(0.22 0 0);
+    --app-ring: oklch(0.556 0 0);
+    --app-emerald: oklch(0.7 0.17 163);
+    --app-emerald-foreground: oklch(0.15 0.05 163);
+}
+
+html[data-theme="light"] {
+    color-scheme: light;
+    --app-background: oklch(0.98 0 0);
+    --app-foreground: oklch(0.16 0 0);
+    --app-card: oklch(1 0 0);
+    --app-card-foreground: oklch(0.16 0 0);
+    --app-primary: oklch(0.18 0 0);
+    --app-primary-foreground: oklch(0.98 0 0);
+    --app-secondary: oklch(0.94 0 0);
+    --app-secondary-foreground: oklch(0.18 0 0);
+    --app-muted: oklch(0.94 0 0);
+    --app-muted-foreground: oklch(0.48 0 0);
+    --app-accent: oklch(0.92 0 0);
+    --app-accent-foreground: oklch(0.18 0 0);
+    --app-destructive: oklch(0.56 0.2 22);
+    --app-border: oklch(0.88 0 0);
+    --app-input: oklch(0.86 0 0);
+    --app-ring: oklch(0.5 0 0);
+    --app-emerald: oklch(0.56 0.16 163);
+    --app-emerald-foreground: oklch(0.98 0.02 163);
+}
+
+#root {
+    min-height: 100vh;
+}
+
+@layer base {
+    * {
+        @apply border-border outline-ring/50;
+    }
+    body {
+        @apply bg-background text-foreground font-sans;
+    }
+}
+
+@layer components {
+    .account-avatar-shell {
+        position: relative;
+        isolation: isolate;
+        display: inline-flex;
+        height: 2rem;
+        width: 2rem;
+        align-items: center;
+        justify-content: center;
+        border-radius: 9999px;
+    }
+
+    .account-avatar-premium {
+        --premium-glow-a: oklch(0.78 0.17 86);
+        --premium-glow-b: oklch(0.76 0.13 165);
+        --premium-glow-c: oklch(0.72 0.16 262);
+    }
+
+    .account-avatar-premium::before {
+        content: "";
+        position: absolute;
+        inset: -4px;
+        z-index: -1;
+        border-radius: inherit;
+        background: conic-gradient(
+            from 140deg,
+            var(--premium-glow-a),
+            var(--premium-glow-b),
+            var(--premium-glow-c),
+            var(--premium-glow-a)
+        );
+        filter: blur(3px);
+        opacity: 0.92;
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+        .account-avatar-premium::before {
+            animation: account-avatar-premium-glow 3.2s ease-in-out infinite;
+        }
+    }
+
+    @keyframes account-avatar-premium-glow {
+        0%,
+        100% {
+            opacity: 0.72;
+            transform: scale(0.96);
+        }
+
+        50% {
+            opacity: 1;
+            transform: scale(1.04);
+        }
+    }
+
+    .account-avatar-premium::after {
+        content: "";
+        position: absolute;
+        inset: -1px;
+        z-index: 0;
+        pointer-events: none;
+        border-radius: inherit;
+        border: 1px solid color-mix(in oklch, var(--premium-glow-a) 78%, transparent);
+    }
+
+    html[data-theme="dark"] .account-avatar-premium {
+        box-shadow:
+            0 0 0 1px color-mix(in oklch, var(--premium-glow-a) 55%, transparent),
+            0 0 18px color-mix(in oklch, var(--premium-glow-b) 54%, transparent),
+            0 0 34px color-mix(in oklch, var(--premium-glow-c) 34%, transparent);
+    }
+
+    html[data-theme="light"] .account-avatar-premium {
+        --premium-glow-a: oklch(0.68 0.15 83);
+        --premium-glow-b: oklch(0.62 0.13 165);
+        --premium-glow-c: oklch(0.58 0.15 262);
+        box-shadow:
+            0 0 0 1px color-mix(in oklch, var(--premium-glow-a) 62%, transparent),
+            0 0 12px color-mix(in oklch, var(--premium-glow-b) 38%, transparent),
+            0 0 24px color-mix(in oklch, var(--premium-glow-c) 24%, transparent);
+    }
+}

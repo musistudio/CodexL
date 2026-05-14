@@ -1,0 +1,18 @@
+{
+  "name": "CodexL Remote",
+  "short_name": "CodexL Remote",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#101114",
+  "theme_color": "#101114",
+  "description": "Scan a CodexL instance QR code and control it from a mobile browser.",
+  "icons": [
+    {
+      "src": "icon.png",
+      "sizes": "1254x1254",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

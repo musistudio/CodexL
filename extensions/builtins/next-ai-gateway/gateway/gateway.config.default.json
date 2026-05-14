@@ -1,0 +1,31 @@
+{
+  "host": "127.0.0.1",
+  "port": 14589,
+  "bodyLimitBytes": 52428800,
+  "Providers": [],
+  "auth": {
+    "enabled": false
+  },
+  "billing": {
+    "enabled": false
+  },
+  "billingQueue": {
+    "enabled": false
+  },
+  "billingWebhook": {
+    "enabled": false
+  },
+  "rawTrace": {
+    "enabled": false,
+    "mode": "disabled"
+  },
+  "agent": {
+    "storage": {
+      "type": "filesystem"
+    },
+    "mcpServers": []
+  },
+  "mcpGateway": {
+    "enabled": false
+  }
+}

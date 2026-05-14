@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#101114" />
+    <title>CodexL Remote</title>
+    <link rel="icon" type="image/png" href="icon.png" />
+    <link rel="apple-touch-icon" href="icon.png" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="stylesheet" href="styles.css?v=20260513-local-bridge-plain-v2" />
+  </head>
+  <body>
+    <div id="controlView" class="control-view">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button id="backButton" class="icon-button back-button" type="button" title="Back to instances" aria-label="Back to instances">‹</button>
+          <div id="subtitle" class="subtitle">Connecting</div>
+        </div>
+        <div class="topbar-actions">
+          <select id="remoteModeSelect" class="mode-select" aria-label="Remote mode" hidden>
+            <option value="web">Web</option>
+          </select>
+          <div id="pageZoomControl" class="zoom-control">
+            <button
+              id="pageZoomButton"
+              class="zoom-button"
+              type="button"
+              title="Page zoom"
+              aria-label="Page zoom"
+              aria-haspopup="true"
+              aria-expanded="false"
+            >
+              <span id="pageZoomLabel">1x</span>
+            </button>
+            <div id="pageZoomMenu" class="zoom-menu" hidden>
+              <input
+                id="pageZoomSlider"
+                class="zoom-slider"
+                type="range"
+                min="1"
+                max="3"
+                step="0.05"
+                value="1"
+                aria-label="Page zoom"
+              />
+              <div class="zoom-ticks" aria-hidden="true">
+                <span>1x</span>
+                <span>3x</span>
+              </div>
+            </div>
+          </div>
+          <select id="qualitySelect" class="quality-select" aria-label="Quality">
+            <option value="auto">Auto</option>
+            <option value="good">Quality</option>
+            <option value="medium">Smooth</option>
+            <option value="bad">Saver</option>
+          </select>
+        </div>
+      </header>
+
+      <main class="viewport">
+        <div id="screenWrap" class="screen-wrap">
+          <canvas id="screen" class="screen" aria-label="Codex app screen" hidden></canvas>
+          <iframe id="webFrame" class="web-frame" title="Codex web bridge" hidden></iframe>
+          <div id="emptyState" class="empty-state">Waiting for CDP screencast</div>
+        </div>
+      </main>
+
+      <div id="passwordGate" class="password-gate" hidden>
+        <form id="passwordForm" class="password-panel">
+          <h1>Remote password</h1>
+          <p>This workspace requires the password set on the desktop client.</p>
+          <input
+            id="passwordInput"
+            class="password-input"
+            type="password"
+            autocomplete="current-password"
+            autocapitalize="none"
+            spellcheck="false"
+            placeholder="Password"
+          />
+          <button class="primary-button" type="submit">Connect</button>
+          <div id="passwordStatus" class="password-status" aria-live="polite"></div>
+        </form>
+      </div>
+
+      <textarea
+        id="keyboardProxy"
+        class="keyboard-proxy"
+        aria-label="Keyboard input proxy"
+        autocomplete="off"
+        autocapitalize="none"
+        spellcheck="false"
+        inputmode="text"
+      ></textarea>
+    </div>
+
+    <script src="vendor/jsQR.js?v=20260513-local-bridge-plain-v2"></script>
+    <script src="app.js?v=20260513-local-bridge-plain-v2" type="module"></script>
+  </body>
+</html>

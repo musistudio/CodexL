@@ -1,0 +1,85 @@
+@import "tailwindcss";
+@source "./**/*.{ts,tsx}";
+@source "../../../src/components/ui/**/*.{ts,tsx}";
+
+@theme inline {
+  --color-background: var(--pwa-background);
+  --color-foreground: var(--pwa-foreground);
+  --color-card: var(--pwa-card);
+  --color-card-foreground: var(--pwa-card-foreground);
+  --color-primary: var(--pwa-primary);
+  --color-primary-foreground: var(--pwa-primary-foreground);
+  --color-secondary: var(--pwa-secondary);
+  --color-secondary-foreground: var(--pwa-secondary-foreground);
+  --color-muted: var(--pwa-muted);
+  --color-muted-foreground: var(--pwa-muted-foreground);
+  --color-accent: var(--pwa-accent);
+  --color-accent-foreground: var(--pwa-accent-foreground);
+  --color-destructive: var(--pwa-destructive);
+  --color-border: var(--pwa-border);
+  --color-input: var(--pwa-input);
+  --color-ring: var(--pwa-ring);
+  --color-emerald: var(--pwa-emerald);
+  --color-emerald-foreground: var(--pwa-emerald-foreground);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+:root {
+  color-scheme: dark;
+  --radius: 0.5rem;
+  --pwa-background: #101114;
+  --pwa-foreground: #f1f5f9;
+  --pwa-card: #191c20;
+  --pwa-card-foreground: #f1f5f9;
+  --pwa-primary: #4fb477;
+  --pwa-primary-foreground: #07110b;
+  --pwa-secondary: #20242a;
+  --pwa-secondary-foreground: #f1f5f9;
+  --pwa-muted: #20242a;
+  --pwa-muted-foreground: #9aa4b2;
+  --pwa-accent: #20242a;
+  --pwa-accent-foreground: #f1f5f9;
+  --pwa-destructive: #ef6969;
+  --pwa-border: #30363f;
+  --pwa-input: #30363f;
+  --pwa-ring: #86b7ff;
+  --pwa-emerald: #4fb477;
+  --pwa-emerald-foreground: #07110b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+html,
+body {
+  overscroll-behavior: none;
+  touch-action: manipulation;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  background: var(--pwa-background);
+  color: var(--pwa-foreground);
+  margin: 0;
+  overflow: hidden;
+}
+
+input,
+textarea {
+  font-size: 16px;
+}

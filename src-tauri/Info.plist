@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>CodexL needs Automation access so Codex Computer Use can control Finder, System Events, browsers, and other apps you ask Codex to use.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>CodexL uses Bluetooth presence to detect whether your selected phone is nearby before handing off Codex messages to your Bot.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>CodexL uses Bluetooth presence to detect whether your selected phone is nearby before handing off Codex messages to your Bot.</string>
+</dict>
+</plist>

@@ -1,296 +1,172 @@
-# codex-app-remotely
+# CodexL
 
-English | [中文](./README.zh-CN.md)
+CodexL is a Tauri desktop launcher for managing multiple local Codex App workspaces, with LAN remote control, optional cloud relay, and built-in extension integrations.
 
-Remotely control Codex.app on your computer from a mobile browser. This tool starts the local Codex Electron app with Chrome DevTools Protocol enabled, streams the app screen, and forwards touch, keyboard, and scroll input from the mobile web controller.
+中文文档见 [README_zh.md](README_zh.md).
 
-## Screenshot
+## Overview
 
-![codex-app-remotely screenshot](./imgs/screenshot.png)
+CodexL is built for local developers who need to keep several Codex workspaces ready at the same time. It can prepare separate Codex homes, model-provider settings, and proxy settings for each workspace, then launch, stop, and manage Codex App from one desktop UI.
+
+Highlights:
+
+- Manage multiple Codex workspaces, with generated Codex homes for non-default workspaces.
+- Launch Codex App with CDP, CLI middleware, model-provider, proxy, and language settings.
+- Start mobile remote control per workspace with LAN QR URLs, access tokens, optional passwords, and cloud-relay end-to-end encryption.
+- Ship built-in Bot Gateway and NeXT AI Gateway extensions for IM-platform integrations and provider protocol conversion.
+- Include a mobile remote-control PWA that can scan a QR code or open a tokenized URL directly.
+- Support Tauri updater artifacts for in-app update checks.
+
+## Repository Layout
+
+| Path | Purpose |
+| --- | --- |
+| `src/` | Desktop React UI. |
+| `src-tauri/` | Tauri/Rust backend for launching Codex, configuration, HTTP/CDP proxying, remote control, and built-in extensions. |
+| `remote/control-pwa/` | Mobile remote-control PWA. |
+| `extensions/builtins/` | Built-in Bot Gateway and NeXT AI Gateway extension fixtures. |
+| `src-tauri/builtin-plugin-packages/` | Built-in extension `.tar.gz` packages bundled into the Tauri app. |
+| `scripts/` | Scripts for release checks, PWA publishing, icon generation, and built-in extension packaging. |
 
 ## Requirements
 
-- Node.js 22+
-- Codex Electron app on macOS or Windows
-- Cloudflare Workers + Durable Objects when using remote mode
+- Node.js 20+.
+- pnpm 9.x. This repository declares `pnpm@9.15.1`.
+- Rust toolchain.
+- System dependencies required by Tauri 2.
+- Codex App installed locally. On macOS, CodexL tries to discover `Codex.app` or `OpenAI Codex.app` automatically.
 
-## Installation and Usage
+## Local Development
 
-Run without installing:
+Install dependencies:
 
-```bash
-npx codex-app-remotely
+```sh
+pnpm install
 ```
 
-Or install the CLI globally:
+Start the desktop development app:
 
-```bash
-npm install -g codex-app-remotely
+```sh
+pnpm tauri dev
 ```
 
-Then run:
+Common checks:
 
-```bash
-car
+```sh
+pnpm run build
+cd src-tauri && cargo check
 ```
 
-After startup, the server prints an access URL with a `token` and renders a QR code in the terminal. Scan it with your phone or open the URL in a mobile browser.
+Common packaging commands:
 
-By default, the launcher starts looking for a free CDP port from `9222`. If `9222` is already used by Chrome or another process, it automatically switches to the next available port.
-
-### Remote Mode Through Cloudflare
-
-Remote mode lets the phone connect through a Cloudflare Worker relay. Deploy the included Worker first:
-
-```bash
-npx codex-app-remotely deploy
+```sh
+pnpm tauri build
+pnpm run build:pwa
+pnpm run package:builtin-plugins
 ```
 
-This command runs Wrangler against the bundled `wrangler.toml`, `worker/`, and `public/` files. You can pass Wrangler deploy options after `deploy`, for example `npx codex-app-remotely deploy --env production`.
+## Remote-Control PWA
 
-Then start the local host in remote mode:
+The desktop app starts a remote-control service for a workspace. By default, it listens on:
 
-```bash
-car --mode remote --remote-url "https://codex-app-remotely-remote.<account>.workers.dev"
+```text
+0.0.0.0:3147
 ```
 
-When running through npm scripts, use npm's `--` separator, or use the supported positional shorthand:
+Open the QR URL from a workspace card on your phone, for example:
 
-```bash
-npm run start -- --mode remote --remote-url "https://codex-app-remotely-remote.<account>.workers.dev"
-npm run start remote "https://codex-app-remotely-remote.<account>.workers.dev"
+```text
+http://192.168.1.10:3147/?token=...
 ```
 
-The CLI prints a remote URL containing `room` and `token`. Open or scan that URL from the remote browser. If `room` is omitted, both sides use `default`. The local process opens an outbound WebSocket to `/ws/host`; remote browsers first try one low-latency WebTransport session on `/wt/session` when supported by the browser and HTTPS origin, then fall back to `/ws/control` and `/ws/frame`; one Durable Object instance per `room` relays control JSON and binary frames.
+The token in the remote URL is sensitive. For more details about scanning, cached web resources, Cloudflare Pages publishing, and HTTPS constraints, see `remote/control-pwa/README.md`.
 
-### Self-Hosted WebTransport Relay
+## Built-In Extensions
 
-Cloudflare Worker remote mode remains WebSocket-based. To run the low-latency WebTransport relay on your own server, deploy the bundled Deno relay with a real TLS certificate and open both TCP and UDP on the same public port:
+This repository includes two optional extensions:
 
-```bash
-docker build -f selfhost/Dockerfile -t codex-app-remotely-relay .
+| Extension | Purpose |
+| --- | --- |
+| Bot Gateway | Connect Codex to IM platforms, with Bot login, message forwarding, and handoff settings. |
+| NeXT AI Gateway | Convert other protocol interfaces into providers that Codex can use. |
 
-docker run -d --name codex-app-remotely-relay \
-  --restart unless-stopped \
-  -p 443:8443/tcp \
-  -p 443:8443/udp \
-  -v /etc/letsencrypt:/etc/letsencrypt:ro \
-  -e TLS_CERT=/etc/letsencrypt/live/remote.example.com/fullchain.pem \
-  -e TLS_KEY=/etc/letsencrypt/live/remote.example.com/privkey.pem \
-  codex-app-remotely-relay
+Extensions are disabled by default and can be enabled in app settings. When extensions are enabled, the runtime requires Node.js 20+.
+
+## Desktop Release and Auto Update
+
+The repository includes `.github/workflows/release.yml`. After a tag is pushed, GitHub Actions builds macOS Apple Silicon, macOS Intel, and Windows x64 installers, creates a GitHub Release, and uploads the `latest.json` file used by the Tauri updater.
+
+Before the first release, configure these secrets in `Settings -> Secrets and variables -> Actions` for the GitHub repository:
+
+| Secret | Purpose |
+| --- | --- |
+| `TAURI_SIGNING_PRIVATE_KEY` | Tauri updater private key. It must match `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`. |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Private-key password. If the key was generated without a password, this can be omitted or left empty. |
+
+To regenerate the updater signing key:
+
+```sh
+pnpm tauri signer generate --ci -w .secrets/codexl-updater.key
 ```
 
-Then point the local host at your relay:
+Write the generated public key to `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`, and write the contents of `.secrets/codexl-updater.key` to the GitHub Secret `TAURI_SIGNING_PRIVATE_KEY`.
 
-```bash
-car --mode remote --remote-url "https://remote.example.com"
+Release flow:
+
+```sh
+# 1. Set the same version in all three files:
+#    package.json
+#    src-tauri/tauri.conf.json
+#    src-tauri/Cargo.toml
+
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
-The self-hosted relay serves the mobile page, accepts the local host on `/ws/host`, accepts WebSocket fallback clients on `/ws/control` and `/ws/frame`, and accepts WebTransport clients on `/wt/session`. WebTransport requires HTTPS and a reachable UDP port; if UDP/HTTP3 is blocked, browsers automatically fall back to WebSocket.
+CI rejects tags where the versions do not match. After a release is published, the in-app update checker reads:
 
-#### Using Nginx In Front
-
-WebTransport is not the same as WebSocket proxying. Use normal Nginx HTTP reverse proxying for the page and WebSocket fallback, and pass UDP/443 through to the relay for WebTransport. Do not configure Nginx `listen 443 quic` for this hostname unless Nginx itself is terminating and serving WebTransport; the bundled relay needs to receive the HTTP/3/QUIC traffic.
-
-Run the relay on localhost with its TLS certificate:
-
-```bash
-docker run -d --name codex-app-remotely-relay \
-  --restart unless-stopped \
-  -p 127.0.0.1:8443:8443/tcp \
-  -p 127.0.0.1:8443:8443/udp \
-  -v /etc/letsencrypt:/etc/letsencrypt:ro \
-  -e TLS_CERT=/etc/letsencrypt/live/remote.example.com/fullchain.pem \
-  -e TLS_KEY=/etc/letsencrypt/live/remote.example.com/privkey.pem \
-  codex-app-remotely-relay
+```text
+https://github.com/musistudio/codexl/releases/latest/download/latest.json
 ```
 
-Then add an Nginx config like this. The `http {}` block handles HTTPS and WebSocket upgrade headers; the top-level `stream {}` block passes QUIC/WebTransport UDP packets to the relay:
+It then downloads the signed update package for the current platform, installs it, and restarts the app.
 
-```nginx
-# /etc/nginx/nginx.conf
-stream {
-    server {
-        listen 443 udp reuseport;
-        proxy_pass 127.0.0.1:8443;
-        proxy_timeout 10m;
-    }
-}
+## Runtime Paths
 
-http {
-    map $http_upgrade $connection_upgrade {
-        default upgrade;
-        ''      close;
-    }
-
-    server {
-        listen 443 ssl;
-        server_name remote.example.com;
-
-        ssl_certificate     /etc/letsencrypt/live/remote.example.com/fullchain.pem;
-        ssl_certificate_key /etc/letsencrypt/live/remote.example.com/privkey.pem;
-
-        location / {
-            proxy_pass https://127.0.0.1:8443;
-            proxy_http_version 1.1;
-            proxy_set_header Host $host;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto https;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection $connection_upgrade;
-            proxy_read_timeout 1h;
-
-            # The relay also terminates TLS locally so it can serve WebTransport on UDP.
-            proxy_ssl_server_name on;
-            proxy_ssl_name remote.example.com;
-        }
-    }
-}
+```text
+~/.codexl/config.json                         # Main CodexL config
+~/.codexl/codex-homes/<workspace-slug>/       # Codex home for non-default workspaces
+~/.codexl/bin/codexl-codex-cli-middleware     # Codex CLI middleware
+~/.codexl/extensions/<extension>/<version>/   # Built-in extension install directory
+~/.codexl/next-ai-gateway/gateway.config.json # Default Gateway config
 ```
 
-After reloading Nginx, make sure the firewall allows both `443/tcp` and `443/udp`. You can still point the local host at the normal HTTPS URL:
+## Common Environment Variables
 
-```bash
-car --mode remote --remote-url "https://remote.example.com"
-```
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CODEXL_CONFIG_PATH` | `~/.codexl/config.json` | Override the CodexL config file path. |
+| `CODEXL_CODEX_HOME` / `CODEX_HOME` | `~/.codex` | Override the default Codex home. |
+| `CODEXL_CODEX_PATH` | Empty | Manually set the Codex App executable path. |
+| `CODEXL_CDP_HOST` | `127.0.0.1` | Codex CDP host. |
+| `CODEXL_CDP_PORT` | `9222` | Starting Codex CDP port. |
+| `CODEXL_HTTP_HOST` | `0.0.0.0` | Local HTTP proxy host. |
+| `CODEXL_HTTP_PORT` | `14588` | Local HTTP proxy port. |
+| `CODEXL_REMOTE_CONTROL_HOST` | `0.0.0.0` | Remote-control service host. |
+| `CODEXL_REMOTE_CONTROL_PORT` | `3147` | Starting remote-control service port. |
+| `CODEXL_LANGUAGE` | `en` | Default UI language, either `en` or `zh`. |
+| `CODEXL_APPEARANCE` | `system` | Default appearance: `system`, `light`, or `dark`. |
+| `CODEXL_EXTENSIONS_ENABLED` | `false` | Whether the extension master switch is enabled by default. |
 
-If you run without Docker, install Deno 2.2+ and start the relay directly:
+## Security Boundaries
 
-```bash
-TLS_CERT=/etc/letsencrypt/live/remote.example.com/fullchain.pem \
-TLS_KEY=/etc/letsencrypt/live/remote.example.com/privkey.pem \
-PORT=443 \
-npm run relay:selfhost
-```
+- Treat QR tokens as sensitive. Do not screenshot or share them with untrusted parties.
+- `/json/*`, `/devtools/*`, and `/web/_bridge` can control or affect Codex App. Do not expose them to untrusted networks.
+- LAN remote control listens on `0.0.0.0` by default and should only be used on trusted local networks.
+- When cloud relay is enabled, end-to-end encryption requires a remote password; the password does not make the token non-sensitive.
 
-### Debugger Mode
+## License
 
-Debugger mode starts or connects to Codex with CDP enabled and opens DevTools for the selected Codex target:
+Copyright (C) 2026 musistudio.
 
-```bash
-car debugger
-```
-
-Equivalent forms:
-
-```bash
-car --mode debugger
-car --open-devtools
-```
-
-When launching Codex itself, this mode also passes `--auto-open-devtools-for-tabs`. When connecting to an already running Codex process, it opens the CDP DevTools frontend in your default browser:
-
-```bash
-car debugger --no-launch --cdp-port 9222
-```
-
-### Specify the Codex App Path
-
-If the Codex app is not in the default location, pass the app path explicitly. On macOS this can be the `.app` bundle:
-
-```bash
-npx codex-app-remotely --app "/Applications/Codex.app"
-```
-
-Equivalent command after global installation:
-
-```bash
-car --app "/Applications/Codex.app"
-```
-
-On Windows this can be the install directory or the executable:
-
-```powershell
-npx codex-app-remotely --app "$env:LOCALAPPDATA\Programs\Codex"
-npx codex-app-remotely --executable "$env:LOCALAPPDATA\Programs\Codex\Codex.exe"
-```
-
-By default, Windows auto-launch checks common Electron install locations, including `%LOCALAPPDATA%\Programs\Codex\Codex.exe` and `%LOCALAPPDATA%\Programs\OpenAI Codex\OpenAI Codex.exe`.
-
-### Connect to an Already Running Codex App
-
-If you already started Codex manually with CDP enabled:
-
-```bash
-npx codex-app-remotely --no-launch --cdp-port 9222
-```
-
-Equivalent command after global installation:
-
-```bash
-car --no-launch --cdp-port 9222
-```
-
-The manual Electron CDP launch command usually looks like this:
-
-```bash
-"/Applications/Codex.app/Contents/MacOS/Codex" \
-  --remote-debugging-port=9222 \
-  --remote-allow-origins=* \
-  --disable-renderer-backgrounding \
-  --disable-background-timer-throttling \
-  --disable-backgrounding-occluded-windows
-```
-
-On Windows:
-
-```powershell
-& "$env:LOCALAPPDATA\Programs\Codex\Codex.exe" `
-  --remote-debugging-port=9222 `
-  --remote-allow-origins=* `
-  --disable-renderer-backgrounding `
-  --disable-background-timer-throttling `
-  --disable-backgrounding-occluded-windows
-```
-
-## Common Options
-
-```bash
-car \
-  --host 0.0.0.0 \
-  --port 3147 \
-  --mode remote \
-  --remote-url https://codex-app-remotely-remote.<account>.workers.dev \
-  --cdp-port 9333 \
-  --screencast-every-nth-frame 1 \
-  --screenshot-max-width 1440 \
-  --screenshot-max-height 900 \
-  --screenshot-quality 74
-```
-
-You can also configure the server with environment variables:
-
-- `CODEX_APP_PATH`
-- `CODEX_EXECUTABLE`
-- `CDP_HOST`
-- `CDP_PORT`
-- `HOST`
-- `PORT`
-- `REMOTE_TOKEN`
-- `REMOTE_MODE`
-- `REMOTE_WORKER_URL`
-- `REMOTE_ROOM`
-- `SCREENCAST_EVERY_NTH_FRAME`
-- `SCREENSHOT_MAX_WIDTH`
-- `SCREENSHOT_MAX_HEIGHT`
-- `SCREENSHOT_QUALITY`
-- `OPEN_DEVTOOLS=1`
-- `CODEX_DEBUGGER=1`
-- `NO_LAUNCH=1`
-
-## Architecture
-
-- `src/server.js`: entry point, orchestrates the launcher, CDP bridge, and mobile WebSocket server.
-- `src/codexLauncher.js`: locates and starts the Codex Electron app with `--remote-debugging-port`.
-- `src/cdpClient.js`: connects to the CDP target, immediately ACKs `Page.screencastFrame`, adapts JPEG screencast profiles, and maps click, pointer, scroll, text, and key events to CDP `Input` commands.
-- `src/mobileWsServer.js`: dependency-light WebSocket server with separate control/frame channels and latest-frame-only binary delivery.
-- `src/remoteRelayClient.js`: outbound host WebSocket client for Cloudflare remote mode.
-- `src/staticServer.js`: static file server plus small status APIs.
-- `src/workerDeploy.js`: deploy command wrapper for the bundled Cloudflare Worker relay.
-- `worker/index.js`: Cloudflare Worker + Durable Object relay for remote rooms.
-- `selfhost/relay.js`: Deno-based self-hosted relay with HTTPS, WebSocket fallback, and WebTransport over HTTP/3.
-- `public/`: mobile control page with a WebTransport-first transport adapter and WebSocket fallback. The WebTransport protocol uses a reliable bidirectional stream for control JSON and independent frame delivery via server unidirectional streams or chunked datagrams so stale frames can be dropped without blocking input.
-
-## Security Notes
-
-CDP has high privileges. This project does not expose the CDP port directly to the mobile device; the phone connects only to this server's WebSocket endpoint or to the Cloudflare relay. Mobile access requires the one-time `token` generated at startup. In remote mode, anyone with the full remote URL can control the app until the local host stops, so treat the URL as a secret. If this tool launches the Codex app, it also quits that app during shutdown. When using `--no-launch` to connect to an external Codex process, this tool does not stop that process.
+CodexL is licensed under the GNU Affero General Public License version 3 only. See [LICENSE](LICENSE) for the full text.
