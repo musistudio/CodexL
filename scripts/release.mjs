@@ -203,16 +203,43 @@ function updateCargoTomlVersion(path, version) {
 function updateCargoLockPackageVersion(path, packageName, version) {
   const fullPath = resolve(repoRoot, path);
   const raw = readFileSync(fullPath, "utf8");
-  const packagePattern = new RegExp(
-    `(\\[\\[package\\]\\]\\nname = "${escapeRegExp(packageName)}"\\nversion = ")[^"]+(")`,
-  );
-  const next = raw.replace(packagePattern, `$1${version}$2`);
+  const lineEnding = raw.includes("\r\n") ? "\r\n" : "\n";
+  const blocks = raw.split(/\r?\n(?=\[\[package\]\]\r?\n)/);
+  let updated = false;
 
-  if (next === raw && !packagePattern.test(raw)) {
+  const next = blocks
+    .map((block) => {
+      if (readCargoLockBlockField(block, "name") !== packageName) {
+        return block;
+      }
+
+      const lines = block.split(/\r?\n/);
+      const versionLineIndex = lines.findIndex((line) => /^\s*version\s*=/.test(line));
+      if (versionLineIndex < 0) {
+        fail(`${path} package ${packageName} must contain a version field.`);
+      }
+
+      lines[versionLineIndex] = lines[versionLineIndex].replace(/^(\s*version\s*=\s*)"[^"]+"(.*)$/, `$1"${version}"$2`);
+      updated = true;
+      return lines.join(lineEnding);
+    })
+    .join(lineEnding);
+
+  if (!updated) {
     fail(`${path} must contain package ${packageName}.`);
   }
 
   writeIfChanged(fullPath, raw, next);
+}
+
+function readCargoLockBlockField(block, fieldName) {
+  for (const line of block.split(/\r?\n/)) {
+    const match = line.match(new RegExp(`^\\s*${fieldName}\\s*=\\s*"([^"]+)"\\s*$`));
+    if (match) {
+      return match[1].trim();
+    }
+  }
+  return null;
 }
 
 function writeIfChanged(path, raw, next) {
@@ -254,10 +281,6 @@ function git(args, options = {}) {
   }
 
   return result;
-}
-
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function fail(message) {

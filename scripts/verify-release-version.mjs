@@ -52,12 +52,32 @@ function readCargoVersion(path) {
 
 function readCargoLockPackageVersion(path, packageName) {
   const content = readFileSync(resolve(repoRoot, path), "utf8");
-  const escapedName = packageName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = content.match(new RegExp(`\\[\\[package\\]\\]\\nname = "${escapedName}"\\nversion = "([^"]+)"`));
-  if (!match) {
+  const packageBlock = findCargoLockPackageBlock(content, packageName);
+  if (!packageBlock) {
     fail(`${path} must contain package ${packageName}.`);
   }
-  return match[1].trim();
+
+  const version = readCargoLockBlockField(packageBlock, "version");
+  if (!version) {
+    fail(`${path} package ${packageName} must contain a version field.`);
+  }
+
+  return version;
+}
+
+function findCargoLockPackageBlock(content, packageName) {
+  const blocks = content.split(/\r?\n(?=\[\[package\]\]\r?\n)/);
+  return blocks.find((block) => readCargoLockBlockField(block, "name") === packageName);
+}
+
+function readCargoLockBlockField(block, fieldName) {
+  for (const line of block.split(/\r?\n/)) {
+    const match = line.match(new RegExp(`^\\s*${fieldName}\\s*=\\s*"([^"]+)"\\s*$`));
+    if (match) {
+      return match[1].trim();
+    }
+  }
+  return null;
 }
 
 function fail(message) {
