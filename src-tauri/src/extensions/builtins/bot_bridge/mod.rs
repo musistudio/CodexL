@@ -112,6 +112,7 @@ RunLoop.main.run()
 "#;
 const PROJECTLESS_PROJECT_LABEL: &str = "(projectless)";
 const BOT_MEDIA_CONTEXT_FILE: &str = "bot-media-context.json";
+const CODEX_EVENT_HUB_CAPACITY: usize = 8192;
 #[cfg(unix)]
 const FLOCK_EXCLUSIVE: std::os::raw::c_int = 2;
 #[cfg(unix)]
@@ -156,7 +157,8 @@ struct BotGatewayRuntimeConfig {
 
 struct AppServerBridge {
     writer: SharedAppStdin,
-    stdout_rx: mpsc::Receiver<Vec<u8>>,
+    event_hub: CodexEventHub,
+    idle_cursor: CodexEventCursor,
     dingtalk_rx: Option<mpsc::Receiver<Value>>,
     pending_dingtalk_events: VecDeque<Value>,
     current_session_key: Option<String>,
@@ -179,6 +181,252 @@ struct BotGatewayClient {
 
 struct BotBridgeLease {
     _file: File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum CodexEventSource {
+    CliAppServer,
+    CdpWebview,
+    RemoteBridge,
+    BotGateway,
+}
+
+impl CodexEventSource {
+    #[allow(dead_code)]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CliAppServer => "cli-app-server",
+            Self::CdpWebview => "cdp-webview",
+            Self::RemoteBridge => "remote-bridge",
+            Self::BotGateway => "bot-gateway",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexEventChannel {
+    Notification,
+    Request,
+    Response,
+    Stream,
+    Unknown,
+}
+
+impl CodexEventChannel {
+    #[allow(dead_code)]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Notification => "notification",
+            Self::Request => "request",
+            Self::Response => "response",
+            Self::Stream => "stream",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct CodexEvent {
+    seq: u64,
+    source: CodexEventSource,
+    channel: CodexEventChannel,
+    method: Option<String>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    value: Option<Value>,
+    raw: Vec<u8>,
+    received_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct CodexEventCursor {
+    next_seq: u64,
+}
+
+struct CodexEventHub {
+    stdout_rx: mpsc::Receiver<Vec<u8>>,
+    events: VecDeque<CodexEvent>,
+    first_seq: u64,
+    next_seq: u64,
+    disconnected: bool,
+}
+
+#[derive(Debug)]
+enum CodexEventHubError {
+    Disconnected,
+    Gap { requested: u64, first: u64 },
+}
+
+impl CodexEvent {
+    fn from_app_server_stdout(seq: u64, raw: Vec<u8>) -> Self {
+        let value = serde_json::from_slice::<Value>(trim_json_line(&raw)).ok();
+        let method = value
+            .as_ref()
+            .and_then(|value| value.get("method"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let null_params = Value::Null;
+        let params = value
+            .as_ref()
+            .and_then(|value| value.get("params"))
+            .unwrap_or(&null_params);
+        let channel = codex_event_channel_for_app_server_value(value.as_ref(), method.as_deref());
+        let thread_id = nested_param_id(params, "threadId", "thread").map(str::to_string);
+        let turn_id = nested_param_id(params, "turnId", "turn").map(str::to_string);
+
+        Self {
+            seq,
+            source: CodexEventSource::CliAppServer,
+            channel,
+            method,
+            thread_id,
+            turn_id,
+            value,
+            raw,
+            received_at: Instant::now(),
+        }
+    }
+}
+
+impl CodexEventHubError {
+    fn message(&self) -> String {
+        match self {
+            Self::Disconnected => "Codex app-server output channel closed".to_string(),
+            Self::Gap { requested, first } => format!(
+                "Codex app-server event cursor fell behind requested_seq={} first_seq={}",
+                requested, first
+            ),
+        }
+    }
+}
+
+impl CodexEventHub {
+    fn new(stdout_rx: mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            stdout_rx,
+            events: VecDeque::new(),
+            first_seq: 1,
+            next_seq: 1,
+            disconnected: false,
+        }
+    }
+
+    fn cursor_now(&self) -> CodexEventCursor {
+        CodexEventCursor {
+            next_seq: self.next_seq,
+        }
+    }
+
+    fn publish_app_server_stdout(&mut self, raw: Vec<u8>) -> CodexEvent {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        let event = CodexEvent::from_app_server_stdout(seq, raw);
+        self.events.push_back(event.clone());
+        while self.events.len() > CODEX_EVENT_HUB_CAPACITY {
+            self.events.pop_front();
+        }
+        self.first_seq = self
+            .events
+            .front()
+            .map(|event| event.seq)
+            .unwrap_or(self.next_seq);
+        event
+    }
+
+    fn drain_available(&mut self, limit: usize) {
+        for _ in 0..limit {
+            match self.stdout_rx.try_recv() {
+                Ok(raw) => {
+                    self.publish_app_server_stdout(raw);
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.disconnected = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn buffered_event_for_cursor(
+        &self,
+        cursor: &CodexEventCursor,
+    ) -> Result<Option<CodexEvent>, CodexEventHubError> {
+        if cursor.next_seq < self.first_seq {
+            return Err(CodexEventHubError::Gap {
+                requested: cursor.next_seq,
+                first: self.first_seq,
+            });
+        }
+        Ok(self
+            .events
+            .iter()
+            .find(|event| event.seq >= cursor.next_seq)
+            .cloned())
+    }
+
+    fn next_event(
+        &mut self,
+        cursor: &mut CodexEventCursor,
+        timeout: Duration,
+    ) -> Result<Option<CodexEvent>, CodexEventHubError> {
+        if let Some(event) = self.buffered_event_for_cursor(cursor)? {
+            cursor.next_seq = event.seq.saturating_add(1);
+            return Ok(Some(event));
+        }
+        if timeout.is_zero() {
+            return Ok(None);
+        }
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let wait = deadline - now;
+            match self.stdout_rx.recv_timeout(wait) {
+                Ok(raw) => {
+                    self.publish_app_server_stdout(raw);
+                    if let Some(event) = self.buffered_event_for_cursor(cursor)? {
+                        cursor.next_seq = event.seq.saturating_add(1);
+                        return Ok(Some(event));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.disconnected = true;
+                    return Err(CodexEventHubError::Disconnected);
+                }
+            }
+        }
+    }
+
+    fn try_next_event(
+        &mut self,
+        cursor: &mut CodexEventCursor,
+    ) -> Result<Option<CodexEvent>, CodexEventHubError> {
+        self.drain_available(100);
+        self.next_event(cursor, Duration::ZERO)
+    }
+}
+
+fn codex_event_channel_for_app_server_value(
+    value: Option<&Value>,
+    method: Option<&str>,
+) -> CodexEventChannel {
+    let has_id = value
+        .and_then(|value| value.get("id"))
+        .is_some_and(|id| !id.is_null());
+    match (method, has_id) {
+        (Some("item/agentMessage/delta"), _) => CodexEventChannel::Stream,
+        (Some(_), true) => CodexEventChannel::Request,
+        (Some(_), false) => CodexEventChannel::Notification,
+        (None, true) => CodexEventChannel::Response,
+        (None, false) => CodexEventChannel::Unknown,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1548,9 +1796,12 @@ fn run_bridge(
         }
     };
     let dingtalk_rx = start_dingtalk_stream_listener(&config);
+    let event_hub = CodexEventHub::new(stdout_rx);
+    let idle_cursor = event_hub.cursor_now();
     let mut app = AppServerBridge {
         writer: app_stdin,
-        stdout_rx,
+        event_hub,
+        idle_cursor,
         dingtalk_rx,
         pending_dingtalk_events: VecDeque::new(),
         current_session_key: None,
@@ -2537,12 +2788,20 @@ impl AppServerBridge {
 
     fn process_idle_app_output(&mut self, bot: &mut BotGatewayClient) {
         for _ in 0..100 {
-            let line = match self.stdout_rx.try_recv() {
-                Ok(line) => line,
-                Err(mpsc::TryRecvError::Empty) => return,
-                Err(mpsc::TryRecvError::Disconnected) => return,
+            let event = match self.event_hub.try_next_event(&mut self.idle_cursor) {
+                Ok(Some(event)) => event,
+                Ok(None) => return,
+                Err(CodexEventHubError::Disconnected) => return,
+                Err(err) => {
+                    log_bridge(
+                        &self.config,
+                        &format!("idle event cursor skipped: {}", err.message()),
+                    );
+                    self.idle_cursor = self.event_hub.cursor_now();
+                    return;
+                }
             };
-            if let Err(err) = self.handle_idle_app_line(bot, &line) {
+            if let Err(err) = self.handle_idle_app_event(bot, &event) {
                 log_bridge(
                     &self.config,
                     &format!("idle handoff output handling failed: {}", err),
@@ -2551,15 +2810,15 @@ impl AppServerBridge {
         }
     }
 
-    fn handle_idle_app_line(
+    fn handle_idle_app_event(
         &mut self,
         bot: &mut BotGatewayClient,
-        line: &[u8],
+        event: &CodexEvent,
     ) -> Result<(), String> {
-        let Ok(value) = serde_json::from_slice::<Value>(trim_json_line(line)) else {
+        let Some(value) = event.value.as_ref() else {
             return Ok(());
         };
-        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+        let method = event.method.as_deref().unwrap_or("");
         let params = value.get("params").unwrap_or(&Value::Null);
 
         if is_bot_approval_request_method(method) {
@@ -2926,8 +3185,8 @@ impl AppServerBridge {
         let turn_result = (|| -> Result<CodexTurnResult, String> {
             let thread_id = self.ensure_thread(message_text)?;
             self.persist_bot_media_context(event, event_id)?;
-            let turn_id = self.start_turn(&thread_id, message_text, event)?;
-            self.wait_turn_completed(bot, &thread_id, &turn_id, event, event_id)
+            let (turn_id, cursor) = self.start_turn(&thread_id, message_text, event)?;
+            self.wait_turn_completed(bot, &thread_id, &turn_id, event, event_id, cursor)
         })();
         match turn_result {
             Ok(result) if !result.response_text.trim().is_empty() => CompletedEventResponse {
@@ -4700,7 +4959,7 @@ impl AppServerBridge {
         thread_id: &str,
         message_text: &str,
         event: &Value,
-    ) -> Result<String, String> {
+    ) -> Result<(String, CodexEventCursor), String> {
         let mut params = Map::new();
         params.insert("threadId".to_string(), Value::String(thread_id.to_string()));
         if let Some(cwd) = self.selected_cwd.as_ref() {
@@ -4719,6 +4978,7 @@ impl AppServerBridge {
             codex_input_from_bot_event(message_text, event, &bot_session_id),
         );
 
+        let turn_cursor = self.event_hub.cursor_now();
         let result = self.request("turn/start", Value::Object(params), Duration::from_secs(30))?;
         let turn_id = result
             .get("turn")
@@ -4730,7 +4990,7 @@ impl AppServerBridge {
             &self.config,
             &format!("started Codex turn {} on thread {}", turn_id, thread_id),
         );
-        Ok(turn_id)
+        Ok((turn_id, turn_cursor))
     }
 
     fn persist_bot_media_context(&self, event: &Value, event_id: &str) -> Result<(), String> {
@@ -5126,11 +5386,11 @@ impl AppServerBridge {
         turn_id: &str,
         event: &Value,
         event_id: &str,
+        mut cursor: CodexEventCursor,
     ) -> Result<CodexTurnResult, String> {
         let deadline = Instant::now() + self.config.turn_timeout;
         let mut capture = TurnCapture::default();
         let mut sent_messages = 0usize;
-        let mut handoff_notice_sent = false;
 
         loop {
             let now = Instant::now();
@@ -5147,10 +5407,10 @@ impl AppServerBridge {
                 return Err("timed out waiting for Codex turn completion".to_string());
             }
             let timeout = std::cmp::min(Duration::from_millis(250), deadline - now);
-            let line = match self.stdout_rx.recv_timeout(timeout) {
-                Ok(line) => line,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let event_line = match self.event_hub.next_event(&mut cursor, timeout) {
+                Ok(Some(event)) => event,
+                Ok(None) => continue,
+                Err(CodexEventHubError::Disconnected) => {
                     log_bridge(
                         &self.config,
                         &format!(
@@ -5160,11 +5420,23 @@ impl AppServerBridge {
                     );
                     return Err("Codex app-server output channel closed".to_string());
                 }
+                Err(err) => {
+                    log_bridge(
+                        &self.config,
+                        &format!(
+                            "Codex turn {} on thread {} event cursor skipped: {}",
+                            turn_id,
+                            thread_id,
+                            err.message()
+                        ),
+                    );
+                    return Err("Codex app-server event cursor fell behind".to_string());
+                }
             };
-            let Ok(value) = serde_json::from_slice::<Value>(trim_json_line(&line)) else {
+            let Some(value) = event_line.value.as_ref() else {
                 continue;
             };
-            let Some(method) = value.get("method").and_then(Value::as_str) else {
+            let Some(method) = event_line.method.as_deref() else {
                 continue;
             };
             let params = value.get("params").unwrap_or(&Value::Null);
@@ -5174,25 +5446,6 @@ impl AppServerBridge {
                     if is_bot_approval_request_method(method)
                         && matches_approval_request_turn(params, thread_id, turn_id) =>
                 {
-                    let forward_decision = self.codex_forward_decision();
-                    if let Some(presence) = forward_decision.handoff_presence.as_ref() {
-                        if !handoff_notice_sent {
-                            let project = self.current_project().to_string();
-                            self.ensure_handoff_activation_notice(
-                                bot, event, thread_id, &project, presence,
-                            )?;
-                            handoff_notice_sent = true;
-                        }
-                    } else {
-                        let project = self.current_project().to_string();
-                        self.ensure_handoff_deactivation_notice(
-                            bot,
-                            event,
-                            thread_id,
-                            &project,
-                            forward_decision.handoff_evaluation.as_ref(),
-                        )?;
-                    }
                     let Some(request_id) = value.get("id").cloned() else {
                         continue;
                     };
@@ -5213,28 +5466,8 @@ impl AppServerBridge {
                 }
                 "item/completed" if matches_thread_turn(params, thread_id, turn_id) => {
                     capture.capture_completed_item(params);
-                    let forward_decision = self.codex_forward_decision();
-                    if forward_decision.handoff_presence.is_none() {
-                        let project = self.current_project().to_string();
-                        self.ensure_handoff_deactivation_notice(
-                            bot,
-                            event,
-                            thread_id,
-                            &project,
-                            forward_decision.handoff_evaluation.as_ref(),
-                        )?;
-                    }
-                    if forward_decision.should_forward && self.config.forward_all_codex_messages {
+                    if self.config.forward_all_codex_messages {
                         if let Some(text) = completed_agent_message_text(params) {
-                            if !handoff_notice_sent {
-                                if let Some(presence) = forward_decision.handoff_presence.as_ref() {
-                                    let project = self.current_project().to_string();
-                                    self.ensure_handoff_activation_notice(
-                                        bot, event, thread_id, &project, presence,
-                                    )?;
-                                    handoff_notice_sent = true;
-                                }
-                            }
                             sent_messages += 1;
                             let idempotency_key =
                                 format!("codexl:{}:codex-message:{}", event_id, sent_messages);
@@ -5260,6 +5493,7 @@ impl AppServerBridge {
                 }
                 "turn/completed" if matches_thread_turn(params, thread_id, turn_id) => {
                     if let Some(message) = turn_completed_error_message(params) {
+                        self.idle_cursor = cursor.clone();
                         log_bridge(
                             &self.config,
                             &format!(
@@ -5270,24 +5504,7 @@ impl AppServerBridge {
                         return Err(message);
                     }
                     let response_text = capture.final_text.unwrap_or(capture.fallback_text);
-                    let forward_decision = self.codex_forward_decision();
-                    if let Some(presence) = forward_decision.handoff_presence.as_ref() {
-                        if !handoff_notice_sent {
-                            let project = self.current_project().to_string();
-                            self.ensure_handoff_activation_notice(
-                                bot, event, thread_id, &project, presence,
-                            )?;
-                        }
-                    } else {
-                        let project = self.current_project().to_string();
-                        self.ensure_handoff_deactivation_notice(
-                            bot,
-                            event,
-                            thread_id,
-                            &project,
-                            forward_decision.handoff_evaluation.as_ref(),
-                        )?;
-                    }
+                    self.idle_cursor = cursor.clone();
                     log_bridge(
                         &self.config,
                         &format!(
@@ -5305,34 +5522,6 @@ impl AppServerBridge {
                 }
                 _ => {}
             }
-        }
-    }
-
-    fn codex_forward_decision(&self) -> CodexForwardDecision {
-        let mut handoff_evaluation = None;
-        let mut handoff_presence = None;
-        if self.config.handoff.enabled {
-            let (presence, snapshot) =
-                evaluate_handoff_presence_with_snapshot(&self.config.handoff);
-            let should_handoff = presence.away;
-            let should_forward = self.config.forward_all_codex_messages || should_handoff;
-            self.log_handoff_decision(
-                "bot-turn",
-                &snapshot,
-                &presence,
-                should_forward,
-                self.config.forward_all_codex_messages,
-            );
-            handoff_evaluation = Some(presence.clone());
-            if should_handoff {
-                handoff_presence = Some(presence);
-            }
-        }
-
-        CodexForwardDecision {
-            should_forward: self.config.forward_all_codex_messages || handoff_presence.is_some(),
-            handoff_presence,
-            handoff_evaluation,
         }
     }
 
@@ -5392,12 +5581,6 @@ impl AppServerBridge {
                 format_log_list(&snapshot.diagnostics)
             ),
         );
-    }
-
-    fn current_project(&self) -> &str {
-        self.selected_cwd
-            .as_deref()
-            .unwrap_or(PROJECTLESS_PROJECT_LABEL)
     }
 
     fn handle_bot_approval_request(
@@ -5616,6 +5799,7 @@ impl AppServerBridge {
             "method": method,
             "params": params,
         });
+        let mut cursor = self.event_hub.cursor_now();
         write_json_line(&self.writer, &request)?;
 
         let deadline = Instant::now() + timeout;
@@ -5625,14 +5809,12 @@ impl AppServerBridge {
                 return Err(format!("timed out waiting for {}", method));
             }
             let wait = std::cmp::min(Duration::from_millis(250), deadline - now);
-            let line = match self.stdout_rx.recv_timeout(wait) {
-                Ok(line) => line,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("Codex app-server output channel closed".to_string())
-                }
+            let event = match self.event_hub.next_event(&mut cursor, wait) {
+                Ok(Some(event)) => event,
+                Ok(None) => continue,
+                Err(err) => return Err(err.message()),
             };
-            let Ok(value) = serde_json::from_slice::<Value>(trim_json_line(&line)) else {
+            let Some(value) = event.value.as_ref() else {
                 continue;
             };
             if value.get("id").and_then(Value::as_str) != Some(id.as_str()) {

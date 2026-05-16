@@ -147,6 +147,20 @@ fn injects_web_bridge_with_auth_query() {
 }
 
 #[test]
+fn web_bridge_script_polyfills_random_uuid_before_app_bundle_runs() {
+    let polyfill_index = WEB_BRIDGE_SCRIPT
+        .find("installCryptoRandomUuidPolyfill();")
+        .unwrap();
+    let installed_guard_index = WEB_BRIDGE_SCRIPT
+        .find("window.__codexWebBridgeInstalled")
+        .unwrap();
+
+    assert!(polyfill_index < installed_guard_index);
+    assert!(WEB_BRIDGE_SCRIPT.contains("Object.defineProperty(target, \"randomUUID\""));
+    assert!(WEB_BRIDGE_SCRIPT.contains("cryptoObject.getRandomValues(bytes)"));
+}
+
+#[test]
 fn web_bridge_script_prefers_webtransport_with_websocket_fallback() {
     assert!(WEB_BRIDGE_SCRIPT.contains("new WebTransport"));
     assert!(WEB_BRIDGE_SCRIPT.contains("new WebSocket"));
@@ -199,6 +213,62 @@ fn web_bridge_dispatch_captures_workspace_navigation_messages() {
 }
 
 #[test]
+fn web_bridge_dispatch_reflects_remote_owner_stream_state_to_codex_app() {
+    let expression = web_bridge_dispatch_expression(&json!({
+        "type": "thread-stream-state-changed",
+        "hostId": "local",
+        "conversationId": "thread-1",
+        "version": 6,
+        "change": { "type": "patches", "patches": [] },
+    }));
+
+    assert!(expression.contains("threadStreamStateParams"));
+    assert!(expression.contains("reflectRemoteThreadStreamStateToCodexApp"));
+    assert!(expression.contains("codex-web-remote-bridge"));
+    assert!(expression.contains("method: \"thread-stream-state-changed\""));
+    assert!(expression.contains("__codexWebBridgeLatestThreadStreamSnapshots"));
+    assert!(expression.contains("params.change?.type === \"snapshot\""));
+    assert!(expression.contains("reflectRemoteThreadStreamStateToCodexApp(input);"));
+    assert!(expression.contains("__codexWebBridgeNotificationForwarded"));
+}
+
+#[test]
+fn web_bridge_dispatch_seeds_codex_app_state_for_remote_thread_start() {
+    let expression = web_bridge_dispatch_expression(&json!({
+        "type": "mcp-request",
+        "hostId": "local",
+        "request": {
+            "id": "request-1",
+            "method": "thread/start",
+            "params": {}
+        },
+    }));
+
+    assert!(expression.contains("reflectThreadStartResponseToCodexApp"));
+    assert!(expression.contains("input.request?.method !== \"thread/start\""));
+    assert!(expression.contains("method: \"thread/started\""));
+    assert!(expression.contains("params: { thread: clone(thread) }"));
+    assert!(expression.contains("__codexWebBridgeNotificationForwarded"));
+}
+
+#[test]
+fn web_bridge_snapshot_request_collects_owner_stream_snapshots() {
+    let expression = web_bridge_snapshot_request_expression("bridge-connected", "remote-client-1");
+
+    assert!(expression.contains("client-status-changed"));
+    assert!(expression.contains("status: \"connected\""));
+    assert!(expression.contains("version: 0"));
+    assert!(expression.contains("codex-message-from-view"));
+    assert!(expression.contains("detail.type !== \"thread-stream-state-changed\""));
+    assert!(expression.contains("method: \"thread-stream-state-changed\""));
+    assert!(expression.contains("type: \"ipc-broadcast\""));
+    assert!(expression.contains("__codexWebBridgeNotificationForwarded"));
+    assert!(expression.contains("snapshotCount: messages.length"));
+    assert!(expression.contains("bridge-connected"));
+    assert!(expression.contains("remote-client-1"));
+}
+
+#[test]
 fn web_bridge_stream_expression_uses_incremental_buffer() {
     let start = web_bridge_stream_start_expression(&json!({
         "type": "fetch-stream",
@@ -215,21 +285,79 @@ fn web_bridge_stream_expression_uses_incremental_buffer() {
 }
 
 #[test]
-fn web_bridge_notification_expression_forwards_mcp_events() {
+fn web_bridge_notification_expression_forwards_all_bridge_events() {
     let install = web_bridge_notification_install_expression();
     let poll = web_bridge_notification_poll_expression(128);
 
     assert!(install.contains("__codexWebBridgeNotifications"));
-    assert!(install.contains("data.type === \"mcp-notification\""));
-    assert!(install.contains("data.type === \"mcp-request\""));
-    assert!(install.contains("data.type === \"mcp-response\""));
-    assert!(install.contains("typeof data.message.method === \"string\""));
-    assert!(install.contains("data.type === \"terminal-attached\""));
-    assert!(install.contains("data.type === \"terminal-data\""));
-    assert!(install.contains("data.type === \"terminal-error\""));
-    assert!(install.contains("data.type === \"terminal-exit\""));
-    assert!(install.contains("data.type === \"terminal-init-log\""));
-    assert!(poll.contains("state.messages.splice(0, limit)"));
+    assert!(install.contains("MAX_QUEUE_MESSAGES"));
+    assert!(install.contains("MAX_QUEUE_BYTES"));
+    assert!(install.contains("typeof data.type !== \"string\""));
+    assert!(install.contains("return true;"));
+    assert!(install.contains("data.__codexWebBridgeNotificationForwarded"));
+    assert!(install.contains("__codexWebBridgeNotificationSeq"));
+    assert!(install.contains("__codexEventSource"));
+    assert!(install.contains("cdp-webview"));
+    assert!(install.contains("__codexEventChannel"));
+    assert!(install.contains("codex-web-bridge-notification-gap"));
+    assert!(install.contains("thread-stream-state-changed"));
+    assert!(install.contains("queue-overflow"));
+    assert!(!install.contains("client-status-changed"));
+    assert!(!install.contains("data.type === \"mcp-notification\""));
+    assert!(!install.contains("data.type === \"terminal-attached\""));
+    assert!(poll.contains("state.messages.shift()"));
+    assert!(poll.contains("maxBytes"));
+    assert!(poll.contains("queuedBytes"));
+}
+
+#[test]
+fn web_bridge_event_hub_fans_out_cdp_events_to_independent_consumers() {
+    let (first, second) = web_bridge_event_hub_test_fanout_messages();
+
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 2);
+    assert_eq!(
+        first[0].get("type").and_then(Value::as_str),
+        Some("mcp-notification")
+    );
+    assert_eq!(
+        first[1].get("method").and_then(Value::as_str),
+        Some("thread-stream-state-changed")
+    );
+}
+
+#[test]
+fn web_bridge_event_hub_reports_gap_when_consumer_falls_behind() {
+    let messages = web_bridge_event_hub_test_gap_message();
+
+    assert_eq!(
+        messages[0].get("type").and_then(Value::as_str),
+        Some("codex-web-bridge-notification-gap")
+    );
+    assert_eq!(
+        messages[0].get("reason").and_then(Value::as_str),
+        Some("rust-event-hub-overflow")
+    );
+}
+
+#[test]
+fn web_bridge_script_strips_internal_notification_metadata() {
+    assert!(WEB_BRIDGE_SCRIPT.contains("stripBridgeMetadata"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("delete hostMessage.__codexWebBridgeNotificationSeq"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("delete hostMessage.__codexEventSource"));
+}
+
+#[test]
+fn web_bridge_script_filters_background_notifications_before_dispatching_to_codex_app() {
+    assert!(WEB_BRIDGE_SCRIPT.contains("CODEX_APP_NOTIFICATION_TYPES"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("shouldDispatchBridgeNotificationToCodexApp"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("thread-stream-state-changed"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("client-status-changed"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("normalizeHostMessageForCodexApp"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("codex-web-bridge-host-view"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("recordBridgeEvent(hostMessage)"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("codex-web-bridge-event"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("continue;"));
 }
 
 #[test]
@@ -237,6 +365,74 @@ fn web_bridge_script_uses_long_timeout_for_stream_and_mcp_requests() {
     assert!(WEB_BRIDGE_SCRIPT.contains("BRIDGE_STREAM_REQUEST_TIMEOUT_MS"));
     assert!(WEB_BRIDGE_SCRIPT.contains("message?.type === \"fetch-stream\""));
     assert!(WEB_BRIDGE_SCRIPT.contains("message?.type === \"mcp-request\""));
+}
+
+#[test]
+fn web_bridge_script_requests_snapshot_after_notification_gaps() {
+    assert!(WEB_BRIDGE_SCRIPT.contains("lastNotificationSeq"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("notification-sequence-gap"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("codex-web-bridge-notification-gap"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("codex-web-bridge-request-snapshot"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("options.force === true"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("notification-gap\", { force: true }"));
+}
+
+#[test]
+fn web_bridge_script_refreshes_stream_snapshot_after_thread_hydration() {
+    assert!(WEB_BRIDGE_SCRIPT.contains("BRIDGE_THREAD_HYDRATION_METHODS"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("\"thread/read\""));
+    assert!(WEB_BRIDGE_SCRIPT.contains("\"thread/turns/list\""));
+    assert!(WEB_BRIDGE_SCRIPT.contains("scheduleHostSnapshotAfterViewHydration(message);"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("remote-view-hydrated"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("BRIDGE_HYDRATION_SNAPSHOT_DELAY_MS"));
+}
+
+#[test]
+fn web_bridge_script_asks_remote_owner_for_snapshot_after_peer_hydration() {
+    assert!(WEB_BRIDGE_SCRIPT.contains("shouldAskRemoteOwnerForSnapshot"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("trackRemoteOwnerSnapshotRequest(hostMessage);"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("peerHydrationRequests"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("mcpResponseId"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("codex-web-bridge-peer-view"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("peer-view-history-loaded"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("peer-view-history-loaded-fallback"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("method: \"client-status-changed\""));
+}
+
+#[test]
+fn web_bridge_script_forwards_follower_approvals_to_codex_host() {
+    assert!(WEB_BRIDGE_SCRIPT.contains("BRIDGE_FOLLOWER_HOST_RESPONSE_METHODS"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("thread-follower-permissions-request-approval-response"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("thread-follower-command-approval-decision"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("thread-follower-file-approval-decision"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("targetClientId.includes(\"codex-web\")"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("vscode:\" || url.hostname !== \"codex\""));
+    assert!(WEB_BRIDGE_SCRIPT.contains("forwardFollowerHostResponseToCodexHost"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("type: \"mcp-response\""));
+    assert!(WEB_BRIDGE_SCRIPT.contains("id: request.params.requestId"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("notificationId: `approval-${request.params.requestId}`"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("maybeForwardFollowerHostResponse(hostMessage)"));
+}
+
+#[test]
+fn web_bridge_notification_expression_captures_view_to_host_events() {
+    let install = web_bridge_notification_install_expression();
+
+    assert!(install.contains("queueBridgeNotification"));
+    assert!(install.contains("\"codex-message-from-view\""));
+    assert!(install.contains("event && event.detail"));
+    assert!(install.contains("codex-message-from-view"));
+    assert!(install.contains("acknowledgeFollowerHostResponseFetch"));
+    assert!(install.contains("thread-follower-permissions-request-approval-response"));
+    assert!(install.contains("targetClientId.includes(\"codex-web\")"));
+    assert!(install.contains("type: \"fetch-response\""));
+    assert!(install.contains("bodyJsonString: JSON.stringify"));
+    assert!(install.contains("resultType: \"success\""));
+    assert!(install.contains("THREAD_HYDRATION_METHODS"));
+    assert!(install.contains("trackThreadHydrationMessage"));
+    assert!(install.contains("replayLatestThreadStreamSnapshot"));
+    assert!(install.contains("__codexWebBridgeLatestThreadStreamSnapshots"));
+    assert!(install.contains("THREAD_HYDRATION_STREAM_REPLAY_DELAY_MS"));
 }
 
 #[test]

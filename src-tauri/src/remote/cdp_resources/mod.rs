@@ -35,9 +35,11 @@ pub use resource::{
 #[cfg(test)]
 use bridge::{
     is_web_bridge_socket_heartbeat, parse_web_bridge_socket_message,
-    web_bridge_dispatch_expression, web_bridge_notification_install_expression,
-    web_bridge_notification_poll_expression, web_bridge_socket_response,
-    web_bridge_stream_poll_expression, web_bridge_stream_start_expression,
+    web_bridge_dispatch_expression, web_bridge_event_hub_test_fanout_messages,
+    web_bridge_event_hub_test_gap_message, web_bridge_notification_install_expression,
+    web_bridge_notification_poll_expression, web_bridge_snapshot_request_expression,
+    web_bridge_socket_response, web_bridge_stream_poll_expression,
+    web_bridge_stream_start_expression,
 };
 #[cfg(test)]
 use bridge_script::WEB_BRIDGE_SCRIPT;

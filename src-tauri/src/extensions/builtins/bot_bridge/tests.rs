@@ -37,6 +37,95 @@ fn temp_test_dir(name: &str) -> PathBuf {
 }
 
 #[test]
+fn codex_event_hub_fans_out_app_server_events_to_independent_cursors() {
+    let (tx, rx) = mpsc::channel();
+    let mut hub = CodexEventHub::new(rx);
+    let mut bot_cursor = hub.cursor_now();
+    let mut remote_cursor = hub.cursor_now();
+
+    tx.send(
+        json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "delta": "hello",
+            },
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .unwrap();
+
+    let bot_event = hub
+        .next_event(&mut bot_cursor, Duration::from_millis(10))
+        .unwrap()
+        .unwrap();
+    let remote_event = hub
+        .next_event(&mut remote_cursor, Duration::from_millis(10))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(bot_event.seq, remote_event.seq);
+    assert_eq!(bot_event.source.as_str(), "cli-app-server");
+    assert_eq!(bot_event.channel.as_str(), "stream");
+    assert_eq!(bot_event.method.as_deref(), Some("item/agentMessage/delta"));
+    assert_eq!(bot_event.thread_id.as_deref(), Some("thread-1"));
+    assert_eq!(bot_event.turn_id.as_deref(), Some("turn-1"));
+}
+
+#[test]
+fn codex_event_hub_preserves_events_seen_by_request_cursor_for_bot_cursor() {
+    let (tx, rx) = mpsc::channel();
+    let mut hub = CodexEventHub::new(rx);
+    let mut request_cursor = hub.cursor_now();
+    let mut bot_cursor = request_cursor.clone();
+
+    tx.send(
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+            },
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .unwrap();
+    tx.send(
+        json!({
+            "id": "codexl-bot-1",
+            "result": { "ok": true },
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .unwrap();
+
+    let first_request_event = hub
+        .next_event(&mut request_cursor, Duration::from_millis(10))
+        .unwrap()
+        .unwrap();
+    let second_request_event = hub
+        .next_event(&mut request_cursor, Duration::from_millis(10))
+        .unwrap()
+        .unwrap();
+    let first_bot_event = hub
+        .next_event(&mut bot_cursor, Duration::from_millis(10))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        first_request_event.method.as_deref(),
+        Some("item/completed")
+    );
+    assert_eq!(second_request_event.channel.as_str(), "response");
+    assert_eq!(first_bot_event.seq, first_request_event.seq);
+    assert_eq!(first_bot_event.method.as_deref(), Some("item/completed"));
+}
+
+#[test]
 fn sanitize_lock_component_keeps_lock_file_names_safe() {
     assert_eq!(sanitize_lock_component("discord"), "discord");
     assert_eq!(

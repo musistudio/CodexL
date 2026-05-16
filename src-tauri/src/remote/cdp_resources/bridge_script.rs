@@ -9,12 +9,71 @@ pub(super) fn web_bridge_script_response() -> WebResourceResponse {
 }
 
 pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
+  installCryptoRandomUuidPolyfill();
+
   if (window.__codexWebBridgeInstalled) {
     return;
   }
   window.__codexWebBridgeInstalled = true;
 
   const pageParams = new URLSearchParams(window.location.search);
+
+  function installCryptoRandomUuidPolyfill() {
+    const scope = typeof globalThis !== "undefined" ? globalThis : window;
+    const cryptoObject = scope.crypto || window.crypto;
+    if (cryptoObject && typeof cryptoObject.randomUUID === "function") {
+      return;
+    }
+
+    const randomBytes = () => {
+      const bytes = new Uint8Array(16);
+      try {
+        if (cryptoObject && typeof cryptoObject.getRandomValues === "function") {
+          cryptoObject.getRandomValues(bytes);
+          return bytes;
+        }
+      } catch {}
+      for (let index = 0; index < bytes.length; index += 1) {
+        bytes[index] = Math.floor(Math.random() * 256) & 0xff;
+      }
+      return bytes;
+    };
+    const randomUUID = () => {
+      const bytes = randomBytes();
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    };
+    const installOn = (target) => {
+      if (!target || typeof target.randomUUID === "function") {
+        return true;
+      }
+      try {
+        Object.defineProperty(target, "randomUUID", {
+          configurable: true,
+          value: randomUUID,
+          writable: true,
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    if (installOn(cryptoObject)) {
+      return;
+    }
+    if (cryptoObject && installOn(Object.getPrototypeOf(cryptoObject))) {
+      return;
+    }
+    try {
+      Object.defineProperty(scope, "crypto", {
+        configurable: true,
+        value: { randomUUID },
+      });
+    } catch {}
+  }
 
 	  function bridgeSocketUrl() {
 	    const configuredUrl = pageParams.get("codexBridgeUrl");
@@ -76,6 +135,34 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	  const BRIDGE_REQUEST_TIMEOUT_MS = 30000;
 	  const BRIDGE_LONG_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 	  const BRIDGE_STREAM_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
+	  const BRIDGE_SNAPSHOT_REQUEST_COOLDOWN_MS = 1000;
+	  const BRIDGE_HYDRATION_SNAPSHOT_DELAY_MS = 100;
+	  const BRIDGE_PEER_HYDRATION_SNAPSHOT_FALLBACK_MS = 1500;
+	  const BRIDGE_THREAD_HYDRATION_METHODS = new Set([
+	    "thread/list",
+	    "thread/read",
+	    "thread/search",
+	    "thread/turns/list",
+	    "turn/list",
+	  ]);
+	  const BRIDGE_FOLLOWER_HOST_RESPONSE_METHODS = new Set([
+	    "thread-follower-command-approval-decision",
+	    "thread-follower-file-approval-decision",
+	    "thread-follower-permissions-request-approval-response",
+	    "thread-follower-submit-mcp-server-elicitation-response",
+	    "thread-follower-submit-user-input",
+	  ]);
+	  const CODEX_APP_NOTIFICATION_TYPES = new Set([
+	    "terminal-attached",
+	    "terminal-data",
+	    "terminal-error",
+	    "terminal-exit",
+	    "terminal-init-log",
+	    "close-terminal-session",
+	    "shared-object-updated",
+	    "query-cache-invalidate",
+	    "tray-menu-threads-changed",
+	  ]);
 	  let socket = null;
 	  let connectingSocket = null;
 	  let transportClient = null;
@@ -87,6 +174,10 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	  let bridgeReconnectDelayMs = BRIDGE_RECONNECT_MIN_DELAY_MS;
 	  let bridgeReconnectTimer = null;
 	  let nextMessageId = 1;
+	  let lastNotificationSeq = 0;
+	  let lastSnapshotRequestAt = 0;
+	  const peerHydrationRequests = new Map();
+	  const bridgeClientId = `codex-web-bridge-frame-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	  const E2EE_AAD = new TextEncoder().encode("codexl-remote-e2ee-v1");
 	  const E2EE_STORAGE_PREFIX = "codexl.remote.e2ee.v1.";
 	  let bridgeCryptoPromise = null;
@@ -109,16 +200,191 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
     if (!message || typeof message !== "object") {
       return;
     }
-    if (message.type === "shared-object-updated" && typeof message.key === "string") {
-      sharedObjects[message.key] = message.value;
+    const hostMessage = stripBridgeMetadata(normalizeHostMessageForCodexApp(message));
+    if (hostMessage.type === "shared-object-updated" && typeof hostMessage.key === "string") {
+      sharedObjects[hostMessage.key] = hostMessage.value;
     }
     window.dispatchEvent(
       new MessageEvent("message", {
-        data: message,
+        data: hostMessage,
         origin: window.location.origin,
         source: window,
       }),
     );
+  }
+
+  function normalizeHostMessageForCodexApp(message) {
+    if (message?.type !== "thread-stream-state-changed") {
+      return message;
+    }
+    return {
+      type: "ipc-broadcast",
+      method: "thread-stream-state-changed",
+      sourceClientId: message.sourceClientId || message.clientId || "codex-web-bridge-host-view",
+      version: Number.isFinite(message.version) ? message.version : 6,
+      params: stripBridgeMetadata(message),
+    };
+  }
+
+  function stripBridgeMetadata(message) {
+    if (!message || typeof message !== "object") {
+      return message;
+    }
+    const hostMessage = { ...message };
+    delete hostMessage.__codexWebBridgeNotificationForwarded;
+    delete hostMessage.__codexWebBridgeNotificationSeq;
+    delete hostMessage.__codexWebBridgeNotificationQueuedAt;
+    delete hostMessage.__codexEventSource;
+    delete hostMessage.__codexEventChannel;
+    delete hostMessage.__codexEventMethod;
+    return hostMessage;
+  }
+
+  function isBridgeNotification(message) {
+    return (
+      message &&
+      typeof message === "object" &&
+      (message.__codexWebBridgeNotificationSeq != null ||
+        message.__codexEventSource === "cdp-webview")
+    );
+  }
+
+  function shouldDispatchBridgeNotificationToCodexApp(message) {
+    if (!message || typeof message !== "object") {
+      return false;
+    }
+    if (message.type === "ipc-broadcast") {
+      return (
+        message.method === "thread-stream-state-changed" ||
+        message.method === "client-status-changed"
+      );
+    }
+    if (message.type === "thread-stream-state-changed") {
+      return true;
+    }
+    if (message.type === "mcp-notification" || message.type === "mcp-request") {
+      return true;
+    }
+    if (message.type === "mcp-response") {
+      return Boolean(message.message && typeof message.message.method === "string");
+    }
+    return CODEX_APP_NOTIFICATION_TYPES.has(message.type);
+  }
+
+  function bridgeIpcRequestBody(message) {
+    if (!message || typeof message !== "object" || message.type !== "fetch") {
+      return null;
+    }
+    if (typeof message.url !== "string") {
+      return null;
+    }
+    let url;
+    try {
+      url = new URL(message.url, window.location.href);
+    } catch {
+      return null;
+    }
+    if (url.protocol !== "vscode:" || url.hostname !== "codex" || url.pathname !== "/ipc-request") {
+      return null;
+    }
+    if (typeof message.body === "string") {
+      try {
+        return JSON.parse(message.body);
+      } catch {
+        return null;
+      }
+    }
+    if (message.body && typeof message.body === "object") {
+      return message.body;
+    }
+    return null;
+  }
+
+  function bridgeFollowerHostResponseRequest(message) {
+    if (!isBridgeNotification(message)) {
+      return null;
+    }
+    const body = bridgeIpcRequestBody(message);
+    if (!body || typeof body !== "object") {
+      return null;
+    }
+    if (!BRIDGE_FOLLOWER_HOST_RESPONSE_METHODS.has(body.method)) {
+      return null;
+    }
+    const targetClientId = typeof body.targetClientId === "string" ? body.targetClientId : "";
+    if (!targetClientId.includes("codex-web")) {
+      return null;
+    }
+    const params = body.params && typeof body.params === "object" ? body.params : null;
+    if (!params || params.requestId == null) {
+      return null;
+    }
+    return { method: body.method, params };
+  }
+
+  function followerHostResponseResult(request) {
+    if (
+      request.method === "thread-follower-command-approval-decision" ||
+      request.method === "thread-follower-file-approval-decision"
+    ) {
+      return { decision: request.params.decision };
+    }
+    return request.params.response;
+  }
+
+  async function forwardFollowerHostResponseToCodexHost(message, request) {
+    const result = followerHostResponseResult(request);
+    if (result === undefined) {
+      return;
+    }
+    await sendBridgeRequest({
+      type: "mcp-response",
+      hostId: message.hostId || request.params.hostId || "local",
+      response: {
+        id: request.params.requestId,
+        result,
+      },
+    });
+    await sendBridgeRequest({
+      type: "desktop-notification-hide",
+      notificationId: `approval-${request.params.requestId}`,
+    });
+  }
+
+  function maybeForwardFollowerHostResponse(message) {
+    const request = bridgeFollowerHostResponseRequest(message);
+    if (!request) {
+      return false;
+    }
+    void forwardFollowerHostResponseToCodexHost(message, request).catch((error) => {
+      console.warn("[codex-web] bridge follower host response failed", error);
+    });
+    return true;
+  }
+
+  function recordBridgeEvent(message) {
+    if (!message || typeof message !== "object") {
+      return;
+    }
+    const events = (window.__codexWebBridgeEvents ||= []);
+    events.push(message);
+    if (events.length > 2048) {
+      events.splice(0, events.length - 2048);
+    }
+    try {
+      window.dispatchEvent(new CustomEvent("codex-web-bridge-event", { detail: message }));
+    } catch {}
+    try {
+      window.parent?.postMessage(
+        {
+          event: stripBridgeMetadata(message),
+          method: message.__codexEventMethod,
+          source: message.__codexEventSource || "bridge",
+          type: "codex-web-bridge-event",
+        },
+        window.location.origin,
+      );
+    } catch {}
   }
 
   function bridgeErrorMessage(message, error) {
@@ -228,6 +494,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	      bridgeReconnectTimer = null;
 	    }
 	    notifyBridgeStatus("connected");
+	    window.setTimeout(() => requestHostSnapshot("bridge-connected"), 0);
 	  }
 
 	  function scheduleBridgeReconnect() {
@@ -258,12 +525,180 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	    }
 	  }
 
+	  function requestHostSnapshot(reason, options = {}) {
+	    const force = options.force === true;
+	    const now = Date.now();
+	    if (!force && now - lastSnapshotRequestAt < BRIDGE_SNAPSHOT_REQUEST_COOLDOWN_MS) {
+	      return;
+	    }
+	    lastSnapshotRequestAt = now;
+	    void sendBridgeRequest({
+	      type: "codex-web-bridge-request-snapshot",
+	      clientId: bridgeClientId,
+	      reason,
+	    }).catch((error) => {
+	      console.warn("[codex-web] bridge snapshot request failed", error);
+	    });
+	  }
+
+	  function mcpRequestMethod(message) {
+	    return message?.type === "mcp-request" && typeof message.request?.method === "string"
+	      ? message.request.method
+	      : null;
+	  }
+
+	  function mcpRequestId(message) {
+	    return message?.type === "mcp-request" && message.request?.id != null
+	      ? String(message.request.id)
+	      : null;
+	  }
+
+	  function mcpResponseId(message) {
+	    return message?.type === "mcp-response" && message.message?.id != null
+	      ? String(message.message.id)
+	      : null;
+	  }
+
+	  function isThreadHydrationRequest(message) {
+	    return BRIDGE_THREAD_HYDRATION_METHODS.has(mcpRequestMethod(message));
+	  }
+
+	  function shouldRefreshStreamSnapshotAfterHostMessage(message) {
+	    return isThreadHydrationRequest(message) || message?.type === "thread-role-request";
+	  }
+
+	  function scheduleHostSnapshotAfterViewHydration(message) {
+	    if (!shouldRefreshStreamSnapshotAfterHostMessage(message)) {
+	      return;
+	    }
+	    window.setTimeout(
+	      () => requestHostSnapshot("remote-view-hydrated", { force: true }),
+	      BRIDGE_HYDRATION_SNAPSHOT_DELAY_MS,
+	    );
+	  }
+
+	  function shouldAskRemoteOwnerForSnapshot(message) {
+	    return isBridgeNotification(message) && shouldRefreshStreamSnapshotAfterHostMessage(message);
+	  }
+
+	  function peerHydrationKey(hostId, requestId) {
+	    return `${hostId || ""}:${requestId}`;
+	  }
+
+	  function dispatchRemoteOwnerSnapshotRequestForClient(clientId, reason) {
+	    dispatchHostMessage({
+	      type: "ipc-broadcast",
+	      method: "client-status-changed",
+	      sourceClientId: clientId,
+	      version: 0,
+	      params: {
+	        clientId,
+	        clientType: "web",
+	        status: "connected",
+	      },
+	      reason,
+	    });
+	  }
+
+	  function dispatchRemoteOwnerSnapshotRequest(message, reason) {
+	    const clientId =
+	      message.sourceClientId || message.clientId || "codex-web-bridge-peer-view";
+	    dispatchRemoteOwnerSnapshotRequestForClient(clientId, reason);
+	  }
+
+	  function trackRemoteOwnerSnapshotRequest(message) {
+	    if (!isBridgeNotification(message)) {
+	      return;
+	    }
+	    if (shouldAskRemoteOwnerForSnapshot(message)) {
+	      const requestId = mcpRequestId(message);
+	      if (!requestId) {
+	        window.setTimeout(
+	          () => dispatchRemoteOwnerSnapshotRequest(message, "peer-view-history-loaded-fallback"),
+	          BRIDGE_PEER_HYDRATION_SNAPSHOT_FALLBACK_MS,
+	        );
+	        return;
+	      }
+	      const key = peerHydrationKey(message.hostId, requestId);
+	      const existing = peerHydrationRequests.get(key);
+	      if (existing?.timer) {
+	        window.clearTimeout(existing.timer);
+	      }
+	      const clientId =
+	        message.sourceClientId || message.clientId || "codex-web-bridge-peer-view";
+	      const timer = window.setTimeout(() => {
+	        const pending = peerHydrationRequests.get(key);
+	        if (!pending) {
+	          return;
+	        }
+	        peerHydrationRequests.delete(key);
+	        dispatchRemoteOwnerSnapshotRequestForClient(
+	          pending.clientId,
+	          "peer-view-history-loaded-fallback",
+	        );
+	      }, BRIDGE_PEER_HYDRATION_SNAPSHOT_FALLBACK_MS);
+	      peerHydrationRequests.set(key, { clientId, timer });
+	      return;
+	    }
+	    const responseId = mcpResponseId(message);
+	    if (!responseId) {
+	      return;
+	    }
+	    const key = peerHydrationKey(message.hostId, responseId);
+	    const pending = peerHydrationRequests.get(key);
+	    if (!pending) {
+	      return;
+	    }
+	    peerHydrationRequests.delete(key);
+	    if (pending.timer) {
+	      window.clearTimeout(pending.timer);
+	    }
+	    dispatchRemoteOwnerSnapshotRequestForClient(
+	      pending.clientId,
+	      "peer-view-history-loaded",
+	    );
+	  }
+
+	  function shouldDispatchNotification(message) {
+	    const rawSeq = message?.__codexWebBridgeNotificationSeq;
+	    const seq = typeof rawSeq === "number" ? rawSeq : Number(rawSeq);
+	    if (!Number.isFinite(seq) || seq <= 0) {
+	      return true;
+	    }
+	    if (lastNotificationSeq > 0 && seq <= lastNotificationSeq) {
+	      return false;
+	    }
+	    if (lastNotificationSeq > 0 && seq !== lastNotificationSeq + 1) {
+	      requestHostSnapshot("notification-sequence-gap", { force: true });
+	    }
+	    lastNotificationSeq = seq;
+	    return true;
+	  }
+
 	  function handleBridgePayload(payload) {
 	    markBridgeConnectionAlive();
 	    if (payload?.type === "bridge-heartbeat-ack") {
 	      return;
 	    }
 	    for (const hostMessage of payload.messages || []) {
+	      if (hostMessage?.type === "codex-web-bridge-notification-gap") {
+	        requestHostSnapshot(hostMessage.reason || "notification-gap", { force: true });
+	        continue;
+	      }
+	      if (!shouldDispatchNotification(hostMessage)) {
+	        continue;
+	      }
+	      recordBridgeEvent(hostMessage);
+	      trackRemoteOwnerSnapshotRequest(hostMessage);
+	      if (maybeForwardFollowerHostResponse(hostMessage)) {
+	        continue;
+	      }
+	      if (
+	        isBridgeNotification(hostMessage) &&
+	        !shouldDispatchBridgeNotificationToCodexApp(hostMessage)
+	      ) {
+	        continue;
+	      }
 	      dispatchHostMessage(hostMessage);
 	    }
     if (!payload.id) {
@@ -1544,6 +1979,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
         return;
       }
       await sendBridgeRequest(message);
+      scheduleHostSnapshotAfterViewHydration(message);
     } catch (error) {
       const hostMessage = bridgeErrorMessage(message, error);
       if (hostMessage) {

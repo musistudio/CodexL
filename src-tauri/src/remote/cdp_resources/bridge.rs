@@ -3,7 +3,7 @@ use super::file_picker::{dispatch_web_file_picker_message, is_web_file_picker_me
 use super::resource::log_web_resource_targets;
 use super::*;
 use crate::remote::crypto::RemoteCrypto;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
@@ -12,16 +12,21 @@ use std::time::{Duration, Instant};
 const WEB_BRIDGE_TARGET_CACHE_TTL_MS: u64 = 30_000;
 const WEB_BRIDGE_CDP_PENDING_PRUNE_LIMIT: usize = 1024;
 const WEB_BRIDGE_HEARTBEAT_TYPE: &str = "bridge-heartbeat";
+const WEB_BRIDGE_SNAPSHOT_REQUEST_TYPE: &str = "codex-web-bridge-request-snapshot";
 const WEB_BRIDGE_STREAM_IDLE_TIMEOUT_MS: u64 = 120_000;
 const WEB_BRIDGE_STREAM_MAX_DURATION_MS: u64 = 10 * 60_000;
 const WEB_BRIDGE_STREAM_POLL_INTERVAL_MS: u64 = 25;
 const WEB_BRIDGE_STREAM_POLL_LIMIT: usize = 64;
 const WEB_BRIDGE_NOTIFICATION_POLL_INTERVAL_MS: u64 = 50;
-const WEB_BRIDGE_NOTIFICATION_POLL_LIMIT: usize = 128;
+const WEB_BRIDGE_NOTIFICATION_POLL_LIMIT: usize = 256;
+const WEB_BRIDGE_NOTIFICATION_POLL_MAX_BYTES: usize = 512 * 1024;
 const WEB_BRIDGE_NOTIFICATION_IDLE_TIMEOUT_MS: u64 = 10 * 60_000;
+const WEB_BRIDGE_EVENT_HUB_CAPACITY: usize = 8192;
 
 static WEB_BRIDGE_TARGET_CACHE: OnceLock<StdMutex<Option<CachedWebBridgeTarget>>> = OnceLock::new();
 static WEB_BRIDGE_CDP_CLIENT_CACHE: OnceLock<StdMutex<Option<CachedWebBridgeCdpClient>>> =
+    OnceLock::new();
+static WEB_BRIDGE_EVENT_HUBS: OnceLock<StdMutex<HashMap<String, Arc<WebBridgeEventHub>>>> =
     OnceLock::new();
 
 struct CachedWebBridgeTarget {
@@ -53,6 +58,263 @@ struct WebBridgeCdpCommand {
 struct WebBridgeCdpPending {
     method: String,
     response: tokio::sync::oneshot::Sender<Result<Value, String>>,
+}
+
+#[derive(Debug, Clone)]
+struct WebBridgeEvent {
+    seq: u64,
+    message: Value,
+    bytes: usize,
+    #[allow(dead_code)]
+    received_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct WebBridgeEventCursor {
+    next_seq: u64,
+}
+
+struct WebBridgeEventHub {
+    cdp_host: String,
+    cdp_port: u16,
+    state: StdMutex<WebBridgeEventHubState>,
+    notify: tokio::sync::Notify,
+}
+
+struct WebBridgeEventHubState {
+    events: VecDeque<WebBridgeEvent>,
+    first_seq: u64,
+    next_seq: u64,
+    producer_running: bool,
+    producer_retry_after: Option<Instant>,
+    consumers: usize,
+}
+
+struct WebBridgeEventConsumer {
+    hub: Arc<WebBridgeEventHub>,
+    cursor: WebBridgeEventCursor,
+}
+
+impl WebBridgeEventHub {
+    fn new(cdp_host: String, cdp_port: u16) -> Self {
+        Self {
+            cdp_host,
+            cdp_port,
+            state: StdMutex::new(WebBridgeEventHubState {
+                events: VecDeque::new(),
+                first_seq: 1,
+                next_seq: 1,
+                producer_running: false,
+                producer_retry_after: None,
+                consumers: 0,
+            }),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn subscribe(self: &Arc<Self>) -> WebBridgeEventConsumer {
+        let cursor = {
+            let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+            state.consumers = state.consumers.saturating_add(1);
+            WebBridgeEventCursor {
+                next_seq: state.next_seq,
+            }
+        };
+        self.ensure_producer();
+        WebBridgeEventConsumer {
+            hub: self.clone(),
+            cursor,
+        }
+    }
+
+    #[cfg(test)]
+    fn subscribe_without_producer_for_test(self: &Arc<Self>) -> WebBridgeEventConsumer {
+        let cursor = {
+            let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+            state.consumers = state.consumers.saturating_add(1);
+            WebBridgeEventCursor {
+                next_seq: state.next_seq,
+            }
+        };
+        WebBridgeEventConsumer {
+            hub: self.clone(),
+            cursor,
+        }
+    }
+
+    fn unregister_consumer(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.consumers = state.consumers.saturating_sub(1);
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn has_consumers(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.consumers > 0)
+            .unwrap_or(false)
+    }
+
+    fn ensure_producer(self: &Arc<Self>) {
+        let should_start = {
+            let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+            if state
+                .producer_retry_after
+                .map(|retry_after| retry_after > Instant::now())
+                .unwrap_or(false)
+            {
+                return;
+            }
+            if state.producer_running {
+                false
+            } else {
+                state.producer_running = true;
+                state.producer_retry_after = None;
+                true
+            }
+        };
+        if !should_start {
+            return;
+        }
+
+        let hub = self.clone();
+        tokio::spawn(async move {
+            let result = run_web_bridge_notification_producer(hub.clone()).await;
+            let failed = result.is_err();
+            hub.mark_producer_stopped(failed);
+            if let Err(err) = result {
+                eprintln!("[codex-web] bridge notification producer stopped: {}", err);
+            }
+        });
+    }
+
+    fn mark_producer_stopped(&self, failed: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.producer_running = false;
+            state.producer_retry_after = if failed {
+                Some(Instant::now() + Duration::from_secs(1))
+            } else {
+                None
+            };
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn publish_messages(&self, messages: Vec<Value>) {
+        if messages.is_empty() {
+            return;
+        }
+
+        {
+            let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+            for message in messages {
+                let seq = state.next_seq;
+                state.next_seq = state.next_seq.saturating_add(1);
+                let bytes = serde_json::to_vec(&message)
+                    .map(|raw| raw.len())
+                    .unwrap_or(0);
+                state.events.push_back(WebBridgeEvent {
+                    seq,
+                    message,
+                    bytes,
+                    received_at: Instant::now(),
+                });
+            }
+            while state.events.len() > WEB_BRIDGE_EVENT_HUB_CAPACITY {
+                state.events.pop_front();
+            }
+            state.first_seq = state
+                .events
+                .front()
+                .map(|event| event.seq)
+                .unwrap_or(state.next_seq);
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn next_batch(
+        &self,
+        cursor: &mut WebBridgeEventCursor,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Vec<Value> {
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let mut messages = Vec::new();
+        let limit = limit.max(1);
+        let mut bytes = 0usize;
+        let mut next_seq = cursor.next_seq;
+
+        if next_seq < state.first_seq {
+            let requested = next_seq;
+            let first = state.first_seq;
+            next_seq = first;
+            messages.push(json!({
+                "type": "codex-web-bridge-notification-gap",
+                "droppedCount": first.saturating_sub(requested),
+                "reason": "rust-event-hub-overflow",
+                "requestedSeq": requested,
+                "firstSeq": first,
+                "queued": state.events.len(),
+            }));
+        }
+
+        for event in state.events.iter() {
+            if event.seq < next_seq {
+                continue;
+            }
+            if messages.len() >= limit {
+                break;
+            }
+            if !messages.is_empty() && bytes.saturating_add(event.bytes) > max_bytes {
+                break;
+            }
+            messages.push(event.message.clone());
+            bytes = bytes.saturating_add(event.bytes);
+            next_seq = event.seq.saturating_add(1);
+        }
+        cursor.next_seq = next_seq;
+
+        messages
+    }
+}
+
+impl Drop for WebBridgeEventConsumer {
+    fn drop(&mut self) {
+        self.hub.unregister_consumer();
+    }
+}
+
+impl WebBridgeEventConsumer {
+    fn next_batch(&mut self, limit: usize, max_bytes: usize) -> Vec<Value> {
+        self.hub.next_batch(&mut self.cursor, limit, max_bytes)
+    }
+}
+
+#[cfg(test)]
+pub(super) fn web_bridge_event_hub_test_fanout_messages() -> (Vec<Value>, Vec<Value>) {
+    let hub = Arc::new(WebBridgeEventHub::new("127.0.0.1".to_string(), 0));
+    let mut first = hub.subscribe_without_producer_for_test();
+    let mut second = hub.subscribe_without_producer_for_test();
+    hub.publish_messages(vec![
+        json!({ "type": "mcp-notification", "method": "one" }),
+        json!({ "type": "ipc-broadcast", "method": "thread-stream-state-changed" }),
+    ]);
+    (
+        first.next_batch(16, WEB_BRIDGE_NOTIFICATION_POLL_MAX_BYTES),
+        second.next_batch(16, WEB_BRIDGE_NOTIFICATION_POLL_MAX_BYTES),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn web_bridge_event_hub_test_gap_message() -> Vec<Value> {
+    let hub = Arc::new(WebBridgeEventHub::new("127.0.0.1".to_string(), 0));
+    let mut consumer = hub.subscribe_without_producer_for_test();
+    let messages = (0..(WEB_BRIDGE_EVENT_HUB_CAPACITY + 2))
+        .map(|index| json!({ "type": "mcp-notification", "index": index }))
+        .collect::<Vec<_>>();
+    hub.publish_messages(messages);
+    consumer.next_batch(16, WEB_BRIDGE_NOTIFICATION_POLL_MAX_BYTES)
 }
 
 pub async fn dispatch_web_bridge_message(
@@ -90,6 +352,29 @@ pub async fn dispatch_web_bridge_message(
         "[codex-web] bridge request: cdp=http://{}:{} type={} requestId={} url={} mcpMethod={} mcpId={}",
         cdp_host, cdp_port, message_type, request_id, url, mcp_method, mcp_id
     );
+
+    if message.get("type").and_then(Value::as_str) == Some(WEB_BRIDGE_SNAPSHOT_REQUEST_TYPE) {
+        let reason = message
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("remote-request");
+        let client_id = message
+            .get("clientId")
+            .and_then(Value::as_str)
+            .unwrap_or("codex-web-bridge");
+        let cdp_client = web_bridge_cdp_client(cdp_host, cdp_port).await?;
+        let result = cdp_client
+            .send(
+                "Runtime.evaluate",
+                json!({
+                    "awaitPromise": true,
+                    "expression": web_bridge_snapshot_request_expression(reason, client_id),
+                    "returnByValue": true,
+                }),
+            )
+            .await?;
+        return web_bridge_runtime_value(&result);
+    }
 
     if is_web_file_picker_message(&message) {
         let value = dispatch_web_file_picker_message(message)?;
@@ -670,17 +955,28 @@ fn spawn_web_bridge_notification_pump_with_options<F>(
     F: Fn(Value) + Send + Sync + 'static,
 {
     tokio::spawn(async move {
+        let hub = web_bridge_event_hub(cdp_host, cdp_port);
+        let consumer = hub.subscribe();
         if let Err(err) =
-            run_web_bridge_notification_pump(&cdp_host, cdp_port, active, idle_timeout, emit).await
+            run_web_bridge_notification_consumer(consumer, active, idle_timeout, emit).await
         {
-            eprintln!("[codex-web] bridge notification pump stopped: {}", err);
+            eprintln!("[codex-web] bridge notification consumer stopped: {}", err);
         }
     });
 }
 
-async fn run_web_bridge_notification_pump<F>(
-    cdp_host: &str,
-    cdp_port: u16,
+fn web_bridge_event_hub(cdp_host: String, cdp_port: u16) -> Arc<WebBridgeEventHub> {
+    let key = format!("{}:{}", cdp_host, cdp_port);
+    let hubs = WEB_BRIDGE_EVENT_HUBS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = hubs.lock().unwrap_or_else(|err| err.into_inner());
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(WebBridgeEventHub::new(cdp_host, cdp_port)))
+        .clone()
+}
+
+async fn run_web_bridge_notification_consumer<F>(
+    mut consumer: WebBridgeEventConsumer,
     active: Option<Arc<AtomicBool>>,
     idle_timeout: Option<Duration>,
     emit: F,
@@ -688,7 +984,44 @@ async fn run_web_bridge_notification_pump<F>(
 where
     F: Fn(Value) + Send + Sync,
 {
-    let cdp_client = web_bridge_cdp_client(cdp_host, cdp_port).await?;
+    let mut last_message_at = Instant::now();
+    loop {
+        if active
+            .as_ref()
+            .map(|active| !active.load(Ordering::Relaxed))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        consumer.hub.ensure_producer();
+        let messages = consumer.next_batch(
+            WEB_BRIDGE_NOTIFICATION_POLL_LIMIT,
+            WEB_BRIDGE_NOTIFICATION_POLL_MAX_BYTES,
+        );
+        if messages.is_empty() {
+            if idle_timeout
+                .map(|timeout| last_message_at.elapsed() > timeout)
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+        } else {
+            last_message_at = Instant::now();
+            emit(json!({ "messages": messages }));
+            continue;
+        }
+
+        let _ = tokio::time::timeout(
+            Duration::from_millis(WEB_BRIDGE_NOTIFICATION_POLL_INTERVAL_MS),
+            consumer.hub.notify.notified(),
+        )
+        .await;
+    }
+}
+
+async fn run_web_bridge_notification_producer(hub: Arc<WebBridgeEventHub>) -> Result<(), String> {
+    let cdp_client = web_bridge_cdp_client(&hub.cdp_host, hub.cdp_port).await?;
     cdp_client
         .send(
             "Runtime.evaluate",
@@ -700,13 +1033,8 @@ where
         )
         .await?;
 
-    let mut last_message_at = Instant::now();
     loop {
-        if active
-            .as_ref()
-            .map(|active| !active.load(Ordering::Relaxed))
-            .unwrap_or(false)
-        {
+        if !hub.has_consumers() {
             return Ok(());
         }
 
@@ -726,7 +1054,7 @@ where
             Ok(result) => result,
             Err(err) => {
                 if !cdp_client.is_open() {
-                    clear_cached_web_bridge_cdp_client(cdp_host, cdp_port);
+                    clear_cached_web_bridge_cdp_client(&hub.cdp_host, hub.cdp_port);
                 }
                 return Err(err);
             }
@@ -737,17 +1065,7 @@ where
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        if messages.is_empty() {
-            if idle_timeout
-                .map(|timeout| last_message_at.elapsed() > timeout)
-                .unwrap_or(false)
-            {
-                return Ok(());
-            }
-        } else {
-            last_message_at = Instant::now();
-            emit(json!({ "messages": messages }));
-        }
+        hub.publish_messages(messages);
 
         tokio::time::sleep(Duration::from_millis(
             WEB_BRIDGE_NOTIFICATION_POLL_INTERVAL_MS,
@@ -1131,6 +1449,87 @@ pub(super) fn web_bridge_dispatch_expression(message: &Value) -> String {
               }}
               return restored;
             }};
+            const markBridgeForwarded = (value) => {{
+              if (!value || typeof value !== "object") {{
+                return;
+              }}
+              try {{
+                Object.defineProperty(value, "__codexWebBridgeNotificationForwarded", {{
+                  configurable: true,
+                  value: true,
+                }});
+              }} catch {{
+                value.__codexWebBridgeNotificationForwarded = true;
+              }}
+            }};
+            const dispatchLocalCodexAppMessage = (value) => {{
+              markBridgeForwarded(value);
+              window.dispatchEvent(
+                new MessageEvent("message", {{
+                  data: value,
+                  origin: window.location.origin,
+                  source: window,
+                }}),
+              );
+            }};
+            const threadStreamStateParams = (value) => {{
+              if (!value || typeof value !== "object") {{
+                return null;
+              }}
+              if (value.type === "thread-stream-state-changed") {{
+                return value;
+              }}
+              if (
+                value.type === "ipc-broadcast" &&
+                value.method === "thread-stream-state-changed" &&
+                value.params &&
+                typeof value.params === "object"
+              ) {{
+                return value.params;
+              }}
+              return null;
+            }};
+            const reflectRemoteThreadStreamStateToCodexApp = (value) => {{
+              const params = threadStreamStateParams(value);
+              if (!params || !params.conversationId || !params.hostId || !params.change) {{
+                return;
+              }}
+              const reflected = {{
+                type: "ipc-broadcast",
+                method: "thread-stream-state-changed",
+                sourceClientId:
+                  value.sourceClientId || value.clientId || "codex-web-remote-bridge",
+                version: Number.isFinite(value.version)
+                  ? value.version
+                  : Number.isFinite(params.version)
+                    ? params.version
+                    : 6,
+                params: clone(params),
+              }};
+              if (params.change?.type === "snapshot") {{
+                const snapshots =
+                  (window.__codexWebBridgeLatestThreadStreamSnapshots ||= Object.create(null));
+                snapshots[params.conversationId] = clone(reflected);
+              }}
+              dispatchLocalCodexAppMessage(reflected);
+            }};
+            const reflectThreadStartResponseToCodexApp = (response) => {{
+              if (input?.type !== "mcp-request" || input.request?.method !== "thread/start") {{
+                return;
+              }}
+              const thread = response?.message?.result?.thread;
+              if (!thread || typeof thread !== "object") {{
+                return;
+              }}
+              // Remote-created threads did not run Codex App's local createConversation()
+              // path, so seed local conversation state before turn stream notifications arrive.
+              dispatchLocalCodexAppMessage({{
+                type: "mcp-notification",
+                hostId: input.hostId,
+                method: "thread/started",
+                params: {{ thread: clone(thread) }},
+              }});
+            }};
             const sendToHost = async () => {{
               if (window.electronBridge?.sendMessageFromView) {{
                 await window.electronBridge.sendMessageFromView(message);
@@ -1326,7 +1725,14 @@ pub(super) fn web_bridge_dispatch_expression(message: &Value) -> String {
                   timedOut: true,
                 }};
               }}
+              reflectThreadStartResponseToCodexApp(result.message);
               return {{ messages: [result.message] }};
+            }}
+
+            if (threadStreamStateParams(input)) {{
+              await sendToHost();
+              reflectRemoteThreadStreamStateToCodexApp(input);
+              return {{ messages: [] }};
             }}
 
             if (bridgeId) {{
@@ -1507,55 +1913,308 @@ fn web_bridge_stream_cleanup_expression(stream_key: &str) -> String {
 
 pub(super) fn web_bridge_notification_install_expression() -> &'static str {
     r#"(async () => {
+      const MAX_QUEUE_MESSAGES = 4096;
+      const MAX_QUEUE_BYTES = 8 * 1024 * 1024;
       const state = (window.__codexWebBridgeNotifications ||= {
         installed: false,
         messages: [],
       });
-      if (!state.installed) {
-        const clone = (value) => {
-          if (value === undefined) {
+      const FOLLOWER_HOST_RESPONSE_METHODS = new Set([
+        "thread-follower-command-approval-decision",
+        "thread-follower-file-approval-decision",
+        "thread-follower-permissions-request-approval-response",
+        "thread-follower-submit-mcp-server-elicitation-response",
+        "thread-follower-submit-user-input",
+      ]);
+      const THREAD_HYDRATION_METHODS = new Set([
+        "thread/list",
+        "thread/read",
+        "thread/search",
+        "thread/turns/list",
+        "turn/list",
+      ]);
+      const THREAD_HYDRATION_STREAM_REPLAY_DELAY_MS = 100;
+      state.messages = Array.isArray(state.messages) ? state.messages : [];
+      state.nextSeq = Number.isFinite(state.nextSeq) ? state.nextSeq : 1;
+      state.queuedBytes = Number.isFinite(state.queuedBytes) ? state.queuedBytes : 0;
+      state.droppedCount = Number.isFinite(state.droppedCount) ? state.droppedCount : 0;
+      state.threadHydrationRequests =
+        state.threadHydrationRequests && typeof state.threadHydrationRequests === "object"
+          ? state.threadHydrationRequests
+          : Object.create(null);
+      if (!state.clientId) {
+        state.clientId = `codex-web-bridge-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      }
+      const serialize = (value) => {
+        if (value === undefined) {
+          return undefined;
+        }
+        try {
+          const raw = JSON.stringify(value);
+          if (raw === undefined) {
             return undefined;
           }
-          return JSON.parse(JSON.stringify(value));
-        };
-        const shouldForward = (data) => {
-          if (!data || typeof data !== "object") {
-            return false;
+          return { bytes: raw.length, value: JSON.parse(raw) };
+        } catch {
+          return undefined;
+        }
+      };
+      const notificationMessage = (entry) => entry && entry.message ? entry.message : entry;
+      const notificationBytes = (entry) => Number.isFinite(entry && entry.bytes) ? entry.bytes : 0;
+      const notificationMethod = (message) =>
+        message && message.type === "ipc-broadcast" ? message.method : message?.type;
+      const notificationParams = (message) =>
+        message && message.type === "ipc-broadcast" ? message.params : message;
+      const isTurnStreamMessage = (message) =>
+        notificationMethod(message) === "thread-stream-state-changed";
+      const isTurnStreamPatch = (message) =>
+        isTurnStreamMessage(message) && notificationParams(message)?.change?.type === "patches";
+      const isTurnStreamSnapshot = (message) =>
+        isTurnStreamMessage(message) && notificationParams(message)?.change?.type === "snapshot";
+      const shouldForward = (data) => {
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          return false;
+        }
+        if (typeof data.type !== "string" || data.type.length === 0) {
+          return false;
+        }
+        if (data.__codexWebBridgeNotificationForwarded) {
+          return false;
+        }
+        return true;
+      };
+      const ipcRequestBody = (data) => {
+        if (!data || typeof data !== "object" || data.type !== "fetch") {
+          return null;
+        }
+        if (typeof data.url !== "string") {
+          return null;
+        }
+        let url;
+        try {
+          url = new URL(data.url, window.location.href);
+        } catch {
+          return null;
+        }
+        if (url.protocol !== "vscode:" || url.hostname !== "codex" || url.pathname !== "/ipc-request") {
+          return null;
+        }
+        if (typeof data.body === "string") {
+          try {
+            return JSON.parse(data.body);
+          } catch {
+            return null;
           }
-          if (data.__codexWebBridgeNotificationForwarded) {
-            return false;
+        }
+        if (data.body && typeof data.body === "object") {
+          return data.body;
+        }
+        return null;
+      };
+      const isFollowerHostResponseFetch = (data) => {
+        const body = ipcRequestBody(data);
+        if (!body || !FOLLOWER_HOST_RESPONSE_METHODS.has(body.method)) {
+          return false;
+        }
+        const targetClientId = typeof body.targetClientId === "string" ? body.targetClientId : "";
+        if (!targetClientId.includes("codex-web")) {
+          return false;
+        }
+        const params = body.params && typeof body.params === "object" ? body.params : null;
+        return Boolean(params && params.requestId != null);
+      };
+      const acknowledgeFollowerHostResponseFetch = (data) => {
+        if (!isFollowerHostResponseFetch(data) || typeof data.requestId !== "string") {
+          return;
+        }
+        window.dispatchEvent(
+          new MessageEvent("message", {
+            data: {
+              type: "fetch-response",
+              requestId: data.requestId,
+              responseType: "success",
+              status: 200,
+              headers: {},
+              bodyJsonString: JSON.stringify({
+                requestId: "",
+                result: { ok: true },
+                resultType: "success",
+                type: "response",
+              }),
+            },
+            origin: window.location.origin,
+            source: window,
+          }),
+        );
+      };
+      const mcpRequestMethod = (data) =>
+        data?.type === "mcp-request" && typeof data.request?.method === "string"
+          ? data.request.method
+          : null;
+      const mcpRequestId = (data) =>
+        data?.type === "mcp-request" && data.request?.id != null
+          ? String(data.request.id)
+          : null;
+      const mcpResponseId = (data) =>
+        data?.type === "mcp-response" && data.message?.id != null
+          ? String(data.message.id)
+          : null;
+      const hydrationConversationId = (data) => {
+        const params = data?.request?.params;
+        if (!params || typeof params !== "object") {
+          return null;
+        }
+        if (typeof params.conversationId === "string") {
+          return params.conversationId;
+        }
+        if (typeof params.threadId === "string") {
+          return params.threadId;
+        }
+        return null;
+      };
+      const hydrationKey = (hostId, requestId) => `${hostId || ""}:${requestId}`;
+      const markBridgeForwarded = (value) => {
+        if (!value || typeof value !== "object") {
+          return;
+        }
+        try {
+          Object.defineProperty(value, "__codexWebBridgeNotificationForwarded", {
+            configurable: true,
+            value: true,
+          });
+        } catch {
+          value.__codexWebBridgeNotificationForwarded = true;
+        }
+      };
+      const replayLatestThreadStreamSnapshot = (conversationId) => {
+        if (!conversationId) {
+          return;
+        }
+        window.setTimeout(() => {
+          const snapshots = window.__codexWebBridgeLatestThreadStreamSnapshots;
+          const snapshot = snapshots && snapshots[conversationId];
+          if (!snapshot) {
+            return;
           }
-          if (data.type === "mcp-notification" || data.type === "mcp-request") {
-            return true;
+          const message = serialize(snapshot)?.value;
+          if (!message) {
+            return;
           }
-          if (data.type === "mcp-response") {
-            return Boolean(data.message && typeof data.message.method === "string");
-          }
-          return (
-            data.type === "terminal-attached" ||
-            data.type === "terminal-data" ||
-            data.type === "terminal-error" ||
-            data.type === "terminal-exit" ||
-            data.type === "terminal-init-log" ||
-            data.type === "close-terminal-session" ||
-            data.type === "shared-object-updated" ||
-            data.type === "query-cache-invalidate" ||
-            data.type === "tray-menu-threads-changed"
+          markBridgeForwarded(message);
+          window.dispatchEvent(
+            new MessageEvent("message", {
+              data: message,
+              origin: window.location.origin,
+              source: window,
+            }),
           );
-        };
+        }, THREAD_HYDRATION_STREAM_REPLAY_DELAY_MS);
+      };
+      const trackThreadHydrationMessage = (data, channel) => {
+        if (channel === "codex-message-from-view" && THREAD_HYDRATION_METHODS.has(mcpRequestMethod(data))) {
+          const requestId = mcpRequestId(data);
+          const conversationId = hydrationConversationId(data);
+          if (requestId && conversationId) {
+            state.threadHydrationRequests[hydrationKey(data.hostId, requestId)] = {
+              conversationId,
+              ts: Date.now(),
+            };
+          }
+          return;
+        }
+        if (channel !== "message") {
+          return;
+        }
+        const responseId = mcpResponseId(data);
+        if (!responseId) {
+          return;
+        }
+        const key = hydrationKey(data.hostId, responseId);
+        const pending = state.threadHydrationRequests[key];
+        if (!pending) {
+          return;
+        }
+        delete state.threadHydrationRequests[key];
+        replayLatestThreadStreamSnapshot(pending.conversationId);
+      };
+      const queueOverLimit = () =>
+        state.messages.length > MAX_QUEUE_MESSAGES ||
+        (state.queuedBytes > MAX_QUEUE_BYTES && state.messages.length > 1);
+      const dropEntryAt = (index) => {
+        const entry = state.messages[index];
+        state.messages.splice(index, 1);
+        state.queuedBytes = Math.max(0, state.queuedBytes - notificationBytes(entry));
+        state.droppedCount += 1;
+      };
+      const trimQueue = () => {
+        const beforeDropped = state.droppedCount;
+        while (queueOverLimit()) {
+          const index = state.messages.findIndex(
+            (entry) => !isTurnStreamMessage(notificationMessage(entry)),
+          );
+          if (index < 0) {
+            break;
+          }
+          dropEntryAt(index);
+        }
+        while (queueOverLimit()) {
+          let index = state.messages.findIndex((entry) =>
+            isTurnStreamPatch(notificationMessage(entry)),
+          );
+          if (index < 0) {
+            index = state.messages.findIndex(
+              (entry) => !isTurnStreamSnapshot(notificationMessage(entry)),
+            );
+          }
+          if (index < 0) {
+            break;
+          }
+          dropEntryAt(index);
+        }
+        if (state.droppedCount !== beforeDropped) {
+          state.pendingGap = {
+            type: "codex-web-bridge-notification-gap",
+            droppedCount: state.droppedCount,
+            reason: "queue-overflow",
+            queued: state.messages.length,
+            queuedBytes: state.queuedBytes,
+            ts: Date.now(),
+          };
+        }
+      };
+      const queueBridgeNotification = (data, channel) => {
+        if (!shouldForward(data)) {
+          return;
+        }
+        const serialized = serialize(data);
+        if (serialized && serialized.value) {
+          const message = serialized.value;
+          message.__codexWebBridgeNotificationForwarded = true;
+          message.__codexWebBridgeNotificationSeq = state.nextSeq++;
+          message.__codexWebBridgeNotificationQueuedAt = Date.now();
+          message.__codexEventSource = "cdp-webview";
+          message.__codexEventChannel =
+            message.type === "ipc-broadcast" ? "ipc-broadcast" : channel;
+          message.__codexEventMethod =
+            message.type === "ipc-broadcast" ? message.method : message.type;
+          state.messages.push({ bytes: serialized.bytes, message });
+          state.queuedBytes += serialized.bytes;
+          trimQueue();
+          if (channel === "codex-message-from-view") {
+            acknowledgeFollowerHostResponseFetch(data);
+          }
+          trackThreadHydrationMessage(data, channel);
+        }
+      };
+      if (!state.installed) {
         window.addEventListener(
           "message",
-          (event) => {
-            const data = event && event.data;
-            if (!shouldForward(data)) {
-              return;
-            }
-            const message = clone(data);
-            if (message) {
-              message.__codexWebBridgeNotificationForwarded = true;
-              state.messages.push(message);
-            }
-          },
+          (event) => queueBridgeNotification(event && event.data, "message"),
+          true,
+        );
+        window.addEventListener(
+          "codex-message-from-view",
+          (event) => queueBridgeNotification(event && event.detail, "codex-message-from-view"),
           true,
         );
         state.installed = true;
@@ -1571,10 +2230,130 @@ pub(super) fn web_bridge_notification_poll_expression(limit: usize) -> String {
         return { messages: [] };
       }
       const limit = __CODEX_WEB_BRIDGE_NOTIFICATION_LIMIT__;
-      return { messages: state.messages.splice(0, limit) };
+      const maxBytes = __CODEX_WEB_BRIDGE_NOTIFICATION_MAX_BYTES__;
+      const messages = [];
+      let bytes = 0;
+      const notificationMessage = (entry) => entry && entry.message ? entry.message : entry;
+      const notificationBytes = (entry) => Number.isFinite(entry && entry.bytes) ? entry.bytes : 0;
+      if (state.pendingGap && messages.length < limit) {
+        messages.push(state.pendingGap);
+        state.pendingGap = null;
+      }
+      while (state.messages.length > 0 && messages.length < limit) {
+        const entry = state.messages[0];
+        const entryBytes = notificationBytes(entry);
+        if (messages.length > 0 && bytes + entryBytes > maxBytes) {
+          break;
+        }
+        state.messages.shift();
+        state.queuedBytes = Math.max(0, (state.queuedBytes || 0) - entryBytes);
+        messages.push(notificationMessage(entry));
+        bytes += entryBytes;
+      }
+      return {
+        messages,
+        queued: state.messages.length,
+        queuedBytes: state.queuedBytes || 0,
+        droppedCount: state.droppedCount || 0,
+        nextSeq: state.nextSeq || 0,
+      };
     })()"#
         .replace(
             "__CODEX_WEB_BRIDGE_NOTIFICATION_LIMIT__",
             &limit.max(1).to_string(),
         )
+        .replace(
+            "__CODEX_WEB_BRIDGE_NOTIFICATION_MAX_BYTES__",
+            &WEB_BRIDGE_NOTIFICATION_POLL_MAX_BYTES.to_string(),
+        )
+}
+
+pub(super) fn web_bridge_snapshot_request_expression(reason: &str, client_id: &str) -> String {
+    let reason = serde_json::to_string(reason).unwrap_or_else(|_| "\"remote-request\"".to_string());
+    let client_id =
+        serde_json::to_string(client_id).unwrap_or_else(|_| "\"codex-web-bridge\"".to_string());
+    r#"(async () => {
+      const reason = __CODEX_WEB_BRIDGE_SNAPSHOT_REASON__;
+      const clientId = __CODEX_WEB_BRIDGE_SNAPSHOT_CLIENT_ID__;
+      const messages = [];
+      const clone = (value) => {
+        if (value === undefined) {
+          return undefined;
+        }
+        return JSON.parse(JSON.stringify(value));
+      };
+      const markBridgeForwarded = (value) => {
+        if (!value || typeof value !== "object") {
+          return;
+        }
+        try {
+          Object.defineProperty(value, "__codexWebBridgeNotificationForwarded", {
+            configurable: true,
+            value: true,
+          });
+        } catch {
+          value.__codexWebBridgeNotificationForwarded = true;
+        }
+      };
+      const toIpcBroadcast = (detail) => {
+        if (
+          !detail ||
+          typeof detail !== "object" ||
+          detail.type !== "thread-stream-state-changed" ||
+          !detail.conversationId ||
+          !detail.hostId ||
+          !detail.change
+        ) {
+          return null;
+        }
+        return {
+          type: "ipc-broadcast",
+          method: "thread-stream-state-changed",
+          sourceClientId: clientId,
+          version: Number.isFinite(detail.version) ? detail.version : 6,
+          params: clone(detail),
+        };
+      };
+      const onMessageFromView = (event) => {
+        const broadcast = toIpcBroadcast(event?.detail);
+        if (broadcast) {
+          messages.push(broadcast);
+        }
+      };
+      window.addEventListener("codex-message-from-view", onMessageFromView, true);
+      try {
+        const status = {
+          type: "ipc-broadcast",
+          method: "client-status-changed",
+          sourceClientId: clientId,
+          version: 0,
+          params: {
+            clientId,
+            clientType: "web",
+            status: "connected",
+          },
+          reason,
+        };
+        markBridgeForwarded(status);
+        window.dispatchEvent(
+          new MessageEvent("message", {
+            data: status,
+            origin: window.location.origin,
+            source: window,
+          }),
+        );
+        await new Promise((resolve) => window.setTimeout(resolve, 100));
+      } finally {
+        window.removeEventListener("codex-message-from-view", onMessageFromView, true);
+      }
+      return {
+        messages,
+        snapshotRequest: {
+          reason,
+          snapshotCount: messages.length,
+        },
+      };
+    })()"#
+        .replace("__CODEX_WEB_BRIDGE_SNAPSHOT_REASON__", &reason)
+        .replace("__CODEX_WEB_BRIDGE_SNAPSHOT_CLIENT_ID__", &client_id)
 }

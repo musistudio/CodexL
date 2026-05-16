@@ -874,6 +874,7 @@ const emptyHandoffScanState: BotHandoffScanState = {
 
 const HANDOFF_TARGET_NONE_VALUE = "__codexl_handoff_target_none__";
 const BOT_CONFIG_CUSTOM_VALUE = "__codexl_bot_config_custom__";
+const WORKSPACE_PROVIDER_GATEWAY_VALUE = "__codexl_workspace_provider_gateway__";
 let initialAppUpdateCheckStarted = false;
 
 function App() {
@@ -1372,6 +1373,16 @@ function App() {
             }
           })
           .catch(console.error);
+      }
+      if (mode === "gateway") {
+        setForm((current) => ({
+          ...current,
+          providerName:
+            current.providerName.trim() ||
+            current.existingProfileName.trim() ||
+            current.workspaceName.trim() ||
+            "next-ai-gateway",
+        }));
       }
       setProviderMode(mode);
     },
@@ -3993,6 +4004,10 @@ function SettingsDialog({
                     onSelectProviderMode("none");
                     return;
                   }
+                  if (value === WORKSPACE_PROVIDER_GATEWAY_VALUE) {
+                    onSelectProviderMode("gateway");
+                    return;
+                  }
                   onSyncExistingProvider(value);
                 }}
               >
@@ -4002,6 +4017,9 @@ function SettingsDialog({
                 <SelectContent>
                   {canChangeProviderMode ? (
                     <SelectItem value={WORKSPACE_PROVIDER_NONE_VALUE}>{strings.none}</SelectItem>
+                  ) : null}
+                  {gatewayEnabled && canChangeProviderMode ? (
+                    <SelectItem value={WORKSPACE_PROVIDER_GATEWAY_VALUE}>{strings.nextAiGatewayProvider}</SelectItem>
                   ) : null}
                   {defaultProviders.map((profile) => (
                     <SelectItem key={profile.name} value={profile.name}>
@@ -4063,7 +4081,7 @@ function SettingsDialog({
                 ref={providerNameInputRef}
                 type="text"
                 placeholder="nextai"
-                disabled={dialogMode === "edit" && providerMode === "gateway"}
+                disabled={isEditingDefaultWorkspace}
                 value={form.providerName}
                 onChange={(event) =>
                   onSetForm((current) => ({ ...current, providerName: event.target.value }))
