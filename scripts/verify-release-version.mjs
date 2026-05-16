@@ -14,6 +14,7 @@ const versions = {
   "package.json": readPackageVersion("package.json"),
   "src-tauri/tauri.conf.json": readPackageVersion("src-tauri/tauri.conf.json"),
   "src-tauri/Cargo.toml": readCargoVersion("src-tauri/Cargo.toml"),
+  "src-tauri/Cargo.lock": readCargoLockPackageVersion("src-tauri/Cargo.lock", "codexl"),
 };
 
 const mismatches = Object.entries(versions).filter(([, version]) => version !== versionFromTag);
@@ -45,6 +46,16 @@ function readCargoVersion(path) {
   const match = content.match(/^\s*version\s*=\s*"([^"]+)"\s*$/m);
   if (!match) {
     fail(`${path} must contain a package version field.`);
+  }
+  return match[1].trim();
+}
+
+function readCargoLockPackageVersion(path, packageName) {
+  const content = readFileSync(resolve(repoRoot, path), "utf8");
+  const escapedName = packageName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = content.match(new RegExp(`\\[\\[package\\]\\]\\nname = "${escapedName}"\\nversion = "([^"]+)"`));
+  if (!match) {
+    fail(`${path} must contain package ${packageName}.`);
   }
   return match[1].trim();
 }

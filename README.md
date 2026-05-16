@@ -116,16 +116,10 @@ Write the generated public key to `plugins.updater.pubkey` in `src-tauri/tauri.c
 Release flow:
 
 ```sh
-# 1. Set the same version in all three files:
-#    package.json
-#    src-tauri/tauri.conf.json
-#    src-tauri/Cargo.toml
-
-git tag v1.0.0
-git push origin v1.0.0
+pnpm release v1.0.1
 ```
 
-CI rejects tags where the versions do not match. After a release is published, the in-app update checker reads:
+The release command updates the app versions, creates a release commit, creates an annotated tag, and pushes both the branch and tag to `origin`. Use `--dry-run` to preview the version changes, or `--no-push` to leave the commit and tag local. CI rejects tags where the versions do not match. After a release is published, the in-app update checker reads:
 
 ```text
 https://github.com/musistudio/codexl/releases/latest/download/latest.json

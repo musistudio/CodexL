@@ -1,7 +1,7 @@
 {
   "name": "codexl",
   "private": true,
-  "version": "1.0.1,
+  "version": "1.0.1",
   "author": "musistudio",
   "license": "AGPL-3.0-only",
   "packageManager": "pnpm@9.15.1",
@@ -12,6 +12,7 @@
     "build:pwa": "tsc --project remote/control-pwa/tsconfig.json && vite build --config remote/control-pwa/vite.config.ts",
     "package:builtin-plugins": "node scripts/package-builtin-plugins.mjs",
     "publish": "node scripts/publish-pwa.mjs",
+    "release": "node scripts/release.mjs",
     "reicon": "node scripts/reicon.mjs",
     "preview": "vite preview",
     "tauri": "tauri"

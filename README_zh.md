@@ -116,16 +116,10 @@ pnpm tauri signer generate --ci -w .secrets/codexl-updater.key
 发布流程：
 
 ```sh
-# 1. 把三个版本号改成同一个版本：
-#    package.json
-#    src-tauri/tauri.conf.json
-#    src-tauri/Cargo.toml
-
-git tag v1.0.0
-git push origin v1.0.0
+pnpm release v1.0.1
 ```
 
-CI 会拒绝版本号不一致的 tag。Release 发布成功后，应用内“检查更新”会读取：
+`release` 命令会统一更新 app 版本号，创建 release commit，创建 annotated tag，并把当前分支和 tag 推到 `origin`。可以用 `--dry-run` 预览版本改动，或用 `--no-push` 只在本地创建 commit 和 tag。CI 会拒绝版本号不一致的 tag。Release 发布成功后，应用内“检查更新”会读取：
 
 ```text
 https://github.com/musistudio/codexl/releases/latest/download/latest.json
