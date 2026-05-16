@@ -1,6 +1,6 @@
 [package]
 name = "codexl"
-version = "1.0.0"
+version = "1.0.1"
 description = "Codex Launcher - A Tauri App"
 authors = ["musistudio"]
 license = "AGPL-3.0-only"
