@@ -1388,6 +1388,10 @@ impl RemoteRuntimeState {
         *self.relay_bulk_tx.lock().await = None;
         *self.relay_frame_tx.lock().await = None;
         self.relay_control_clients.lock().await.clear();
+        self.relay_web_bridge_notification_pumps
+            .lock()
+            .await
+            .clear();
         self.relay_frame_client_count.store(0, Ordering::Relaxed);
         self.update_screencast_streaming().await;
     }
@@ -2817,6 +2821,47 @@ mod tests {
             device_uuid.as_deref(),
             Some("11111111-1111-4111-8111-111111111111")
         );
+    }
+
+    #[tokio::test]
+    async fn clear_relay_state_allows_web_bridge_notification_pumps_to_restart() {
+        let runtime = RemoteRuntimeState::new(RemoteServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 3147,
+            token: "remote-token".to_string(),
+            relay_url: Some("https://relay.example.com".to_string()),
+            relay_connection_id: Some("connection-1".to_string()),
+            crypto: None,
+            device_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            workspace_id: "workspace-1".to_string(),
+            workspace_name: "Workspace 1".to_string(),
+            workspace_path: "/tmp/workspace-1".to_string(),
+            cloud_auth: None,
+            cdp_host: "127.0.0.1".to_string(),
+            cdp_port: 9222,
+        });
+
+        runtime
+            .relay_web_bridge_notification_pumps
+            .lock()
+            .await
+            .insert("client-1".to_string());
+        runtime
+            .relay_control_clients
+            .lock()
+            .await
+            .insert("client-1".to_string());
+        runtime.relay_frame_client_count.store(1, Ordering::Relaxed);
+
+        runtime.clear_relay_state().await;
+
+        assert!(runtime
+            .relay_web_bridge_notification_pumps
+            .lock()
+            .await
+            .is_empty());
+        assert!(runtime.relay_control_clients.lock().await.is_empty());
+        assert_eq!(runtime.relay_frame_client_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
