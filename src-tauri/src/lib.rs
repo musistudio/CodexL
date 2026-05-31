@@ -5,6 +5,8 @@ mod config;
 mod extensions;
 mod gateway_usage;
 mod launcher;
+#[cfg(target_os = "macos")]
+mod macos_tray;
 mod platforms;
 mod ports;
 pub(crate) mod remote;
@@ -132,6 +134,7 @@ async fn list_codex_web_asset_versions(
 #[tauri::command]
 async fn launch_codex(
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     cdp_port: Option<u16>,
     codex_path: Option<String>,
     codex_home: Option<String>,
@@ -157,7 +160,7 @@ async fn launch_codex(
         );
     }
 
-    server::launch_codex_instance(
+    let info = server::launch_codex_instance(
         state.inner(),
         server::LaunchRequest {
             cdp_port,
@@ -166,15 +169,22 @@ async fn launch_codex(
             profile_name,
         },
     )
-    .await
+    .await?;
+    let config = state.config.lock().await.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(info)
 }
 
 #[tauri::command]
 async fn stop_codex(
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     profile_name: Option<String>,
 ) -> Result<(), String> {
-    server::stop_codex_instance(state.inner(), profile_name).await
+    server::stop_codex_instance(state.inner(), profile_name).await?;
+    let config = state.config.lock().await.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -186,6 +196,7 @@ async fn get_config(state: tauri::State<'_, AppState>) -> Result<AppConfig, Stri
 #[tauri::command]
 async fn update_config(
     mut new_config: AppConfig,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     new_config.normalize();
@@ -202,6 +213,7 @@ async fn update_config(
     gateway_service::sync_with_config(state.inner(), &gateway_config)
         .await
         .map(|_| ())?;
+    refresh_macos_tray_menu(&app, state.inner(), &gateway_config).await;
     Ok(())
 }
 
@@ -239,35 +251,46 @@ async fn start_remote_control(
     remote_password: Option<String>,
     use_cloud_relay: Option<bool>,
     require_e2ee: Option<bool>,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<remote::RemoteControlInfo, String> {
-    remote::start_remote_control(
+    let info = remote::start_remote_control(
         state.inner(),
         profile_name,
         remote_password,
         use_cloud_relay,
         require_e2ee,
     )
-    .await
+    .await?;
+    let config = state.config.lock().await.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(info)
 }
 
 #[tauri::command]
 async fn stop_remote_control(
     profile_name: String,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    remote::stop_remote_control(state.inner(), &profile_name).await
+    remote::stop_remote_control(state.inner(), &profile_name).await?;
+    let config = state.config.lock().await.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(())
 }
 
 #[tauri::command]
 async fn set_start_remote_on_launch(
     profile_name: String,
     enabled: bool,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
     config.set_start_remote_on_launch(&profile_name, enabled)?;
-    Ok(config.clone())
+    let config = config.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(config)
 }
 
 #[tauri::command]
@@ -276,6 +299,7 @@ async fn set_remote_launch_options(
     start_remote: bool,
     start_cloud: bool,
     remote_e2ee_password: Option<String>,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
@@ -285,7 +309,9 @@ async fn set_remote_launch_options(
         start_cloud,
         remote_e2ee_password,
     )?;
-    Ok(config.clone())
+    let config = config.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(config)
 }
 
 #[tauri::command]
@@ -365,6 +391,7 @@ fn get_default_providers() -> Result<Vec<DefaultProviderProfile>, String> {
 #[tauri::command]
 async fn add_existing_provider(
     provider: ExistingProviderRequest,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
     let profile_config_format = profile_config_format_for_state(state.inner()).await;
@@ -373,24 +400,30 @@ async fn add_existing_provider(
     let mut config = state.config.lock().await;
     config.add_provider_profile(profile);
     config.save()?;
-    Ok(config.clone())
+    let config = config.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(config)
 }
 
 #[tauri::command]
 async fn create_workspace(
     provider: WorkspaceRequest,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
     let profile = config::create_workspace_profile(provider)?;
     let mut config = state.config.lock().await;
     config.add_provider_profile(profile);
     config.save()?;
-    Ok(config.clone())
+    let config = config.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(config)
 }
 
 #[tauri::command]
 async fn create_provider(
     provider: NewProviderRequest,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
     let profile_config_format = profile_config_format_for_state(state.inner()).await;
@@ -402,12 +435,15 @@ async fn create_provider(
         config.add_provider_profile(profile);
     }
     config.save()?;
-    Ok(config.clone())
+    let config = config.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(config)
 }
 
 #[tauri::command]
 async fn create_next_ai_gateway_provider(
     provider: NextAiGatewayProviderRequest,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
     ensure_next_ai_gateway_enabled(state.inner()).await?;
@@ -418,13 +454,16 @@ async fn create_next_ai_gateway_provider(
     let mut config = state.config.lock().await;
     config.add_provider_profile(profile);
     config.save()?;
-    Ok(config.clone())
+    let config = config.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(config)
 }
 
 #[tauri::command]
 async fn delete_provider(
     name: String,
     remove_codex_home: bool,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
     remote::stop_remote_control(state.inner(), &name).await?;
@@ -446,12 +485,15 @@ async fn delete_provider(
     }
 
     let config = state.config.lock().await;
-    Ok(config.clone())
+    let config = config.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(config)
 }
 
 #[tauri::command]
 async fn update_provider(
     provider: UpdateProviderRequest,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
     let profile_config_format = profile_config_format_for_state(state.inner()).await;
@@ -494,7 +536,9 @@ async fn update_provider(
         }
         config.normalize();
         config.save()?;
-        return Ok(config.clone());
+        let config = config.clone();
+        refresh_macos_tray_menu(&app, state.inner(), &config).await;
+        return Ok(config);
     }
 
     let original_name = provider.original_name.clone();
@@ -503,12 +547,15 @@ async fn update_provider(
     let mut config = state.config.lock().await;
     config.update_provider_profile(&original_name, profile)?;
     config.save()?;
-    Ok(config.clone())
+    let config = config.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(config)
 }
 
 #[tauri::command]
 async fn update_workspace(
     provider: UpdateWorkspaceRequest,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
     let original_name = provider.original_name.clone();
@@ -516,12 +563,15 @@ async fn update_workspace(
     let mut config = state.config.lock().await;
     config.update_provider_profile(&original_name, profile)?;
     config.save()?;
-    Ok(config.clone())
+    let config = config.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(config)
 }
 
 #[tauri::command]
 async fn update_next_ai_gateway_provider(
     provider: UpdateNextAiGatewayProviderRequest,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
     ensure_next_ai_gateway_enabled(state.inner()).await?;
@@ -535,7 +585,9 @@ async fn update_next_ai_gateway_provider(
     let mut config = state.config.lock().await;
     config.update_provider_profile(&original_name, profile)?;
     config.save()?;
-    Ok(config.clone())
+    let config = config.clone();
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(config)
 }
 
 #[tauri::command]
@@ -794,6 +846,16 @@ fn is_terminal_bot_login_status(status: &str) -> bool {
     matches!(status, "confirmed" | "expired" | "already_bound" | "failed")
 }
 
+async fn refresh_macos_tray_menu(app: &tauri::AppHandle, state: &AppState, config: &AppConfig) {
+    #[cfg(target_os = "macos")]
+    if let Err(err) = macos_tray::refresh_menu(app, state, config).await {
+        eprintln!("Failed to refresh macOS tray menu: {}", err);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, state, config);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = AppState::new(AppConfig::load());
@@ -801,6 +863,7 @@ pub fn run() {
     let gateway_state = state.clone();
     let auto_launch_state = state.clone();
     let shutdown_state = state.clone();
+    let tray_state = state.clone();
     let shutdown_started_for_run = Arc::new(AtomicBool::new(false));
 
     let app = tauri::Builder::default()
@@ -808,7 +871,12 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state)
-        .setup(move |_app| {
+        .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            if let Err(err) = macos_tray::install(app, tray_state.clone()) {
+                eprintln!("Failed to install macOS tray menu: {}", err);
+            }
+
             tauri::async_runtime::spawn({
                 let server_state = server_state.clone();
                 async move {
@@ -832,6 +900,7 @@ pub fn run() {
 
             tauri::async_runtime::spawn({
                 let auto_launch_state = auto_launch_state.clone();
+                let auto_launch_app = app.handle().clone();
                 async move {
                     let (should_launch, profile_name, start_remote) = {
                         let config = auto_launch_state.config.lock().await;
@@ -877,8 +946,19 @@ pub fn run() {
                             .map(|_| ())
                         };
 
-                        if let Err(err) = result {
-                            eprintln!("Auto launch failed: {}", err);
+                        match result {
+                            Ok(()) => {
+                                let config = auto_launch_state.config.lock().await.clone();
+                                refresh_macos_tray_menu(
+                                    &auto_launch_app,
+                                    &auto_launch_state,
+                                    &config,
+                                )
+                                .await;
+                            }
+                            Err(err) => {
+                                eprintln!("Auto launch failed: {}", err);
+                            }
                         }
                     }
                 }

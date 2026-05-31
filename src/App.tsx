@@ -694,6 +694,14 @@ type GatewayUsageSummary = {
   requests: GatewayUsageRequestEvent[];
 };
 type GatewayUsageBreakdownMode = "model" | "session" | "project";
+type GatewayUsageViewMode = "overview" | "details";
+type GatewayUsageOverviewMode = "daily" | "weekly" | "cumulative";
+type GatewayUsageHeatmapTooltipState = {
+  placement: "above" | "below";
+  text: string;
+  x: number;
+  y: number;
+};
 type GatewayUsageDateRange = {
   startDate: string;
   endDate: string;
@@ -706,6 +714,7 @@ type GatewayProviderForm = {
   apiKey: string;
   baseUrl: string;
   models: string;
+  thinkingEffortModels: string[];
   raw: JsonObject;
 };
 type GatewayMcpServerTransport = "stdio" | "websocket";
@@ -948,6 +957,8 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     gatewayUsageCapture: t("gateway.usageCapture"),
     gatewayUsageCaptureDescription: t("gateway.usageCaptureDescription"),
     gatewayUsageDashboard: t("gateway.usageDashboard"),
+    gatewayUsageOverview: t("gateway.usageOverview"),
+    gatewayUsageDetails: t("gateway.usageDetails"),
     gatewayUsageDateRange: t("gateway.usageDateRange"),
     gatewayUsageEnterFullscreen: t("gateway.usageEnterFullscreen"),
     gatewayUsageExitFullscreen: t("gateway.usageExitFullscreen"),
@@ -985,6 +996,16 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     gatewayUsageInput: t("gateway.usageInput"),
     gatewayUsageOutput: t("gateway.usageOutput"),
     gatewayUsageRefresh: t("gateway.usageRefresh"),
+    gatewayUsageLifetimeTokens: t("gateway.usageLifetimeTokens"),
+    gatewayUsagePeakTokens: t("gateway.usagePeakTokens"),
+    gatewayUsageLongestTask: t("gateway.usageLongestTask"),
+    gatewayUsageCurrentStreak: t("gateway.usageCurrentStreak"),
+    gatewayUsageLongestStreak: t("gateway.usageLongestStreak"),
+    gatewayUsageTokenActivity: t("gateway.usageTokenActivity"),
+    gatewayUsageDailyMode: t("gateway.usageDailyMode"),
+    gatewayUsageWeeklyMode: t("gateway.usageWeeklyMode"),
+    gatewayUsageCumulativeMode: t("gateway.usageCumulativeMode"),
+    gatewayUsageDayUnit: t("gateway.usageDayUnit"),
     botSettingsDescription: t("bot.settingsDescription"),
     addBot: t("bot.addBot"),
     associatedWorkspace: t("bot.associatedWorkspace"),
@@ -1136,6 +1157,7 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     providers: t("gateway.providers"),
     providerType: t("gateway.providerType"),
     models: t("gateway.models"),
+    adaptThinkingEffort: t("gateway.adaptThinkingEffort"),
     addProvider: t("gateway.addProvider"),
     editProvider: t("gateway.editProvider"),
     providerDialogDescription: t("gateway.providerDialogDescription"),
@@ -2479,6 +2501,7 @@ function App() {
         <AppSettingsDialog
           appearance={appearance}
           language={language}
+          remoteCloudAuth={config.remote_cloud_auth ?? emptyRemoteCloudAuth()}
           extensions={normalizeExtensionSettings(config.extensions)}
           transcribeBaseUrl={config.remote_transcribe_base_url || config.remote_transcribe_api_url || ""}
           transcribeApiKey={config.remote_transcribe_api_key || ""}
@@ -3059,6 +3082,7 @@ function IconButton({ title, disabled = false, tooltip, className = "", children
 function AppSettingsDialog({
   appearance,
   language,
+  remoteCloudAuth,
   extensions,
   transcribeBaseUrl,
   transcribeApiKey,
@@ -3074,6 +3098,7 @@ function AppSettingsDialog({
 }: {
   appearance: Appearance;
   language: Language;
+  remoteCloudAuth: RemoteCloudAuthConfig;
   extensions: ExtensionSettings;
   transcribeBaseUrl: string;
   transcribeApiKey: string;
@@ -3113,6 +3138,10 @@ function AppSettingsDialog({
   const [extensionError, setExtensionError] = useState("");
   const [gatewayForm, setGatewayForm] = useState<GatewayConfigForm | null>(null);
   const [gatewayError, setGatewayError] = useState("");
+  const [usageViewMode, setUsageViewMode] = useState<GatewayUsageViewMode>("overview");
+  const [usageOverviewSummary, setUsageOverviewSummary] = useState<GatewayUsageSummary | null>(null);
+  const [usageOverviewLoading, setUsageOverviewLoading] = useState(false);
+  const [usageOverviewError, setUsageOverviewError] = useState("");
   const [usageSummary, setUsageSummary] = useState<GatewayUsageSummary | null>(null);
   const [usageLoading, setUsageLoading] = useState(false);
   const [usageError, setUsageError] = useState("");
@@ -3200,10 +3229,34 @@ function AppSettingsDialog({
   }, [activeSection, usageFullscreen]);
 
   useEffect(() => {
+    if (usageViewMode === "overview" && usageFullscreen) {
+      setUsageFullscreen(false);
+    }
+  }, [usageFullscreen, usageViewMode]);
+
+  useEffect(() => {
     if (activeSection === "bot" && !botEnabled) {
       setActiveSection("extensions");
     }
   }, [activeSection, botEnabled]);
+
+  const loadGatewayUsageOverview = useCallback(async () => {
+    setUsageOverviewLoading(true);
+    setUsageOverviewError("");
+    try {
+      const summary = await invoke<GatewayUsageSummary>("get_gateway_usage_summary", {
+        days: 365,
+        hours: undefined,
+        startDate: undefined,
+        endDate: undefined,
+      });
+      setUsageOverviewSummary(summary);
+    } catch (error) {
+      setUsageOverviewError(errorMessage(error));
+    } finally {
+      setUsageOverviewLoading(false);
+    }
+  }, []);
 
   const loadGatewayUsage = useCallback(async () => {
     setUsageLoading(true);
@@ -3224,10 +3277,16 @@ function AppSettingsDialog({
   }, [usageDateRange]);
 
   useEffect(() => {
-    if (activeSection === "usage" && gatewayUsageEnabled) {
+    if (activeSection === "usage" && gatewayUsageEnabled && usageViewMode === "overview") {
+      loadGatewayUsageOverview().catch(console.error);
+    }
+  }, [activeSection, gatewayUsageEnabled, loadGatewayUsageOverview, usageViewMode]);
+
+  useEffect(() => {
+    if (activeSection === "usage" && gatewayUsageEnabled && usageViewMode === "details") {
       loadGatewayUsage().catch(console.error);
     }
-  }, [activeSection, gatewayUsageEnabled, loadGatewayUsage]);
+  }, [activeSection, gatewayUsageEnabled, loadGatewayUsage, usageViewMode]);
 
   const showToast = (status: ToastState["status"], message: string) => {
     const id = Date.now();
@@ -3453,6 +3512,22 @@ function AppSettingsDialog({
                 <Plus className="h-4 w-4" />
                 {strings.addBot}
               </Button>
+            ) : activeSection === "usage" ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  setUsageViewMode((current) => (current === "overview" ? "details" : "overview"))
+                }
+              >
+                {usageViewMode === "overview" ? (
+                  <Activity className="h-4 w-4" />
+                ) : (
+                  <LayoutDashboard className="h-4 w-4" />
+                )}
+                {usageViewMode === "overview" ? strings.gatewayUsageDetails : strings.gatewayUsageOverview}
+              </Button>
             ) : null}
           </DialogHeader>
 
@@ -3611,20 +3686,32 @@ function AppSettingsDialog({
                 onChange={setGatewayForm}
               />
             ) : activeSection === "usage" ? (
-              <div className={cn("max-w-5xl", usageFullscreenActive && "max-w-none")}>
-                <GatewayUsageDashboard
-                  summary={usageSummary}
-                  loading={usageLoading}
-                  error={usageError || gatewayError}
-                  strings={strings}
-                  dateRange={usageDateRange}
-                  onDateRangeChange={setUsageDateRange}
-                  onPresetHours={(hours) => setUsageDateRange(gatewayUsageDateRangeForHours(hours))}
-                  onPresetRange={(days) => setUsageDateRange(gatewayUsageDateRangeForDays(days))}
-                  fullscreen={usageFullscreenActive}
-                  onToggleFullscreen={() => setUsageFullscreen((current) => !current)}
-                  onRefresh={() => loadGatewayUsage().catch(console.error)}
-                />
+              <div className={cn(usageViewMode === "overview" ? "max-w-none" : "max-w-5xl", usageFullscreenActive && "max-w-none")}>
+                {usageViewMode === "overview" ? (
+                  <GatewayUsageOverviewDashboard
+                    auth={remoteCloudAuth}
+                    summary={usageOverviewSummary}
+                    loading={usageOverviewLoading}
+                    error={usageOverviewError || gatewayError}
+                    strings={strings}
+                    language={language}
+                    onRefresh={() => loadGatewayUsageOverview().catch(console.error)}
+                  />
+                ) : (
+                  <GatewayUsageDashboard
+                    summary={usageSummary}
+                    loading={usageLoading}
+                    error={usageError || gatewayError}
+                    strings={strings}
+                    dateRange={usageDateRange}
+                    onDateRangeChange={setUsageDateRange}
+                    onPresetHours={(hours) => setUsageDateRange(gatewayUsageDateRangeForHours(hours))}
+                    onPresetRange={(days) => setUsageDateRange(gatewayUsageDateRangeForDays(days))}
+                    fullscreen={usageFullscreenActive}
+                    onToggleFullscreen={() => setUsageFullscreen((current) => !current)}
+                    onRefresh={() => loadGatewayUsage().catch(console.error)}
+                  />
+                )}
               </div>
             ) : (
               <AppUpdatePanel
@@ -4645,6 +4732,283 @@ function GatewaySettingsPanel({
   );
 }
 
+function GatewayUsageOverviewDashboard({
+  auth,
+  summary,
+  loading,
+  error,
+  strings,
+  language,
+  onRefresh,
+}: {
+  auth: RemoteCloudAuthConfig;
+  summary: GatewayUsageSummary | null;
+  loading: boolean;
+  error: string;
+  strings: AppStrings;
+  language: Language;
+  onRefresh: () => void;
+}) {
+  const [activityMode, setActivityMode] = useState<GatewayUsageOverviewMode>("daily");
+  const signedIn = hasRemoteCloudIdentity(auth);
+  const displayName = remoteCloudDisplayName(auth);
+  const avatarUrl = signedIn ? remoteCloudAvatarUrl(auth) : "";
+  const isPro = signedIn && Boolean(auth.is_pro);
+  const metrics = useMemo(() => gatewayUsageOverviewMetrics(summary), [summary]);
+  const hasUsage = metrics.lifetimeTokens > 0;
+
+  const metricItems = [
+    {
+      label: strings.gatewayUsageLifetimeTokens,
+      value: formatTokenCount(metrics.lifetimeTokens),
+    },
+    {
+      label: strings.gatewayUsagePeakTokens,
+      value: formatTokenCount(metrics.peakTokens),
+    },
+    {
+      label: strings.gatewayUsageLongestTask,
+      value: formatDurationCompact(metrics.longestTaskSeconds),
+    },
+    {
+      label: strings.gatewayUsageCurrentStreak,
+      value: formatUsageDays(metrics.currentStreakDays, strings),
+    },
+    {
+      label: strings.gatewayUsageLongestStreak,
+      value: formatUsageDays(metrics.longestStreakDays, strings),
+    },
+  ];
+
+  return (
+    <section
+      className={cn(
+        "mx-auto flex min-h-[min(760px,calc(100dvh-220px))] max-w-6xl flex-col items-center px-1 pb-8",
+        signedIn ? "pt-8 sm:pt-12" : "pt-2 sm:pt-4",
+      )}
+    >
+      {signedIn ? (
+        <div className="flex flex-col items-center text-center">
+          <GatewayUsageOverviewAvatar label={displayName} avatarUrl={avatarUrl} />
+          <div className="mt-6 flex max-w-full flex-wrap items-center justify-center gap-2">
+            <h2 className="max-w-[min(28rem,100%)] truncate text-3xl font-semibold tracking-normal text-foreground">
+              {displayName}
+            </h2>
+            {isPro ? (
+              <Badge className="account-pro-badge h-6 rounded-full px-2 text-xs font-medium">
+                {strings.pro}
+              </Badge>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {error ? (
+        <p className="mt-8 w-full max-w-4xl rounded-md border border-destructive/50 bg-destructive/12 px-3 py-2.5 text-sm leading-relaxed text-red-300">
+          {error}
+        </p>
+      ) : null}
+
+      <div
+        className={cn(
+          "grid w-full max-w-4xl overflow-hidden rounded-xl border border-border bg-muted/10 sm:grid-cols-5",
+          signedIn ? "mt-12" : "mt-2 sm:mt-4",
+        )}
+      >
+        {metricItems.map((item, index) => (
+          <div
+            key={item.label}
+            className={cn(
+              "min-w-0 px-4 py-4 text-center",
+              index > 0 && "border-t border-border sm:border-l sm:border-t-0",
+            )}
+          >
+            <div className="truncate text-lg font-semibold tabular-nums text-foreground">{item.value}</div>
+            <div className="mt-1 truncate text-sm text-muted-foreground">{item.label}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-12 w-full max-w-5xl">
+        <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+          <h3 className="text-base font-semibold text-foreground">{strings.gatewayUsageTokenActivity}</h3>
+          <div className="flex items-center gap-2">
+            <GatewayUsageOverviewModeTabs mode={activityMode} strings={strings} onModeChange={setActivityMode} />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8"
+              title={strings.gatewayUsageRefresh}
+              aria-label={strings.gatewayUsageRefresh}
+              onClick={onRefresh}
+              disabled={loading}
+            >
+              <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
+            </Button>
+          </div>
+        </div>
+        <GatewayUsageActivityHeatmap
+          summary={summary}
+          mode={activityMode}
+          language={language}
+        />
+        {!hasUsage && !loading ? (
+          <p className="mt-6 rounded-md border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
+            {strings.gatewayUsageNoData}
+          </p>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function GatewayUsageOverviewAvatar({ label, avatarUrl }: { label: string; avatarUrl: string }) {
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setFailed(false);
+  }, [avatarUrl]);
+
+  const fallback = (
+    <span className="flex h-28 w-28 items-center justify-center rounded-full bg-sky-600 text-3xl font-medium text-white shadow-sm">
+      {accountInitials(label)}
+    </span>
+  );
+
+  if (!avatarUrl || failed) {
+    return fallback;
+  }
+
+  return (
+    <img
+      src={avatarUrl}
+      alt=""
+      className="h-28 w-28 rounded-full object-cover shadow-sm"
+      referrerPolicy="no-referrer"
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
+function GatewayUsageOverviewModeTabs({
+  mode,
+  strings,
+  onModeChange,
+}: {
+  mode: GatewayUsageOverviewMode;
+  strings: AppStrings;
+  onModeChange: (mode: GatewayUsageOverviewMode) => void;
+}) {
+  const options: Array<{ value: GatewayUsageOverviewMode; label: string }> = [
+    { value: "daily", label: strings.gatewayUsageDailyMode },
+    { value: "weekly", label: strings.gatewayUsageWeeklyMode },
+    { value: "cumulative", label: strings.gatewayUsageCumulativeMode },
+  ];
+
+  return (
+    <div className="flex items-center gap-4">
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          className={cn(
+            "text-sm font-medium text-muted-foreground transition-colors hover:text-foreground",
+            mode === option.value && "text-foreground",
+          )}
+          onClick={() => onModeChange(option.value)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function GatewayUsageActivityHeatmap({
+  summary,
+  mode,
+  language,
+}: {
+  summary: GatewayUsageSummary | null;
+  mode: GatewayUsageOverviewMode;
+  language: Language;
+}) {
+  const [activeTooltip, setActiveTooltip] = useState<GatewayUsageHeatmapTooltipState | null>(null);
+  const heatmap = useMemo(
+    () => buildGatewayUsageHeatmap(summary, mode, language),
+    [language, mode, summary],
+  );
+  const showTooltip = useCallback((event: React.PointerEvent<HTMLDivElement>, text: string) => {
+    setActiveTooltip(positionGatewayUsageHeatmapTooltip(text, event.clientX, event.clientY));
+  }, []);
+
+  return (
+    <div className="w-full pb-1">
+      <div className="mx-auto w-full">
+        <div
+          className="grid grid-flow-col gap-[3px] sm:gap-1"
+          style={{
+            gridTemplateColumns: `repeat(${heatmap.weekCount}, minmax(0, 1fr))`,
+            gridTemplateRows: `repeat(${heatmap.rowCount}, minmax(0, 1fr))`,
+          }}
+        >
+          {heatmap.cells.map((cell) => (
+            <div
+              key={cell.key}
+              className={cn(
+                "group relative aspect-square w-full rounded-[2px] sm:rounded-[3px]",
+                !cell.inRange && "pointer-events-none opacity-0",
+              )}
+              aria-label={cell.tooltip}
+              onPointerEnter={(event) => showTooltip(event, cell.tooltip)}
+              onPointerMove={(event) => showTooltip(event, cell.tooltip)}
+              onPointerLeave={() => setActiveTooltip(null)}
+              onPointerCancel={() => setActiveTooltip(null)}
+              style={{
+                gridColumn: cell.weekIndex + 1,
+                gridRow: cell.dayIndex + 1,
+                backgroundColor: gatewayUsageHeatmapColor(cell.value, heatmap.maxValue),
+              }}
+            />
+          ))}
+        </div>
+        <div
+          className="mt-3 grid gap-[3px] text-sm text-muted-foreground sm:gap-1"
+          style={{ gridTemplateColumns: `repeat(${heatmap.weekCount}, minmax(0, 1fr))` }}
+        >
+          {heatmap.monthLabels.map((month) => (
+            <span
+              key={`${month.label}-${month.weekIndex}`}
+              className="truncate"
+              style={{ gridColumn: `${month.weekIndex + 1} / span 4` }}
+            >
+              {month.label}
+            </span>
+          ))}
+        </div>
+      </div>
+      {activeTooltip && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              className="pointer-events-none fixed z-[1000] w-max rounded-md border border-border bg-card px-2.5 py-1.5 text-center text-xs text-card-foreground shadow-xl"
+              style={{
+                left: activeTooltip.x,
+                maxWidth: "min(16rem, calc(100vw - 16px))",
+                top: activeTooltip.y,
+                transform:
+                  activeTooltip.placement === "above" ? "translate(-50%, -100%)" : "translateX(-50%)",
+              }}
+            >
+              {activeTooltip.text}
+            </div>,
+            document.body,
+          )
+        : null}
+    </div>
+  );
+}
+
 function GatewayUsageDashboard({
   summary,
   loading,
@@ -5240,6 +5604,23 @@ function GatewayProviderEditor({
   strings: AppStrings;
   onChange: (patch: Partial<GatewayProviderForm>) => void;
 }) {
+  const deepSeekV4Models = deepSeekV4ModelsFromProvider(provider);
+  const selectedThinkingEffortModels = normalizeThinkingEffortModels(
+    provider.thinkingEffortModels,
+    provider.models,
+  );
+  const updateThinkingEffortModel = (model: string, enabled: boolean) => {
+    const selected = new Set(selectedThinkingEffortModels);
+    if (enabled) {
+      selected.add(model);
+    } else {
+      selected.delete(model);
+    }
+    onChange({
+      thinkingEffortModels: Array.from(selected).filter((item) => deepSeekV4Models.includes(item)),
+      ...(enabled ? { type: "openai_chat_completions" } : {}),
+    });
+  };
   return (
     <div className="grid gap-4">
       <div className="grid gap-3 sm:grid-cols-2">
@@ -5278,9 +5659,32 @@ function GatewayProviderEditor({
         <Input
           value={provider.models}
           placeholder="gpt-5.5, gpt-5.4"
-          onChange={(event) => onChange({ models: event.target.value })}
+          onChange={(event) => {
+            const models = event.target.value;
+            onChange({
+              models,
+              thinkingEffortModels: normalizeThinkingEffortModels(provider.thinkingEffortModels, models),
+            });
+          }}
         />
       </Field>
+      {deepSeekV4Models.length > 0 ? (
+        <div className="rounded-md border border-border bg-muted/10 px-3 py-2.5">
+          <div className="text-sm font-medium">{strings.adaptThinkingEffort}</div>
+          <div className="mt-2 grid gap-2">
+            {deepSeekV4Models.map((model) => (
+              <div key={model} className="flex items-center justify-between gap-3">
+                <div className="min-w-0 break-words text-sm text-foreground">{model}</div>
+                <Switch
+                  checked={selectedThinkingEffortModels.includes(model)}
+                  aria-label={`${strings.adaptThinkingEffort}: ${model}`}
+                  onCheckedChange={(checked) => updateThinkingEffortModel(model, checked === true)}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -8365,12 +8769,13 @@ function extensionDescription(extension: BuiltinExtensionStatus, strings: AppStr
 function gatewayFormFromConfig(file: GatewayConfigFile): GatewayConfigForm {
   const config = file.config || {};
   const agent = objectValue(config.agent);
+  const providerPlugins = arrayValue(config.providerPlugins).map(objectValue);
   return {
     host: stringValue(config.host, "127.0.0.1"),
     port: numberString(config.port, "14589"),
     usageCaptureEnabled: gatewayUsageCaptureEnabledFromConfig(config),
     providers: arrayValue(config.Providers ?? config.providers).map((item) =>
-      gatewayProviderFormFromRaw(objectValue(item)),
+      gatewayProviderFormFromRaw(objectValue(item), providerPlugins),
     ),
     mcpServers: arrayValue(agent.mcpServers).map((item) =>
       gatewayMcpServerFormFromRaw(objectValue(item)),
@@ -8442,14 +8847,19 @@ function gatewayModelName(item: unknown): string {
   return stringValue(model.name ?? model.id ?? model.model, "").trim();
 }
 
-function gatewayProviderFormFromRaw(raw: JsonObject): GatewayProviderForm {
+const CODEXL_DEEPSEEK_THINKING_PLUGIN_KEY_PREFIX = "codexl-deepseek-thinking";
+
+function gatewayProviderFormFromRaw(raw: JsonObject, providerPlugins: JsonObject[] = []): GatewayProviderForm {
+  const name = stringValue(raw.name, "");
+  const models = gatewayProviderModels(raw).join(", ");
   return {
     id: newLocalId(),
-    name: stringValue(raw.name, ""),
+    name,
     type: stringValue(raw.type ?? raw.provider, "openai_responses"),
     apiKey: stringValue(raw.apikey ?? raw.apiKey, ""),
     baseUrl: stringValue(raw.baseurl ?? raw.baseUrl, ""),
-    models: gatewayProviderModels(raw).join(", "),
+    models,
+    thinkingEffortModels: gatewayProviderDeepSeekThinkingModels(name, models, providerPlugins),
     raw,
   };
 }
@@ -8462,6 +8872,7 @@ function createGatewayProviderForm(): GatewayProviderForm {
     apiKey: "",
     baseUrl: "https://api.openai.com/v1",
     models: "",
+    thinkingEffortModels: [],
     raw: {},
   };
 }
@@ -8484,6 +8895,12 @@ function gatewayConfigFromForm(form: GatewayConfigForm): JsonObject {
   codexlUsageCapture.enabled = form.usageCaptureEnabled;
   config.codexlUsageCapture = codexlUsageCapture;
   config.Providers = form.providers.map(gatewayProviderConfigFromForm);
+  const providerPlugins = gatewayProviderPluginsFromForm(form);
+  if (providerPlugins.length > 0) {
+    config.providerPlugins = providerPlugins;
+  } else {
+    delete config.providerPlugins;
+  }
   const agent = objectValue(config.agent);
   const storage = objectValue(agent.storage);
   agent.storage = Object.keys(storage).length > 0 ? storage : { type: "filesystem" };
@@ -8505,6 +8922,160 @@ function gatewayProviderConfigFromForm(provider: GatewayProviderForm): JsonObjec
   delete raw.baseUrl;
   delete raw.provider;
   return raw;
+}
+
+function gatewayProviderPluginsFromForm(form: GatewayConfigForm): JsonObject[] {
+  const providerNames = new Set(
+    form.providers.map((provider) => provider.name.trim()).filter(Boolean),
+  );
+  const existingPlugins = arrayValue(form.rawConfig.providerPlugins)
+    .map(objectValue)
+    .filter((plugin) => {
+      if (isCodexLDeepSeekThinkingPlugin(plugin)) {
+        return false;
+      }
+      const providerName = stringValue(plugin.providerName, "").trim();
+      return !(
+        providerName &&
+        providerNames.has(providerName) &&
+        providerPluginHasDeepSeekThinking(plugin)
+      );
+    });
+  const generatedPlugins = form.providers
+    .filter((provider) => gatewayProviderUsesDeepSeekThinking(provider))
+    .map(gatewayDeepSeekThinkingPluginFromProvider);
+  return [...existingPlugins, ...generatedPlugins];
+}
+
+function gatewayDeepSeekThinkingPluginFromProvider(provider: GatewayProviderForm): JsonObject {
+  const providerName = provider.name.trim();
+  const models = normalizeThinkingEffortModels(provider.thinkingEffortModels, provider.models);
+  return {
+    key: `${CODEXL_DEEPSEEK_THINKING_PLUGIN_KEY_PREFIX}-${slugForGatewayPluginKey(providerName || provider.id)}`,
+    enabled: true,
+    providerName,
+    deepseekThinking: {
+      enabled: true,
+      models,
+    },
+  };
+}
+
+function gatewayProviderUsesDeepSeekThinking(provider: GatewayProviderForm): boolean {
+  return (
+    provider.type === "openai_chat_completions" &&
+    normalizeThinkingEffortModels(provider.thinkingEffortModels, provider.models).length > 0 &&
+    provider.name.trim().length > 0
+  );
+}
+
+function deepSeekV4ModelsFromProvider(provider: GatewayProviderForm): string[] {
+  return deepSeekV4ModelsFromText(provider.models);
+}
+
+function deepSeekV4ModelsFromText(models: string): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const model of commaList(models)) {
+    const normalized = normalizeGatewayModelName(model);
+    const key = gatewayModelComparisonKey(normalized);
+    if (!isDeepSeekV4Model(normalized) || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function normalizeThinkingEffortModels(selectedModels: string[], models: string): string[] {
+  const availableModels = deepSeekV4ModelsFromText(models);
+  const selected = new Set(selectedModels.map(gatewayModelComparisonKey).filter(Boolean));
+  return availableModels.filter((model) => selected.has(gatewayModelComparisonKey(model)));
+}
+
+function normalizeGatewayModelName(model: string): string {
+  return model.trim().replace(/^\/+/, "");
+}
+
+function isDeepSeekV4Model(model: string): boolean {
+  const modelName = normalizeGatewayModelName(model).split("/").pop()?.toLowerCase() || "";
+  return modelName.startsWith("deepseek-v4-");
+}
+
+function gatewayModelComparisonKey(model: string): string {
+  const normalized = normalizeGatewayModelName(model).toLowerCase();
+  return normalized.split("/").pop() || normalized;
+}
+
+function gatewayProviderDeepSeekThinkingModels(
+  providerName: string,
+  models: string,
+  providerPlugins: JsonObject[],
+): string[] {
+  const name = providerName.trim();
+  if (!name) {
+    return [];
+  }
+  const availableModels = deepSeekV4ModelsFromText(models);
+  if (availableModels.length === 0) {
+    return [];
+  }
+  for (const plugin of providerPlugins) {
+    if (booleanValue(plugin.enabled, true) === false) {
+      continue;
+    }
+    if (stringValue(plugin.providerName, "").trim() !== name) {
+      continue;
+    }
+    if (!providerPluginHasDeepSeekThinking(plugin)) {
+      continue;
+    }
+    const pluginModels = providerPluginDeepSeekThinkingModels(plugin);
+    if (pluginModels === undefined) {
+      return availableModels;
+    }
+    const selected = new Set(pluginModels.map(gatewayModelComparisonKey).filter(Boolean));
+    return availableModels.filter((model) => selected.has(gatewayModelComparisonKey(model)));
+  }
+  return [];
+}
+
+function providerPluginDeepSeekThinkingModels(plugin: JsonObject): string[] | undefined {
+  const raw = plugin.deepseekThinking ?? plugin.deepSeekThinking;
+  if (raw === true) {
+    return undefined;
+  }
+  const deepseekThinking = objectValue(raw);
+  const hasModels = Object.prototype.hasOwnProperty.call(deepseekThinking, "models");
+  const hasModel = Object.prototype.hasOwnProperty.call(deepseekThinking, "model");
+  if (!hasModels && !hasModel) {
+    return undefined;
+  }
+  return stringListFromUnknown(deepseekThinking.models ?? deepseekThinking.model);
+}
+
+function providerPluginHasDeepSeekThinking(plugin: JsonObject): boolean {
+  const raw = plugin.deepseekThinking ?? plugin.deepSeekThinking;
+  if (raw === true) {
+    return true;
+  }
+  const deepseekThinking = objectValue(raw);
+  return Object.keys(deepseekThinking).length > 0 && booleanValue(deepseekThinking.enabled, true);
+}
+
+function isCodexLDeepSeekThinkingPlugin(plugin: JsonObject): boolean {
+  return stringValue(plugin.key, "").startsWith(CODEXL_DEEPSEEK_THINKING_PLUGIN_KEY_PREFIX);
+}
+
+function slugForGatewayPluginKey(value: string): string {
+  return (
+    value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "provider"
+  );
 }
 
 function gatewayMcpServerFormFromRaw(raw: JsonObject): GatewayMcpServerForm {
@@ -8863,6 +9434,14 @@ function numberString(value: unknown, fallback: string): string {
   return typeof value === "number" && Number.isFinite(value) ? String(value) : fallback;
 }
 
+function numberValue(value: unknown, fallback: number): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  const parsed = Number.parseFloat(String(value ?? ""));
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 function integerValue(value: unknown, fallback: number): number {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Math.trunc(value);
@@ -8997,6 +9576,335 @@ function errorMessage(error: unknown) {
     return error.message;
   }
   return String(error);
+}
+
+function gatewayUsageOverviewMetrics(summary: GatewayUsageSummary | null) {
+  const days = gatewayUsageDailyRange(summary);
+  const lifetimeTokens = gatewayUsageTotalTokens(summary?.totals);
+  const peakTokens = Math.max(0, ...days.map((item) => item.totalTokens));
+  const longestTaskSeconds = Math.max(
+    0,
+    ...(summary?.bySession ?? []).map((session) => {
+      if (!session.firstReceivedAtUnix || !session.lastReceivedAtUnix) {
+        return 0;
+      }
+      return Math.max(0, session.lastReceivedAtUnix - session.firstReceivedAtUnix);
+    }),
+  );
+  let currentStreakDays = 0;
+  for (let index = days.length - 1; index >= 0; index -= 1) {
+    if (days[index].totalTokens <= 0) {
+      break;
+    }
+    currentStreakDays += 1;
+  }
+
+  let longestStreakDays = 0;
+  let activeStreakDays = 0;
+  for (const day of days) {
+    if (day.totalTokens > 0) {
+      activeStreakDays += 1;
+      longestStreakDays = Math.max(longestStreakDays, activeStreakDays);
+    } else {
+      activeStreakDays = 0;
+    }
+  }
+
+  return {
+    lifetimeTokens,
+    peakTokens,
+    longestTaskSeconds,
+    currentStreakDays,
+    longestStreakDays,
+  };
+}
+
+function gatewayUsageDailyRange(summary: GatewayUsageSummary | null) {
+  const fallbackEnd = new Date();
+  const endDate = parseDateOnly(summary?.endDate) ?? fallbackEnd;
+  const parsedStartDate = parseDateOnly(summary?.startDate);
+  const startDate =
+    parsedStartDate && localDateDayNumber(parsedStartDate) <= localDateDayNumber(endDate)
+      ? parsedStartDate
+      : addCalendarDays(endDate, -364);
+  const totalsByDay = new Map(
+    (summary?.daily ?? []).map((item) => [item.day, gatewayUsageTotalTokens(item)]),
+  );
+  const lifetimeTokens = gatewayUsageTotalTokens(summary?.totals);
+  if (lifetimeTokens > 0 && !Array.from(totalsByDay.values()).some((value) => value > 0)) {
+    const lastReceivedAtUnix = gatewayUsageLastReceivedAtUnix(summary?.totals);
+    if (lastReceivedAtUnix > 0) {
+      totalsByDay.set(dateInputValue(new Date(lastReceivedAtUnix * 1000)), lifetimeTokens);
+    }
+  }
+  const days = [];
+  const spanDays = Math.max(0, daysBetweenDates(startDate, endDate));
+  for (let offset = 0; offset <= spanDays; offset += 1) {
+    const date = addCalendarDays(startDate, offset);
+    const key = dateInputValue(date);
+    days.push({
+      date,
+      key,
+      totalTokens: totalsByDay.get(key) ?? 0,
+    });
+  }
+  return days;
+}
+
+function buildGatewayUsageHeatmap(
+  summary: GatewayUsageSummary | null,
+  mode: GatewayUsageOverviewMode,
+  language: Language,
+) {
+  const rangeDays = gatewayUsageDailyRange(summary);
+  const rangeStart = rangeDays[0]?.date ?? addCalendarDays(new Date(), -364);
+  const rangeEnd = rangeDays[rangeDays.length - 1]?.date ?? new Date();
+  const gridStart = startOfUsageWeek(rangeStart);
+  const gridEnd = endOfUsageWeek(rangeEnd);
+  const weekCount = Math.max(1, Math.floor(daysBetweenDates(gridStart, gridEnd) / 7) + 1);
+  const rangeStartDay = localDateDayNumber(rangeStart);
+  const rangeEndDay = localDateDayNumber(rangeEnd);
+  const dailyByDate = new Map(rangeDays.map((day) => [day.key, day.totalTokens]));
+  const weeklyTotals = new Map<number, number>();
+  const weeklyRanges = new Map<number, { startDate: Date; endDate: Date }>();
+  const cumulativeByDate = new Map<string, number>();
+  let cumulativeTokens = 0;
+
+  for (const day of rangeDays) {
+    const weekIndex = Math.floor(daysBetweenDates(gridStart, day.date) / 7);
+    weeklyTotals.set(weekIndex, (weeklyTotals.get(weekIndex) ?? 0) + day.totalTokens);
+    const range = weeklyRanges.get(weekIndex);
+    if (range) {
+      range.endDate = day.date;
+    } else {
+      weeklyRanges.set(weekIndex, { startDate: day.date, endDate: day.date });
+    }
+    cumulativeTokens += day.totalTokens;
+    if (day.totalTokens > 0) {
+      cumulativeByDate.set(day.key, cumulativeTokens);
+    }
+  }
+
+  const cells = [];
+  if (mode === "weekly") {
+    for (let weekIndex = 0; weekIndex < weekCount; weekIndex += 1) {
+      const range = weeklyRanges.get(weekIndex);
+      const date = range?.endDate ?? addCalendarDays(gridStart, weekIndex * 7 + 6);
+      const key = `week-${weekIndex}`;
+      const value = weeklyTotals.get(weekIndex) ?? 0;
+      cells.push({
+        key,
+        date,
+        inRange: Boolean(range),
+        weekIndex,
+        dayIndex: 0,
+        value,
+        tooltip: gatewayUsageWeeklyHeatmapTooltip(range?.startDate ?? date, date, value, language),
+      });
+    }
+
+    return {
+      cells,
+      maxValue: Math.max(0, ...cells.filter((cell) => cell.inRange).map((cell) => cell.value)),
+      rowCount: 1,
+      weekCount,
+      monthLabels: gatewayUsageHeatmapMonthLabels(rangeStart, rangeEnd, gridStart, language),
+    };
+  }
+
+  const gridSpanDays = Math.max(0, daysBetweenDates(gridStart, gridEnd));
+  for (let offset = 0; offset <= gridSpanDays; offset += 1) {
+    const date = addCalendarDays(gridStart, offset);
+    const key = dateInputValue(date);
+    const dateDay = localDateDayNumber(date);
+    const inRange = dateDay >= rangeStartDay && dateDay <= rangeEndDay;
+    const weekIndex = Math.floor(offset / 7);
+    const dayIndex = date.getDay();
+    const dailyTokens = inRange ? dailyByDate.get(key) ?? 0 : 0;
+    const value =
+      mode === "cumulative"
+        ? inRange && dailyTokens > 0
+          ? cumulativeByDate.get(key) ?? 0
+          : 0
+        : dailyTokens;
+    cells.push({
+      key,
+      date,
+      inRange,
+      weekIndex,
+      dayIndex,
+      value,
+      tooltip: gatewayUsageHeatmapTooltip(date, value, language),
+    });
+  }
+
+  const maxValue = Math.max(0, ...cells.filter((cell) => cell.inRange).map((cell) => cell.value));
+
+  return {
+    cells,
+    maxValue,
+    rowCount: 7,
+    weekCount,
+    monthLabels: gatewayUsageHeatmapMonthLabels(rangeStart, rangeEnd, gridStart, language),
+  };
+}
+
+function gatewayUsageHeatmapTooltip(
+  date: Date,
+  value: number,
+  language: Language,
+) {
+  return `${formatTokenCount(value)} tokens on ${formatUsageHeatmapDate(date, language)}`;
+}
+
+function gatewayUsageWeeklyHeatmapTooltip(
+  startDate: Date,
+  endDate: Date,
+  value: number,
+  language: Language,
+) {
+  const startLabel = formatUsageHeatmapDate(startDate, language);
+  const endLabel = formatUsageHeatmapDate(endDate, language);
+  const dateLabel = startLabel === endLabel ? endLabel : `${startLabel} - ${endLabel}`;
+  return `${formatTokenCount(value)} tokens on ${dateLabel}`;
+}
+
+function positionGatewayUsageHeatmapTooltip(
+  text: string,
+  clientX: number,
+  clientY: number,
+): GatewayUsageHeatmapTooltipState {
+  const margin = 8;
+  const offset = 12;
+  const maxTooltipWidth = 256;
+  const estimatedTooltipHeight = 34;
+  const viewportWidth = typeof window === "undefined" ? maxTooltipWidth + margin * 2 : window.innerWidth;
+  const viewportHeight = typeof window === "undefined" ? 800 : window.innerHeight;
+  const tooltipWidth = Math.min(maxTooltipWidth, Math.max(0, viewportWidth - margin * 2));
+  const halfTooltipWidth = tooltipWidth / 2;
+  const minX = margin + halfTooltipWidth;
+  const maxX = Math.max(minX, viewportWidth - margin - halfTooltipWidth);
+  const x = Math.min(Math.max(clientX, minX), maxX);
+  const hasRoomAbove = clientY - offset - estimatedTooltipHeight >= margin;
+  const hasRoomBelow = clientY + offset + estimatedTooltipHeight <= viewportHeight - margin;
+  const placement = hasRoomAbove || !hasRoomBelow ? "above" : "below";
+  const rawY = placement === "above" ? clientY - offset : clientY + offset;
+  const y = placement === "above" ? Math.max(margin, rawY) : Math.min(viewportHeight - margin, rawY);
+
+  return { placement, text, x, y };
+}
+
+function gatewayUsageHeatmapMonthLabels(startDate: Date, endDate: Date, gridStart: Date, language: Language) {
+  const labels: Array<{ label: string; weekIndex: number }> = [];
+  const pushLabel = (date: Date) => {
+    const weekIndex = Math.floor(daysBetweenDates(gridStart, date) / 7);
+    const label = new Intl.DateTimeFormat(language === "zh" ? "zh-CN" : "en-US", {
+      month: "short",
+    }).format(date);
+    if (labels[labels.length - 1]?.label !== label) {
+      labels.push({ label, weekIndex });
+    }
+  };
+
+  pushLabel(startDate);
+  for (
+    let cursor = new Date(startDate.getFullYear(), startDate.getMonth() + 1, 1);
+    localDateDayNumber(cursor) <= localDateDayNumber(endDate);
+    cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1)
+  ) {
+    pushLabel(cursor);
+  }
+  return labels;
+}
+
+function gatewayUsageHeatmapColor(value: number, maxValue: number) {
+  if (!Number.isFinite(value) || value <= 0 || maxValue <= 0) {
+    return "color-mix(in oklch, var(--app-muted) 48%, transparent)";
+  }
+
+  const ratio = value / maxValue;
+  if (ratio >= 0.76) return "oklch(0.74 0.15 248)";
+  if (ratio >= 0.48) return "oklch(0.62 0.12 248)";
+  if (ratio >= 0.24) return "oklch(0.5 0.09 248)";
+  return "oklch(0.38 0.06 248)";
+}
+
+function gatewayUsageTotalTokens(value: unknown) {
+  const record = objectValue(value);
+  return Math.max(0, numberValue(record.totalTokens ?? record.total_tokens, 0));
+}
+
+function gatewayUsageLastReceivedAtUnix(value: unknown) {
+  const record = objectValue(value);
+  return Math.max(0, numberValue(record.lastReceivedAtUnix ?? record.last_received_at_unix, 0));
+}
+
+function parseDateOnly(value: string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+  if (!match) {
+    return null;
+  }
+  const year = Number.parseInt(match[1], 10);
+  const month = Number.parseInt(match[2], 10);
+  const day = Number.parseInt(match[3], 10);
+  const date = new Date(year, month - 1, day);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+function addCalendarDays(date: Date, days: number) {
+  const next = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function startOfUsageWeek(date: Date) {
+  return addCalendarDays(date, -date.getDay());
+}
+
+function endOfUsageWeek(date: Date) {
+  return addCalendarDays(date, 6 - date.getDay());
+}
+
+function localDateDayNumber(date: Date) {
+  return Math.floor(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86_400_000);
+}
+
+function daysBetweenDates(start: Date, end: Date) {
+  return localDateDayNumber(end) - localDateDayNumber(start);
+}
+
+function formatUsageHeatmapDate(date: Date, language: Language) {
+  return new Intl.DateTimeFormat(language === "zh" ? "zh-CN" : "en-US", {
+    month: "short",
+    day: "numeric",
+  }).format(date);
+}
+
+function formatUsageDays(value: number, strings: AppStrings) {
+  return `${formatCompactNumber(Math.max(0, value))} ${strings.gatewayUsageDayUnit}`;
+}
+
+function formatDurationCompact(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return "-";
+  }
+  const totalSeconds = Math.max(0, Math.round(seconds));
+  const days = Math.floor(totalSeconds / 86_400);
+  const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  if (days > 0) {
+    return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  }
+  if (hours > 0) {
+    return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m`;
+  }
+  return `${totalSeconds}s`;
 }
 
 function formatCompactNumber(value: number) {

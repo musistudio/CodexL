@@ -179,27 +179,80 @@ function buildNextAiGateway(pluginDir) {
 function patchNextAiGatewayBundle(outputFile) {
   let content = readFileSync(outputFile, "utf8");
   const enabledPatchedMarker = `if(!Xe(r))continue;if(ko(r.enabled)===!1)continue;let s=r,i=zwt(s.transport)||"stdio"`;
-  if (!content.includes(enabledPatchedMarker)) {
+  const enabledPatchedMarkerNew = `if(!Xe(r))continue;let s=r;if(Vi(s.enabled)===!1)continue;let i=evt(s.transport)||"stdio"`;
+  if (!content.includes(enabledPatchedMarker) && !content.includes(enabledPatchedMarkerNew)) {
     const marker = `if(!Xe(r))continue;let s=r,i=zwt(s.transport)||"stdio"`;
-    if (!content.includes(marker)) {
+    const markerNew = `if(!Xe(r))continue;let s=r,i=evt(s.transport)||"stdio"`;
+    if (content.includes(marker)) {
+      content = content.replace(marker, enabledPatchedMarker);
+    } else if (content.includes(markerNew)) {
+      content = content.replace(markerNew, enabledPatchedMarkerNew);
+    } else {
       throw new Error(`NeXT AI Gateway MCP server parser has an unexpected shape: ${outputFile}`);
     }
-    content = content.replace(marker, enabledPatchedMarker);
   }
 
   const stdioModePatchedMarker = `Hwt(s.stdioMessageMode)||"newline-json"`;
-  if (!content.includes(stdioModePatchedMarker)) {
+  const stdioModePatchedMarkerNew = `tvt(s.stdioMessageMode)||"newline-json"`;
+  if (!content.includes(stdioModePatchedMarker) && !content.includes(stdioModePatchedMarkerNew)) {
     const marker = `Hwt(s.stdioMessageMode)||"content-length"`;
-    if (!content.includes(marker)) {
+    const markerNew = `tvt(s.stdioMessageMode)||"content-length"`;
+    if (content.includes(marker)) {
+      content = content.replace(marker, stdioModePatchedMarker);
+    } else if (content.includes(markerNew)) {
+      content = content.replace(markerNew, stdioModePatchedMarkerNew);
+    } else {
       throw new Error(`NeXT AI Gateway stdio message mode parser has an unexpected shape: ${outputFile}`);
     }
-    content = content.replace(marker, stdioModePatchedMarker);
   }
 
-  if (!content.includes(enabledPatchedMarker) || !content.includes(stdioModePatchedMarker)) {
+  if (
+    !(content.includes(enabledPatchedMarker) || content.includes(enabledPatchedMarkerNew)) ||
+    !(content.includes(stdioModePatchedMarker) || content.includes(stdioModePatchedMarkerNew))
+  ) {
     throw new Error(`NeXT AI Gateway MCP server parser has an unexpected shape: ${outputFile}`);
   }
+  content = patchNextAiGatewayDeepSeekThinking(content, outputFile);
   writeFileSync(outputFile, content);
+}
+
+function patchNextAiGatewayDeepSeekThinking(content, outputFile) {
+  if (!content.includes("__codexlDeepSeekThinkingModels")) {
+    const marker = `function dvt(t){if(t===!0)return{enabled:!0};if(!(!Xe(t)||Vi(t.enabled)===!1))return{enabled:!0}}function fvt`;
+    const replacement =
+      `function dvt(t){if(t===!0)return{enabled:!0};if(!(!Xe(t)||Vi(t.enabled)===!1)){let e=__codexlDeepSeekThinkingModels(t);return{enabled:!0,...e.length>0?{models:e}:void 0}}}` +
+      `function __codexlDeepSeekThinkingModels(t){let e=t?.models??t?.model,n=Array.isArray(e)?e:typeof e=="string"?e.split(","):[];return n.map(r=>typeof r=="string"?r.trim():"").filter(Boolean)}` +
+      `function fvt`;
+    if (!content.includes(marker)) {
+      throw new Error(`NeXT AI Gateway deepseek thinking parser has an unexpected shape: ${outputFile}`);
+    }
+    content = content.replace(marker, replacement);
+  }
+
+  if (!content.includes("x2e(t.deepseekThinking)")) {
+    const marker = `t.deepseekThinking?.enabled?x2e():void 0`;
+    if (!content.includes(marker)) {
+      throw new Error(`NeXT AI Gateway deepseek thinking config plugin has an unexpected shape: ${outputFile}`);
+    }
+    content = content.replace(marker, `t.deepseekThinking?.enabled?x2e(t.deepseekThinking):void 0`);
+  }
+
+  if (!content.includes("__codexlDeepSeekModelSet")) {
+    const marker =
+      `function x2e(){return{key:F9t,provider:"openai",transformRequest(t){if(!U9t(t))return{ok:!0,value:t.upstreamRequest};let e=Vk(t.upstreamRequest.body)?{...t.upstreamRequest.body}:void 0;if(!e)return{ok:!0,value:t.upstreamRequest};let n=G9t(t,e),r=V9t(t,e);return!n&&!r?{ok:!0,value:t.upstreamRequest}:n==="disabled"?(e.thinking={type:"disabled"},delete e.reasoning_effort,C2e(e),{ok:!0,value:{...t.upstreamRequest,body:e}}):(e.thinking={type:n||"enabled"},r&&(e.reasoning_effort=r),C2e(e),{ok:!0,value:{...t.upstreamRequest,body:e}})}}}function U9t`;
+    const replacement =
+      `function x2e(t={}){let e=__codexlDeepSeekModelSet(t.models);return{key:F9t,provider:"openai",transformRequest(n){if(!U9t(n))return{ok:!0,value:n.upstreamRequest};let r=Vk(n.upstreamRequest.body)?{...n.upstreamRequest.body}:void 0;if(!r)return{ok:!0,value:n.upstreamRequest};if(e&&!e.has(__codexlDeepSeekRequestModel(n,r)))return{ok:!0,value:n.upstreamRequest};let s=G9t(n,r),i=V9t(n,r);return!s&&!i?{ok:!0,value:n.upstreamRequest}:s==="disabled"?(r.thinking={type:"disabled"},delete r.reasoning_effort,C2e(r),{ok:!0,value:{...n.upstreamRequest,body:r}}):(r.thinking={type:s||"enabled"},i&&(r.reasoning_effort=i),C2e(r),{ok:!0,value:{...n.upstreamRequest,body:r}})}}}` +
+      `function __codexlDeepSeekModelSet(t){let e=Array.isArray(t)?t:typeof t=="string"?t.split(","):[];if(e.length===0)return;let n=new Set;for(let r of e){let s=__codexlDeepSeekModelKey(r);s&&n.add(s)}return n.size>0?n:void 0}` +
+      `function __codexlDeepSeekRequestModel(t,e){return __codexlDeepSeekModelKey(t.model||t.standardRequest?.model||e?.model||mK(t).model)}` +
+      `function __codexlDeepSeekModelKey(t){if(typeof t!="string")return"";let e=t.trim().replace(/^\\/+/, "").toLowerCase(),n=e.split("/").pop()||e;return n}` +
+      `function U9t`;
+    if (!content.includes(marker)) {
+      throw new Error(`NeXT AI Gateway deepseek thinking plugin has an unexpected shape: ${outputFile}`);
+    }
+    content = content.replace(marker, replacement);
+  }
+
+  return content;
 }
 
 function reuseExistingBundleOrThrow(outputFile, envName) {
