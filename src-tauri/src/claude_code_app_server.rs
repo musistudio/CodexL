@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -42,6 +43,9 @@ const PROTECTED_BUNDLED_PLUGIN_NAMES: &[&str] = &[
     BROWSER_USE_PLUGIN_NAME,
 ];
 const DEFAULT_MODEL: &str = "claude-code";
+const DEFAULT_APPROVAL_POLICY: &str = "on-request";
+const DEFAULT_APPROVALS_REVIEWER: &str = "user";
+const AUTO_REVIEW_APPROVALS_REVIEWER: &str = "auto_review";
 const DEFAULT_PERMISSION_PROMPT_TOOL: &str = "stdio";
 const DEFAULT_CLAUDE_CONTEXT_WINDOW: i64 = 200_000;
 const CLAUDE_ONE_M_CONTEXT_WINDOW: i64 = 1_000_000;
@@ -921,6 +925,7 @@ rl.on("close", () => {
 });
 "#;
 const CLAUDE_STREAM_JSON_ARGS: &[&str] = &[
+    "--print",
     "--output-format",
     "stream-json",
     "--verbose",
@@ -959,6 +964,8 @@ struct ClaudeThread {
     updated_at: i64,
     archived: bool,
     name: Option<String>,
+    approval_policy: String,
+    approvals_reviewer: String,
     turns: Vec<ClaudeTurn>,
     latest_token_usage_info: Option<Value>,
 }
@@ -983,6 +990,8 @@ struct ClaudeTurn {
     started_at: i64,
     completed_at: Option<i64>,
     duration_ms: Option<i64>,
+    approval_policy: String,
+    approvals_reviewer: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1003,6 +1012,7 @@ struct TurnWork {
     cwd: String,
     prompt: String,
     resume_existing: bool,
+    permission_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2290,6 +2300,10 @@ fn standalone_codex_app_result(method: &str, params: &Value) -> Option<Value> {
         | "memory/reset"
         | "experimentalFeature/enablement/set"
         | "marketplace/add" => Some(json!({})),
+        "externalAgentConfig/detect" => Some(json!({ "items": [] })),
+        "externalAgentConfig/import" => Some(json!({})),
+        "config/value/write" | "config/batchWrite" => Some(config_write_response(params)),
+        "fs/readFile" => Some(fs_read_file_response(params)),
         "remoteControl/status/read" => Some(json!({
             "enabled": false,
             "status": "unavailable",
@@ -2333,6 +2347,40 @@ fn standalone_codex_app_result(method: &str, params: &Value) -> Option<Value> {
         })),
         _ => None,
     }
+}
+
+fn config_write_response(params: &Value) -> Value {
+    json!({
+        "status": "ok",
+        "version": now_millis().to_string(),
+        "filePath": config_write_file_path(params),
+        "overriddenMetadata": Value::Null,
+    })
+}
+
+fn config_write_file_path(params: &Value) -> String {
+    params
+        .get("filePath")
+        .and_then(Value::as_str)
+        .and_then(non_empty_string)
+        .unwrap_or_else(|| {
+            PathBuf::from(crate::config::default_codex_home())
+                .join("config.toml")
+                .to_string_lossy()
+                .to_string()
+        })
+}
+
+fn fs_read_file_response(params: &Value) -> Value {
+    let data = params
+        .get("path")
+        .and_then(Value::as_str)
+        .and_then(|path| std::fs::read(path).ok())
+        .unwrap_or_default();
+
+    json!({
+        "dataBase64": general_purpose::STANDARD.encode(data),
+    })
 }
 
 fn normalize_proxied_codex_app_result(method: &str, params: &Value, result: Value) -> Value {
@@ -4643,6 +4691,8 @@ impl ClaudeAppServerState {
         let id = new_uuid_v4();
         let cwd = normalize_cwd(params.get("cwd").and_then(Value::as_str));
         let model = model_from_params(params);
+        let approval_policy = approval_policy_from_params(params, None);
+        let approvals_reviewer = approvals_reviewer_from_params(params, None);
         let now = now_seconds();
         let name = self.workspace_name.clone();
         let thread = ClaudeThread {
@@ -4657,6 +4707,8 @@ impl ClaudeAppServerState {
             updated_at: now,
             archived: false,
             name,
+            approval_policy,
+            approvals_reviewer,
             turns: Vec::new(),
             latest_token_usage_info: None,
         };
@@ -4910,6 +4962,10 @@ impl ClaudeAppServerState {
             if let Some(model) = params.get("model").and_then(Value::as_str) {
                 thread.model = model.to_string();
             }
+            thread.approval_policy =
+                approval_policy_from_params(params, Some(&thread.approval_policy));
+            thread.approvals_reviewer =
+                approvals_reviewer_from_params(params, Some(&thread.approvals_reviewer));
         }
         let input = params
             .get("input")
@@ -4963,6 +5019,8 @@ impl ClaudeAppServerState {
             started_at: now,
             completed_at: None,
             duration_ms: None,
+            approval_policy: thread.approval_policy.clone(),
+            approvals_reviewer: thread.approvals_reviewer.clone(),
         };
         let turn_id = turn.id.clone();
         let user_item = turn.user_item_json();
@@ -4980,6 +5038,9 @@ impl ClaudeAppServerState {
             cwd: thread.cwd.clone(),
             prompt,
             resume_existing,
+            permission_mode: claude_permission_mode_for_approvals_reviewer(
+                &thread.approvals_reviewer,
+            ),
         };
         claude_code_log_event(
             "turn_start_prepared",
@@ -5293,6 +5354,7 @@ fn claude_thread_stream_state_changed_notification(thread: &ClaudeThread) -> Val
 fn claude_conversation_state(thread: &ClaudeThread) -> Value {
     json!({
         "id": thread.id,
+        "requests": [],
         "turns": thread
             .turns
             .iter()
@@ -5333,8 +5395,8 @@ fn claude_conversation_turn(thread: &ClaudeThread, turn: &ClaudeTurn) -> Value {
         "params": {
             "threadId": thread.id,
             "input": turn.input,
-            "approvalPolicy": "on-request",
-            "approvalsReviewer": "user",
+            "approvalPolicy": turn.approval_policy,
+            "approvalsReviewer": turn.approvals_reviewer,
             "sandboxPolicy": {
                 "type": "workspaceWrite",
                 "writableRoots": [&thread.cwd],
@@ -5397,7 +5459,10 @@ impl ClaudeThread {
             "agentNickname": Value::Null,
             "agentRole": Value::Null,
             "gitInfo": Value::Null,
+            "approvalPolicy": self.approval_policy,
+            "approvalsReviewer": self.approvals_reviewer,
             "name": self.name,
+            "requests": [],
             "turns": if include_turns {
                 Value::Array(self.turns.iter().map(|turn| turn.to_json(true)).collect())
             } else {
@@ -5740,6 +5805,8 @@ fn load_claude_thread_from_transcript_path(
                         started_at,
                         completed_at: Some(completed_at),
                         duration_ms: Some((completed_at - started_at).max(0) * 1000),
+                        approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
+                        approvals_reviewer: DEFAULT_APPROVALS_REVIEWER.to_string(),
                     });
                 }
             }
@@ -5791,6 +5858,8 @@ fn load_claude_thread_from_transcript_path(
         updated_at,
         archived: false,
         name,
+        approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
+        approvals_reviewer: DEFAULT_APPROVALS_REVIEWER.to_string(),
         turns,
         latest_token_usage_info,
     })
@@ -9988,11 +10057,7 @@ fn claude_command(work: &TurnWork) -> Command {
     if let Some(model) = claude_model_arg() {
         command.arg("--model").arg(model);
     }
-    if let Some(permission_mode) = std::env::var(PERMISSION_MODE_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(permission_mode) = claude_permission_mode_arg(work) {
         command.arg("--permission-mode").arg(permission_mode);
     }
     if let Some(permission_prompt_tool) = claude_permission_prompt_tool_arg() {
@@ -10043,6 +10108,28 @@ fn claude_permission_approval_timeout() -> Duration {
         .filter(|value| *value > 0)
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_millis(DEFAULT_PERMISSION_APPROVAL_TIMEOUT_MS))
+}
+
+fn claude_permission_mode_arg(work: &TurnWork) -> Option<String> {
+    std::env::var(PERMISSION_MODE_ENV)
+        .ok()
+        .and_then(|value| non_empty_string(&value))
+        .or_else(|| work.permission_mode.clone())
+}
+
+fn claude_permission_mode_for_approvals_reviewer(approvals_reviewer: &str) -> Option<String> {
+    is_auto_review_approvals_reviewer(approvals_reviewer).then(|| "auto".to_string())
+}
+
+fn is_auto_review_approvals_reviewer(approvals_reviewer: &str) -> bool {
+    let normalized = approvals_reviewer
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    matches!(
+        normalized.as_str(),
+        AUTO_REVIEW_APPROVALS_REVIEWER | "autoreview" | "auto" | "guardian_subagent"
+    )
 }
 
 fn claude_permission_prompt_tool_arg() -> Option<String> {
@@ -10520,11 +10607,7 @@ fn claude_command_display(work: &TurnWork) -> String {
         parts.push("--model".to_string());
         parts.push(model);
     }
-    if let Some(permission_mode) = std::env::var(PERMISSION_MODE_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(permission_mode) = claude_permission_mode_arg(work) {
         parts.push("--permission-mode".to_string());
         parts.push(permission_mode);
     }
@@ -11118,8 +11201,8 @@ fn thread_runtime_response(thread: &ClaudeThread, include_turns: bool) -> Value 
         "cwd": thread.cwd,
         "runtimeWorkspaceRoots": [],
         "instructionSources": [],
-        "approvalPolicy": "on-request",
-        "approvalsReviewer": "user",
+        "approvalPolicy": thread.approval_policy,
+        "approvalsReviewer": thread.approvals_reviewer,
         "sandbox": { "type": "dangerFullAccess" },
         "activePermissionProfile": Value::Null,
         "reasoningEffort": Value::Null,
@@ -11176,6 +11259,26 @@ fn model_from_params(params: &Value) -> String {
                 .filter(|value| !value.is_empty())
         })
         .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+}
+
+fn approval_policy_from_params(params: &Value, fallback: Option<&str>) -> String {
+    json_non_empty_string(params.get("approvalPolicy"))
+        .or_else(|| json_non_empty_string(params.pointer("/config/approvalPolicy")))
+        .or_else(|| json_non_empty_string(params.pointer("/config/approval_policy")))
+        .or_else(|| fallback.and_then(non_empty_string))
+        .unwrap_or_else(|| DEFAULT_APPROVAL_POLICY.to_string())
+}
+
+fn approvals_reviewer_from_params(params: &Value, fallback: Option<&str>) -> String {
+    json_non_empty_string(params.get("approvalsReviewer"))
+        .or_else(|| json_non_empty_string(params.pointer("/config/approvalsReviewer")))
+        .or_else(|| json_non_empty_string(params.pointer("/config/approvals_reviewer")))
+        .or_else(|| fallback.and_then(non_empty_string))
+        .unwrap_or_else(|| DEFAULT_APPROVALS_REVIEWER.to_string())
+}
+
+fn json_non_empty_string(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).and_then(non_empty_string)
 }
 
 fn prompt_from_input(input: &[Value]) -> String {
@@ -11453,16 +11556,13 @@ mod tests {
         );
 
         let content = std::fs::read_to_string(&log_path).expect("read log file");
-        let line = content.lines().last().expect("log line");
-        let value = serde_json::from_str::<Value>(line).expect("parse log json");
-        assert_eq!(
-            value.get("event").and_then(Value::as_str),
-            Some("test_event")
-        );
-        assert_eq!(
-            value.get("threadId").and_then(Value::as_str),
-            Some("thread")
-        );
+        let found = content.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|value| {
+                value.get("event").and_then(Value::as_str) == Some("test_event")
+                    && value.get("threadId").and_then(Value::as_str) == Some("thread")
+            })
+        });
+        assert!(found, "test log event not found in {content}");
 
         restore_env(APP_SERVER_LOG_PATH_ENV, old_log_path);
         let _ = std::fs::remove_dir_all(root);
@@ -12028,6 +12128,7 @@ args = ["server.js", "--stdio"]
             cwd: root.to_string_lossy().to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
         let command = claude_command_display(&work);
         assert!(!command.contains("--plugin-dir"), "{command}");
@@ -12088,6 +12189,7 @@ args = ["server.js", "--stdio"]
             cwd: root.to_string_lossy().to_string(),
             prompt: "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\nGenerate a concise UI title (up to 36 characters) for this task.\n\nUser prompt:\nhello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         });
         assert!(!title_command.contains("--mcp-config"), "{title_command}");
 
@@ -12118,6 +12220,7 @@ args = ["server.js", "--stdio"]
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
         let command = claude_command(&work);
         let envs = command
@@ -12169,6 +12272,10 @@ args = ["server.js", "--stdio"]
                     == Some("thread-stream-state-changed")
             })
             .expect("started thread stream snapshot");
+        assert!(started_snapshot
+            .pointer("/params/change/conversationState/requests")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty));
         assert_eq!(
             started_snapshot
                 .pointer("/params/change/conversationState/threadRuntimeStatus/type")
@@ -12226,6 +12333,37 @@ args = ["server.js", "--stdio"]
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_and_conversation_state_include_requests_array() {
+        let mut state = ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: None,
+        };
+
+        let (thread_response, notification) = state.start_thread(&json!({ "cwd": "/tmp" }));
+        assert!(thread_response
+            .pointer("/thread/requests")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty));
+        assert!(notification
+            .pointer("/params/thread/requests")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty));
+
+        let thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id");
+        let thread = state.threads.get(thread_id).expect("thread");
+        assert!(claude_conversation_state(thread)
+            .get("requests")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty));
     }
 
     #[cfg(unix)]
@@ -12309,6 +12447,53 @@ args = ["server.js", "--stdio"]
                 .expect("thread goal result");
             assert!(result.get("goal").is_some_and(Value::is_null));
         }
+    }
+
+    #[test]
+    fn new_frontend_init_methods_have_standalone_results() {
+        let root = test_dir("new-frontend-init-methods");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let config_path = root.join("config.toml");
+        let read_path = root.join("AGENTS.md");
+        std::fs::write(&read_path, "hello").expect("write readable file");
+
+        let detect = standalone_codex_app_result("externalAgentConfig/detect", &json!({}))
+            .expect("external agent detect result");
+        assert!(detect
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty));
+        let import = standalone_codex_app_result(
+            "externalAgentConfig/import",
+            &json!({ "migrationItems": [] }),
+        )
+        .expect("external agent import result");
+        assert!(import.as_object().is_some_and(Map::is_empty));
+
+        let write = standalone_codex_app_result(
+            "config/batchWrite",
+            &json!({ "edits": [], "filePath": config_path.to_string_lossy() }),
+        )
+        .expect("config batch write result");
+        assert_eq!(write.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(
+            write.get("filePath").and_then(Value::as_str),
+            Some(config_path.to_string_lossy().as_ref())
+        );
+        assert!(write.get("overriddenMetadata").is_some_and(Value::is_null));
+
+        let read = standalone_codex_app_result(
+            "fs/readFile",
+            &json!({ "path": read_path.to_string_lossy() }),
+        )
+        .expect("fs read file result");
+        let expected_data = general_purpose::STANDARD.encode("hello");
+        assert_eq!(
+            read.get("dataBase64").and_then(Value::as_str),
+            Some(expected_data.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -13552,6 +13737,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
 
         assert_eq!(claude_model_arg(), None);
@@ -13571,6 +13757,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
 
         assert_eq!(claude_model_arg(), Some("sonnet".to_string()));
@@ -13589,14 +13776,96 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
 
         let command = claude_command_display(&work);
+        assert!(command.contains("--print"));
         assert!(command.contains("--output-format stream-json"));
         assert!(command.contains("--verbose"));
         assert!(command.contains("--input-format stream-json"));
         assert!(command.contains("--include-partial-messages"));
         assert!(command.contains("--session-id 11111111-1111-4111-8111-111111111111"));
+    }
+
+    #[test]
+    fn auto_review_maps_to_claude_auto_permission_mode() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_permission_mode = std::env::var_os(PERMISSION_MODE_ENV);
+        std::env::remove_var(PERMISSION_MODE_ENV);
+        let mut state = ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: None,
+        };
+        let (thread_response, _) = state.start_thread(&json!({
+            "cwd": "/tmp",
+            "approvalsReviewer": "auto_review",
+        }));
+        let thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        assert_eq!(
+            thread_response
+                .get("approvalsReviewer")
+                .and_then(Value::as_str),
+            Some("auto_review")
+        );
+
+        let (turn_response, _, work, _) = state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "hello" }],
+            }))
+            .expect("start turn");
+
+        assert_eq!(work.permission_mode.as_deref(), Some("auto"));
+        assert_eq!(
+            turn_response
+                .pointer("/turn/status")
+                .and_then(Value::as_str),
+            Some("inProgress")
+        );
+        let thread = state.threads.get(&thread_id).expect("thread state");
+        assert_eq!(
+            thread
+                .turns
+                .first()
+                .map(|turn| turn.approvals_reviewer.as_str()),
+            Some("auto_review")
+        );
+        let command = claude_command_display(&work);
+        assert!(command.contains("--permission-mode auto"), "{command}");
+
+        restore_env(PERMISSION_MODE_ENV, old_permission_mode);
+    }
+
+    #[test]
+    fn permission_mode_env_overrides_auto_review_mode() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_permission_mode = std::env::var_os(PERMISSION_MODE_ENV);
+        std::env::set_var(PERMISSION_MODE_ENV, "plan");
+        let work = TurnWork {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            agent_item_id: "agent".to_string(),
+            cli_item_id: "cli".to_string(),
+            claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            cwd: "/tmp".to_string(),
+            prompt: "hello".to_string(),
+            resume_existing: false,
+            permission_mode: Some("auto".to_string()),
+        };
+
+        let command = claude_command_display(&work);
+        assert!(command.contains("--permission-mode plan"), "{command}");
+        assert!(!command.contains("--permission-mode auto"), "{command}");
+
+        restore_env(PERMISSION_MODE_ENV, old_permission_mode);
     }
 
     #[test]
@@ -13613,6 +13882,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
 
         assert!(claude_command_display(&work).contains("--permission-prompt-tool stdio"));
@@ -13669,6 +13939,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             cwd: "/tmp/workspace".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
         let message = json!({
             "type": "control_request",
@@ -13760,6 +14031,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             cwd: "/tmp/workspace".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
         let message = json!({
             "type": "control_request",
@@ -13810,6 +14082,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             cwd: "/tmp/workspace".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
         let message = json!({
             "type": "control_request",
@@ -13902,6 +14175,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
 
         let input = claude_stream_json_input(&work);
@@ -14051,6 +14325,7 @@ sleep 60
             cwd: root.to_string_lossy().to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
         let started = Instant::now();
         let result = run_claude_code_turn_stream_json(
@@ -14111,6 +14386,7 @@ sleep 60
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
         let mut stream = ClaudeStreamState::default();
         let mut command_output = String::new();
@@ -14244,6 +14520,7 @@ sleep 60
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
         let mut stream = ClaudeStreamState::default();
         let mut command_output = String::new();
@@ -14340,6 +14617,7 @@ sleep 60
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
         let mut stream = ClaudeStreamState::default();
         let mut command_output = String::new();
@@ -14416,6 +14694,7 @@ sleep 60
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
         let mut stream = ClaudeStreamState::default();
         let mut command_output = String::new();
@@ -14478,6 +14757,7 @@ sleep 60
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
         let mut stream = ClaudeStreamState::default();
         let mut command_output = String::new();
@@ -14609,6 +14889,7 @@ sleep 60
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
         let mut stream = ClaudeStreamState::default();
         let mut command_output = String::new();
@@ -14674,6 +14955,7 @@ sleep 60
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
             resume_existing: false,
+            permission_mode: None,
         };
         let mut stream = ClaudeStreamState::default();
         let mut command_output = String::new();

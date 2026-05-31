@@ -308,9 +308,11 @@ async fn set_start_remote_on_launch(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
-    let mut config = state.config.lock().await;
-    config.set_start_remote_on_launch(&profile_name, enabled)?;
-    let config = config.clone();
+    let config = {
+        let mut config = state.config.lock().await;
+        config.set_start_remote_on_launch(&profile_name, enabled)?;
+        config.clone()
+    };
     refresh_macos_tray_menu(&app, state.inner(), &config).await;
     Ok(config)
 }
@@ -324,14 +326,16 @@ async fn set_remote_launch_options(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
-    let mut config = state.config.lock().await;
-    config.set_remote_launch_options(
-        &profile_name,
-        start_remote,
-        start_cloud,
-        remote_e2ee_password,
-    )?;
-    let config = config.clone();
+    let config = {
+        let mut config = state.config.lock().await;
+        config.set_remote_launch_options(
+            &profile_name,
+            start_remote,
+            start_cloud,
+            remote_e2ee_password,
+        )?;
+        config.clone()
+    };
     refresh_macos_tray_menu(&app, state.inner(), &config).await;
     Ok(config)
 }
@@ -419,10 +423,12 @@ async fn add_existing_provider(
     let profile_config_format = profile_config_format_for_state(state.inner()).await;
     let profile =
         config::add_existing_provider_profile_with_format(provider, profile_config_format)?;
-    let mut config = state.config.lock().await;
-    config.add_provider_profile(profile);
-    config.save()?;
-    let config = config.clone();
+    let config = {
+        let mut config = state.config.lock().await;
+        config.add_provider_profile(profile);
+        config.save()?;
+        config.clone()
+    };
     refresh_macos_tray_menu(&app, state.inner(), &config).await;
     Ok(config)
 }
@@ -434,10 +440,12 @@ async fn create_workspace(
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
     let profile = config::create_workspace_profile(provider)?;
-    let mut config = state.config.lock().await;
-    config.add_provider_profile(profile);
-    config.save()?;
-    let config = config.clone();
+    let config = {
+        let mut config = state.config.lock().await;
+        config.add_provider_profile(profile);
+        config.save()?;
+        config.clone()
+    };
     refresh_macos_tray_menu(&app, state.inner(), &config).await;
     Ok(config)
 }
@@ -450,14 +458,16 @@ async fn create_provider(
 ) -> Result<AppConfig, String> {
     let profile_config_format = profile_config_format_for_state(state.inner()).await;
     let profile = config::create_default_provider_with_format(provider, profile_config_format)?;
-    let mut config = state.config.lock().await;
-    if profile.name == DEFAULT_PROVIDER_PROFILE_NAME {
-        config.update_provider_profile(DEFAULT_PROVIDER_PROFILE_NAME, profile)?;
-    } else {
-        config.add_provider_profile(profile);
-    }
-    config.save()?;
-    let config = config.clone();
+    let config = {
+        let mut config = state.config.lock().await;
+        if profile.name == DEFAULT_PROVIDER_PROFILE_NAME {
+            config.update_provider_profile(DEFAULT_PROVIDER_PROFILE_NAME, profile)?;
+        } else {
+            config.add_provider_profile(profile);
+        }
+        config.save()?;
+        config.clone()
+    };
     refresh_macos_tray_menu(&app, state.inner(), &config).await;
     Ok(config)
 }
@@ -473,10 +483,12 @@ async fn create_next_ai_gateway_provider(
     let profile_config_format = profile_config_format_for_state(state.inner()).await;
     let profile =
         config::create_next_ai_gateway_provider_with_format(provider, profile_config_format)?;
-    let mut config = state.config.lock().await;
-    config.add_provider_profile(profile);
-    config.save()?;
-    let config = config.clone();
+    let config = {
+        let mut config = state.config.lock().await;
+        config.add_provider_profile(profile);
+        config.save()?;
+        config.clone()
+    };
     refresh_macos_tray_menu(&app, state.inner(), &config).await;
     Ok(config)
 }
@@ -506,8 +518,10 @@ async fn delete_provider(
         }
     }
 
-    let config = state.config.lock().await;
-    let config = config.clone();
+    let config = {
+        let config = state.config.lock().await;
+        config.clone()
+    };
     refresh_macos_tray_menu(&app, state.inner(), &config).await;
     Ok(config)
 }
@@ -540,25 +554,27 @@ async fn update_provider(
             },
             profile_config_format,
         )?;
-        let mut config = state.config.lock().await;
-        if let Some(profile) = config
-            .provider_profiles
-            .iter_mut()
-            .find(|profile| profile.name == DEFAULT_PROVIDER_PROFILE_NAME)
-        {
-            profile.bot = bot;
-            profile.proxy_url = proxy_url;
-            profile.remote_frontend_mode = remote_frontend_mode;
-            profile.remote_web_asset_registry_url = remote_web_asset_registry_url;
-            profile.remote_web_asset_version = remote_web_asset_version;
-            let profile_id = profile.id.clone();
-            profile
-                .bot
-                .normalize_for_profile_instance(DEFAULT_PROVIDER_PROFILE_NAME, &profile_id);
-        }
-        config.normalize();
-        config.save()?;
-        let config = config.clone();
+        let config = {
+            let mut config = state.config.lock().await;
+            if let Some(profile) = config
+                .provider_profiles
+                .iter_mut()
+                .find(|profile| profile.name == DEFAULT_PROVIDER_PROFILE_NAME)
+            {
+                profile.bot = bot;
+                profile.proxy_url = proxy_url;
+                profile.remote_frontend_mode = remote_frontend_mode;
+                profile.remote_web_asset_registry_url = remote_web_asset_registry_url;
+                profile.remote_web_asset_version = remote_web_asset_version;
+                let profile_id = profile.id.clone();
+                profile
+                    .bot
+                    .normalize_for_profile_instance(DEFAULT_PROVIDER_PROFILE_NAME, &profile_id);
+            }
+            config.normalize();
+            config.save()?;
+            config.clone()
+        };
         refresh_macos_tray_menu(&app, state.inner(), &config).await;
         return Ok(config);
     }
@@ -566,10 +582,12 @@ async fn update_provider(
     let original_name = provider.original_name.clone();
     let profile =
         config::update_existing_provider_profile_with_format(provider, profile_config_format)?;
-    let mut config = state.config.lock().await;
-    config.update_provider_profile(&original_name, profile)?;
-    config.save()?;
-    let config = config.clone();
+    let config = {
+        let mut config = state.config.lock().await;
+        config.update_provider_profile(&original_name, profile)?;
+        config.save()?;
+        config.clone()
+    };
     refresh_macos_tray_menu(&app, state.inner(), &config).await;
     Ok(config)
 }
@@ -582,10 +600,12 @@ async fn update_workspace(
 ) -> Result<AppConfig, String> {
     let original_name = provider.original_name.clone();
     let profile = config::update_workspace_profile(provider)?;
-    let mut config = state.config.lock().await;
-    config.update_provider_profile(&original_name, profile)?;
-    config.save()?;
-    let config = config.clone();
+    let config = {
+        let mut config = state.config.lock().await;
+        config.update_provider_profile(&original_name, profile)?;
+        config.save()?;
+        config.clone()
+    };
     refresh_macos_tray_menu(&app, state.inner(), &config).await;
     Ok(config)
 }
@@ -604,10 +624,12 @@ async fn update_next_ai_gateway_provider(
         provider,
         profile_config_format,
     )?;
-    let mut config = state.config.lock().await;
-    config.update_provider_profile(&original_name, profile)?;
-    config.save()?;
-    let config = config.clone();
+    let config = {
+        let mut config = state.config.lock().await;
+        config.update_provider_profile(&original_name, profile)?;
+        config.save()?;
+        config.clone()
+    };
     refresh_macos_tray_menu(&app, state.inner(), &config).await;
     Ok(config)
 }
