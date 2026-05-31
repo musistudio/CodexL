@@ -93,6 +93,21 @@ fn rewrites_html_absolute_paths_without_touching_protocol_relative_urls() {
 }
 
 #[test]
+fn appends_auth_query_to_html_asset_links() {
+    let html = r#"<script type="module" src="./assets/app.js"></script><link href='/web/assets/app.css?v=1'><img src="//cdn.example/a.png">"#;
+    let rewritten = append_html_asset_auth_query(
+        html,
+        "/web",
+        Some("hostId=local&token=secret&codexBridgeUrl=ws%3A%2F%2Frelay%2Fweb%2F_bridge"),
+    );
+
+    assert!(rewritten.contains("src=\"./assets/app.js?hostId=local&token=secret\""));
+    assert!(rewritten.contains("href='/web/assets/app.css?v=1&hostId=local&token=secret'"));
+    assert!(rewritten.contains("src=\"//cdn.example/a.png\""));
+    assert!(!rewritten.contains("codexBridgeUrl"));
+}
+
+#[test]
 fn strips_html_content_security_policy_meta_tags() {
     let html = r#"<head>
 <meta charset="utf-8">
@@ -384,6 +399,14 @@ fn web_bridge_script_filters_background_notifications_before_dispatching_to_code
     assert!(WEB_BRIDGE_SCRIPT.contains("recordBridgeEvent(hostMessage)"));
     assert!(WEB_BRIDGE_SCRIPT.contains("codex-web-bridge-event"));
     assert!(WEB_BRIDGE_SCRIPT.contains("continue;"));
+}
+
+#[test]
+fn web_bridge_script_installs_app_host_rpc_bridge() {
+    assert!(WEB_BRIDGE_SCRIPT.contains("connect-app-host"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("installCodexAppHostRpcBridge"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("hotkeyWindowHotkeys: null"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("\"resolve\""));
 }
 
 #[test]

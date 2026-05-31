@@ -1497,6 +1497,13 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     return desktopApiFetchEndpoint(message) === "list-models-for-host";
   }
 
+  function isIdeContextDesktopApiRequest(message) {
+    if (String(message?.method || "POST").toUpperCase() !== "POST") {
+      return false;
+    }
+    return desktopApiFetchEndpoint(message) === "ide-context";
+  }
+
   async function maybeHandleListModelsForHostDesktopApiRequest(message) {
     if (!isListModelsForHostDesktopApiRequest(message) || !message?.requestId) {
       return false;
@@ -1514,6 +1521,14 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     return true;
   }
 
+  function maybeHandleIdeContextDesktopApiRequest(message) {
+    if (!isIdeContextDesktopApiRequest(message) || !message?.requestId) {
+      return false;
+    }
+    dispatchDesktopApiFetchSuccess(message, { ideContext: null });
+    return true;
+  }
+
   function installDesktopApiHostModelListEventInterceptor() {
     if (runtime.desktopApiHostModelListEventInterceptorInstalled) {
       return;
@@ -1522,12 +1537,21 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     const pendingRequestIds = new Set();
     runtime.desktopApiHostModelListPendingRequestIds = pendingRequestIds;
     const handleRequest = async (message) => {
-      if (!isListModelsForHostDesktopApiRequest(message) || !message?.requestId) {
+      if (!message?.requestId) {
+        return;
+      }
+      const handlesListModels = isListModelsForHostDesktopApiRequest(message);
+      const handlesIdeContext = isIdeContextDesktopApiRequest(message);
+      if (!handlesListModels && !handlesIdeContext) {
         return;
       }
       pendingRequestIds.add(message.requestId);
       try {
-        await maybeHandleListModelsForHostDesktopApiRequest(message);
+        if (handlesIdeContext) {
+          maybeHandleIdeContextDesktopApiRequest(message);
+        } else {
+          await maybeHandleListModelsForHostDesktopApiRequest(message);
+        }
       } catch (error) {
         log("error", "CodexL desktop API model list failed", String(error));
         dispatchDesktopApiFetchError(message, 500, error?.message || error);
@@ -4840,6 +4864,7 @@ mod tests {
         assert!(script.contains("storage:get"));
         assert!(script.contains("transcribe:fetch"));
         assert!(script.contains("models:list-for-host"));
+        assert!(script.contains("ide-context"));
         assert!(script.contains("installTranscribeFetchInterceptor"));
         assert!(script.contains("installDesktopApiHostModelListInterceptor"));
         assert!(script.contains("installGatewayModelQuerySelectorRepair"));

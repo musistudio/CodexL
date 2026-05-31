@@ -227,6 +227,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	      window.parent?.postMessage(
 	        {
 	          ...detail,
+	          clientId: bridgeClientId,
 	          status,
 	          ts: Date.now(),
 	          type: BRIDGE_STATUS_MESSAGE,
@@ -255,10 +256,15 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
       return `fetch:${endpoint}:${message.requestId || ""}`;
     }
     if (type === "fetch-response") {
-      return `fetch-response:${message.requestId || ""}:${message.responseType || ""}`;
+      const status = message.status != null ? `:${message.status}` : "";
+      const error = message.error ? `:${String(message.error).replace(/\s+/g, " ").slice(0, 120)}` : "";
+      return `fetch-response:${message.requestId || ""}:${message.responseType || ""}${status}${error}`;
     }
     if (type === "ipc-broadcast") {
       const params = message.params || {};
+      if (message.method === "client-status-changed") {
+        return `ipc-broadcast:client-status-changed:${params.status || ""}:${params.clientType || ""}:${params.clientId || ""}`;
+      }
       const change = params.change || {};
       const turnCount =
         change.type === "snapshot" && Array.isArray(change.conversationState?.turns)
@@ -2640,6 +2646,136 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
     }
   }
 
+  const appHostRpcMainObject = {
+    services: {
+      codexMicro: null,
+      hotkeyWindowHotkeys: null,
+      primaryRuntime: null,
+      projectWritableRoots: null,
+    },
+  };
+
+  function appHostRpcDevalue(value) {
+    if (value === undefined) {
+      return ["undefined"];
+    }
+    if (
+      value === null ||
+      typeof value === "string" ||
+      typeof value === "boolean"
+    ) {
+      return value;
+    }
+    if (typeof value === "number") {
+      if (value === Infinity) {
+        return ["inf"];
+      }
+      if (value === -Infinity) {
+        return ["-inf"];
+      }
+      if (Number.isNaN(value)) {
+        return ["nan"];
+      }
+      return value;
+    }
+    if (Array.isArray(value)) {
+      return [value.map(appHostRpcDevalue)];
+    }
+    if (typeof value === "object") {
+      const result = {};
+      for (const key of Object.keys(value)) {
+        result[key] = appHostRpcDevalue(value[key]);
+      }
+      return result;
+    }
+    return ["undefined"];
+  }
+
+  function appHostRpcEvaluate(exportsTable, expression) {
+    if (!Array.isArray(expression)) {
+      return undefined;
+    }
+    if (expression[0] !== "pipeline" && expression[0] !== "import") {
+      return undefined;
+    }
+    const exportId = expression[1];
+    let value = exportsTable[exportId]?.value;
+    const path = Array.isArray(expression[2]) ? expression[2] : [];
+    for (const segment of path) {
+      if (value == null) {
+        return undefined;
+      }
+      value = value[segment];
+    }
+    if (expression.length > 3 && typeof value === "function") {
+      return value();
+    }
+    return value;
+  }
+
+  function installCodexAppHostRpcBridge() {
+    if (window.__codexAppHostRpcBridgeInstalled) {
+      return;
+    }
+    window.__codexAppHostRpcBridgeInstalled = true;
+    window.addEventListener(
+      "message",
+      (event) => {
+        const data = event?.data;
+        if (!data || data.type !== "connect-app-host") {
+          return;
+        }
+        const port = data.port || event.ports?.[0];
+        if (!port) {
+          return;
+        }
+        const exportsTable = [{ value: appHostRpcMainObject }];
+        const sendRpcPacket = (packet) => {
+          port.postMessage(JSON.stringify(packet));
+        };
+        port.addEventListener("message", (portEvent) => {
+          if (portEvent.data === null) {
+            port.close();
+            return;
+          }
+          if (typeof portEvent.data !== "string") {
+            return;
+          }
+          let packet;
+          try {
+            packet = JSON.parse(portEvent.data);
+          } catch {
+            return;
+          }
+          if (!Array.isArray(packet)) {
+            return;
+          }
+          if (packet[0] === "push" && packet.length > 1) {
+            exportsTable.push({ value: appHostRpcEvaluate(exportsTable, packet[1]) });
+            return;
+          }
+          if (packet[0] === "pull" && typeof packet[1] === "number") {
+            sendRpcPacket([
+              "resolve",
+              packet[1],
+              appHostRpcDevalue(exportsTable[packet[1]]?.value),
+            ]);
+            return;
+          }
+          if (packet[0] === "release" && typeof packet[1] === "number") {
+            delete exportsTable[packet[1]];
+            return;
+          }
+          if (packet[0] === "abort") {
+            port.close();
+          }
+        });
+        port.start?.();
+      },
+      true,
+    );
+  }
+
   const electronBridge = (window.electronBridge ||= {});
   electronBridge.sendMessageFromView = async (message) => {
     await forwardToCodexHost(message);
@@ -2653,6 +2789,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
     void forwardToCodexHost(event.detail);
   });
 
+  installCodexAppHostRpcBridge();
   installCodexLPluginBridge();
   installCodexLPluginRuntimeEntry();
   bridgeConnectionStarted = true;

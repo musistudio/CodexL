@@ -18,7 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{
-    HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_TYPE, COOKIE, SEC_WEBSOCKET_ACCEPT,
+    HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_TYPE, COOKIE, REFERER, SEC_WEBSOCKET_ACCEPT,
     SEC_WEBSOCKET_KEY, SET_COOKIE, UPGRADE,
 };
 use hyper::server::conn::http1;
@@ -629,6 +629,17 @@ async fn route_remote_request(
     runtime: Arc<RemoteRuntimeState>,
 ) -> Result<Response<HttpBody>, String> {
     let path = request.uri().path().to_string();
+    if matches!(
+        path.as_str(),
+        "/api/remote-info" | "/web/_version" | "/web/index.html" | "/web/_bridge.js"
+    ) {
+        eprintln!(
+            "[remote] http request: method={} backend={} {}",
+            request.method(),
+            runtime.backend.mode(),
+            remote_request_query_summary(request)
+        );
+    }
 
     if request.method() == Method::GET && is_websocket_upgrade(request) && path == "/web/_resource"
     {
@@ -648,6 +659,11 @@ async fn route_remote_request(
         && path == "/web/_bridge"
         && !runtime.authorized_web_bridge(request)
     {
+        eprintln!(
+            "[codex-web] bridge http auth failed: backend={} {}",
+            runtime.backend.mode(),
+            remote_request_query_summary(request)
+        );
         return Ok(json_response(
             StatusCode::UNAUTHORIZED,
             json!({ "error": "unauthorized" }),
@@ -655,6 +671,11 @@ async fn route_remote_request(
     }
 
     if remote_http_path_requires_auth(&path) && !runtime.authorized(request) {
+        eprintln!(
+            "[remote] http auth failed: backend={} {}",
+            runtime.backend.mode(),
+            remote_request_query_summary(request)
+        );
         return Ok(json_response(
             StatusCode::UNAUTHORIZED,
             json!({ "error": "unauthorized" }),
@@ -730,7 +751,14 @@ async fn web_bridge_websocket_response(
     request: &mut Request<Incoming>,
     runtime: Arc<RemoteRuntimeState>,
 ) -> Result<Response<HttpBody>, String> {
-    if !runtime.authorized_web_bridge(request) {
+    let authorized = runtime.authorized_web_bridge(request);
+    eprintln!(
+        "[codex-web] bridge websocket upgrade: backend={} auth={} {}",
+        runtime.backend.mode(),
+        authorized,
+        remote_request_query_summary(request)
+    );
+    if !authorized {
         return Ok(empty_response(StatusCode::UNAUTHORIZED));
     }
 
@@ -777,7 +805,14 @@ async fn web_resource_websocket_response(
     request: &mut Request<Incoming>,
     runtime: Arc<RemoteRuntimeState>,
 ) -> Result<Response<HttpBody>, String> {
-    if !runtime.authorized_web_bridge(request) {
+    let authorized = runtime.authorized_web_bridge(request);
+    eprintln!(
+        "[codex-web] resource websocket upgrade: backend={} auth={} {}",
+        runtime.backend.mode(),
+        authorized,
+        remote_request_query_summary(request)
+    );
+    if !authorized {
         return Ok(empty_response(StatusCode::UNAUTHORIZED));
     }
 
@@ -840,12 +875,72 @@ async fn web_resource_websocket_response(
         .map_err(|e| e.to_string())
 }
 
+fn remote_request_query_summary(request: &Request<Incoming>) -> String {
+    let query = request.uri().query().unwrap_or("");
+    let token = query_param(query, "token");
+    let referer_token_present = request
+        .headers()
+        .get(REFERER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(referer_query_token)
+        .is_some();
+    let mut parts = vec![
+        format!("path={}", request.uri().path()),
+        format!("tokenPresent={}", token.is_some()),
+    ];
+    if let Some(token) = token {
+        parts.push(format!("tokenLen={}", token.len()));
+    }
+    for key in [
+        "hostId",
+        "remoteMode",
+        "transport",
+        "auth",
+        "e2ee",
+        "requirePassword",
+        "webAssetVersion",
+    ] {
+        if let Some(value) = query_param(query, key).filter(|value| !value.is_empty()) {
+            parts.push(format!("{}={}", key, log_query_value(&value)));
+        }
+    }
+    if query_param(query, "cloudUser").is_some() {
+        parts.push("cloudUserPresent=true".to_string());
+    }
+    if query_param(query, "jwt").is_some() {
+        parts.push("jwtPresent=true".to_string());
+    }
+    if referer_token_present {
+        parts.push("refererTokenPresent=true".to_string());
+    }
+    parts.join(" ")
+}
+
+fn log_query_value(value: &str) -> String {
+    let mut preview = value
+        .chars()
+        .map(|ch| if ch.is_control() { '_' } else { ch })
+        .take(80)
+        .collect::<String>();
+    if value.chars().count() > preview.chars().count() {
+        preview.push_str("...");
+    }
+    preview
+}
+
 async fn websocket_response(
     request: &mut Request<Incoming>,
     runtime: Arc<RemoteRuntimeState>,
     channel: WsChannel,
 ) -> Result<Response<HttpBody>, String> {
-    if !runtime.authorized(request) {
+    let authorized = runtime.authorized(request);
+    eprintln!(
+        "[remote] {} websocket upgrade: auth={} {}",
+        channel.label(),
+        authorized,
+        remote_request_query_summary(request)
+    );
+    if !authorized {
         return Ok(empty_response(StatusCode::UNAUTHORIZED));
     }
 
@@ -883,6 +978,15 @@ async fn websocket_response(
 enum WsChannel {
     Control,
     Frame,
+}
+
+impl WsChannel {
+    fn label(self) -> &'static str {
+        match self {
+            WsChannel::Control => "control",
+            WsChannel::Frame => "frame",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -993,6 +1097,7 @@ impl RemoteRuntimeState {
         self.query_token_authorized(request)
             || self.bearer_token_authorized(request)
             || self.cookie_token_authorized(request)
+            || self.referer_token_authorized(request)
     }
 
     fn authorized_web_bridge(&self, request: &Request<Incoming>) -> bool {
@@ -1021,6 +1126,17 @@ impl RemoteRuntimeState {
                 .to_str()
                 .ok()
                 .and_then(|header| cookie_value(header, REMOTE_AUTH_COOKIE_NAME))
+                .map(|token| self.token_matches(&token))
+                .unwrap_or(false)
+        })
+    }
+
+    fn referer_token_authorized(&self, request: &Request<Incoming>) -> bool {
+        request.headers().get_all(REFERER).iter().any(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(referer_query_token)
                 .map(|token| self.token_matches(&token))
                 .unwrap_or(false)
         })
@@ -1176,8 +1292,30 @@ impl RemoteRuntimeState {
     }
 
     async fn dispatch_app_desktop_api_fetch_request(&self, message: &Value) -> Option<Value> {
+        if let Some(response) = self.dispatch_app_frontend_compat_fetch_request(message) {
+            return Some(response);
+        }
         let transcribe_api = self.transcribe_api.lock().await.clone();
         custom_transcribe_fetch_response(message, &transcribe_api, "app").await
+    }
+
+    fn dispatch_app_frontend_compat_fetch_request(&self, message: &Value) -> Option<Value> {
+        let request_id = message
+            .get("requestId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let fetch_request = bridge_fetch_request(message)?;
+        if fetch_request.endpoint != "ide-context" {
+            return None;
+        }
+        let codex_home = crate::config::default_codex_home();
+        let body = cli_frontend_compat_endpoint_response(
+            &fetch_request.endpoint,
+            &fetch_request.body,
+            &codex_home,
+            &self.config.workspace_name,
+        )?;
+        Some(fetch_response_body_success(request_id, body))
     }
 
     async fn dispatch_app_web_bridge_socket_payload_with_emitter<F>(
@@ -1189,22 +1327,64 @@ impl RemoteRuntimeState {
         F: Fn(Value) + Send + Sync,
     {
         let (id, message) = cdp_resources::parse_web_bridge_socket_message(raw);
+        let is_heartbeat = matches!(&message, Ok(message) if cdp_resources::is_web_bridge_socket_heartbeat(message));
+        match &message {
+            Ok(message) if !is_heartbeat => {
+                eprintln!(
+                    "[codex-web] app socket request id={} message={}",
+                    id.as_deref().unwrap_or(""),
+                    cli_bridge_message_label(message)
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "[codex-web] app socket request parse failed id={} error={}",
+                    id.as_deref().unwrap_or(""),
+                    err
+                );
+            }
+            _ => {}
+        }
         if let Ok(message) = &message {
             if let Some(response) = self.dispatch_app_desktop_api_fetch_request(message).await {
-                return cdp_resources::web_bridge_socket_response(
+                let response = cdp_resources::web_bridge_socket_response(
                     id,
                     Ok(json!({ "messages": [response] })),
                 );
+                if !is_heartbeat {
+                    eprintln!(
+                        "[codex-web] app socket response id={} labels={}",
+                        response.get("id").and_then(Value::as_str).unwrap_or(""),
+                        cli_bridge_response_labels(&response)
+                    );
+                }
+                return response;
             }
         }
 
-        cdp_resources::dispatch_web_bridge_socket_payload_with_emitter(
+        let response = cdp_resources::dispatch_web_bridge_socket_payload_with_emitter(
             &self.config.cdp_host,
             self.config.cdp_port,
             raw,
             emit,
         )
-        .await
+        .await;
+        if !is_heartbeat {
+            if let Some(err) = response.get("error").and_then(Value::as_str) {
+                eprintln!(
+                    "[codex-web] app socket response id={} error={}",
+                    response.get("id").and_then(Value::as_str).unwrap_or(""),
+                    err
+                );
+            } else {
+                eprintln!(
+                    "[codex-web] app socket response id={} labels={}",
+                    response.get("id").and_then(Value::as_str).unwrap_or(""),
+                    cli_bridge_response_labels(&response)
+                );
+            }
+        }
+        response
     }
 
     fn handle_app_web_bridge_socket_text(
@@ -1305,6 +1485,7 @@ impl RemoteRuntimeState {
         channel: WsChannel,
     ) {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
+        eprintln!("[remote] {} websocket opened id={}", channel.label(), id);
         let (tx, mut rx) = mpsc::unbounded_channel();
         match channel {
             WsChannel::Control => {
@@ -1356,6 +1537,7 @@ impl RemoteRuntimeState {
                 self.update_screencast_streaming().await;
             }
         }
+        eprintln!("[remote] {} websocket closed id={}", channel.label(), id);
     }
 
     async fn handle_control_message(&self, client: ControlTarget, raw: &str) {
@@ -4819,6 +5001,7 @@ fn cli_frontend_compat_endpoint_response(
         })),
         "codex-command-keymap-state" => Some(Value::Null),
         "codex-home" => Some(json!({ "codexHome": codex_home })),
+        "ide-context" => Some(json!({ "ideContext": Value::Null })),
         "extension-info" => Some(json!({
             "name": "CodexL",
             "version": env!("CARGO_PKG_VERSION"),
@@ -6196,19 +6379,60 @@ fn cli_bridge_message_label(message: &Value) -> String {
         "fetch" => bridge_fetch_request(message)
             .map(|request| format!("fetch:{}", request.endpoint))
             .unwrap_or_else(|| "fetch:?".to_string()),
-        "fetch-response" => format!(
-            "fetch-response:{}:{}",
-            message
-                .get("requestId")
+        "fetch-response" => {
+            let status = message
+                .get("status")
+                .and_then(Value::as_u64)
+                .map(|status| format!(":{status}"))
+                .unwrap_or_default();
+            let error = message
+                .get("error")
                 .and_then(Value::as_str)
-                .unwrap_or(""),
-            message
-                .get("responseType")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-        ),
+                .map(|error| {
+                    let mut preview = error
+                        .chars()
+                        .map(|ch| if ch.is_control() { ' ' } else { ch })
+                        .take(120)
+                        .collect::<String>();
+                    if error.chars().count() > preview.chars().count() {
+                        preview.push_str("...");
+                    }
+                    format!(":{preview}")
+                })
+                .unwrap_or_default();
+            format!(
+                "fetch-response:{}:{}{}{}",
+                message
+                    .get("requestId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                message
+                    .get("responseType")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                status,
+                error
+            )
+        }
         "ipc-broadcast" => {
             let params = message.get("params");
+            if message.get("method").and_then(Value::as_str) == Some("client-status-changed") {
+                return format!(
+                    "ipc-broadcast:client-status-changed:{}:{}:{}",
+                    params
+                        .and_then(|params| params.get("status"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    params
+                        .and_then(|params| params.get("clientType"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    params
+                        .and_then(|params| params.get("clientId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                );
+            }
             let change = params.and_then(|params| params.get("change"));
             let turn_count = change
                 .and_then(|change| change.get("conversationState"))
@@ -7462,6 +7686,11 @@ fn cookie_value(header: &str, name: &str) -> Option<String> {
     None
 }
 
+fn referer_query_token(header: &str) -> Option<String> {
+    let query = header.split('#').next()?.split_once('?')?.1;
+    query_param(query, "token")
+}
+
 fn json_response(status: StatusCode, value: Value) -> Response<HttpBody> {
     let body = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
     Response::builder()
@@ -7664,6 +7893,23 @@ mod tests {
         );
         assert_eq!(
             cookie_value("codexl_remote_token_extra=secret", REMOTE_AUTH_COOKIE_NAME),
+            None
+        );
+    }
+
+    #[test]
+    fn referer_query_token_finds_top_level_remote_token() {
+        assert_eq!(
+            referer_query_token(
+                "http://127.0.0.1:3147/web/index.html?hostId=local&token=remote-token#hash"
+            )
+            .as_deref(),
+            Some("remote-token")
+        );
+        assert_eq!(
+            referer_query_token(
+                "http://127.0.0.1:3147/web/index.html?codexBridgeUrl=ws%3A%2F%2Flocal%2Fweb%2F_bridge%3Ftoken%3Dnested"
+            ),
             None
         );
     }
@@ -8288,6 +8534,15 @@ mod tests {
                 "Default",
             ),
             Some(json!({ "config": {} }))
+        );
+        assert_eq!(
+            cli_frontend_compat_endpoint_response(
+                "ide-context",
+                &json!({ "params": { "workspaceRoot": "/tmp/project" } }),
+                "/tmp/codex-home",
+                "Default",
+            ),
+            Some(json!({ "ideContext": Value::Null }))
         );
         assert_eq!(
             cli_frontend_compat_endpoint_response(

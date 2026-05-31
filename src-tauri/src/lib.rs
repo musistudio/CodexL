@@ -15,8 +15,8 @@ mod server;
 use config::{
     AppConfig, BotProfileConfig, CodexProfileConfigFormat, DefaultProviderProfile,
     ExistingProviderRequest, NewProviderRequest, NextAiGatewayProviderRequest,
-    UpdateNextAiGatewayProviderRequest, UpdateProviderRequest, UpdateWorkspaceRequest,
-    WorkspaceRequest, DEFAULT_PROVIDER_PROFILE_NAME,
+    RemoteCloudAuthConfig, UpdateNextAiGatewayProviderRequest, UpdateProviderRequest,
+    UpdateWorkspaceRequest, WorkspaceRequest, DEFAULT_PROVIDER_PROFILE_NAME,
 };
 use extensions::builtins::bot_bridge;
 use extensions::builtins::gateway::{config as gateway_config, service as gateway_service};
@@ -215,6 +215,28 @@ async fn update_config(
         .map(|_| ())?;
     refresh_macos_tray_menu(&app, state.inner(), &gateway_config).await;
     Ok(())
+}
+
+#[tauri::command]
+async fn update_remote_cloud_auth(
+    mut remote_cloud_auth: RemoteCloudAuthConfig,
+    remote_relay_url: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<AppConfig, String> {
+    remote_cloud_auth.normalize();
+
+    let next_config = {
+        let mut config = state.config.lock().await;
+        config.remote_cloud_auth = remote_cloud_auth;
+        config.remote_relay_url = remote_relay_url;
+        config.normalize();
+        config.save()?;
+        config.clone()
+    };
+
+    refresh_macos_tray_menu(&app, state.inner(), &next_config).await;
+    Ok(next_config)
 }
 
 async fn ensure_extensions_runtime_for_config(config: &AppConfig) -> Result<(), String> {
@@ -975,6 +997,7 @@ pub fn run() {
             get_instance_statuses,
             get_config,
             update_config,
+            update_remote_cloud_auth,
             start_remote_control,
             stop_remote_control,
             set_start_remote_on_launch,

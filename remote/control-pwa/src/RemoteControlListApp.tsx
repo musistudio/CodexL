@@ -29,7 +29,7 @@ import { decodeCodexQrFromVideo } from "../qrDecoder.js";
 
 const INSTANCE_STORAGE_KEY = "codexl-remote.instances";
 const REMOTE_MODE_WEB = "web";
-const PWA_BUILD = "20260524-codexl-runtime-bridge-v1";
+const PWA_BUILD = "20260531-web-runtime-network-v1";
 const SERVICE_WORKER_URL = `service-worker.js?v=${PWA_BUILD}`;
 const SPRING_TRANSITION = { damping: 30, mass: 0.72, stiffness: 430, type: "spring" } as const;
 const SOFT_SPRING_TRANSITION = { damping: 34, mass: 0.85, stiffness: 300, type: "spring" } as const;

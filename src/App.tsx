@@ -1265,6 +1265,7 @@ const HANDOFF_TARGET_NONE_VALUE = "__codexl_handoff_target_none__";
 const BOT_CONFIG_CUSTOM_VALUE = "__codexl_bot_config_custom__";
 const WORKSPACE_PROVIDER_GATEWAY_VALUE = "__codexl_workspace_provider_gateway__";
 const DEFAULT_CODEXL_SERVER_URL = "https://codexl.io";
+const MAX_AUTH_STATUS_REFRESH_DELAY_MS = 2_147_483_647;
 let initialAppUpdateCheckStarted = false;
 
 function isEditableTextTarget(target: EventTarget | null) {
@@ -1307,6 +1308,7 @@ function App() {
   const [weixinBotQr, setWeixinBotQr] = useState<WeixinBotQrState | null>(null);
   const [accountLoginState, setAccountLoginState] = useState<AccountLoginState>("idle");
   const [accountError, setAccountError] = useState("");
+  const [authStatusRefreshTick, setAuthStatusRefreshTick] = useState(0);
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState>({
     status: "idle",
     update: null,
@@ -1500,13 +1502,10 @@ function App() {
   }, []);
 
   const saveRemoteCloudAuth = useCallback(async (remoteCloudAuth: RemoteCloudAuthConfig, remoteRelayUrl: string) => {
-    const currentConfig = await invoke<AppConfig>("get_config");
-    const nextConfig: AppConfig = {
-      ...currentConfig,
-      remote_relay_url: normalizeRemoteRelayUrl(remoteRelayUrl),
-      remote_cloud_auth: remoteCloudAuth,
-    };
-    await invoke("update_config", { newConfig: nextConfig });
+    const nextConfig = await invoke<AppConfig>("update_remote_cloud_auth", {
+      remoteCloudAuth,
+      remoteRelayUrl: normalizeRemoteRelayUrl(remoteRelayUrl),
+    });
     setConfig(nextConfig);
   }, []);
 
@@ -1578,6 +1577,26 @@ function App() {
       showSettingsError(error);
     }
   }, [showSettingsError]);
+
+  useEffect(() => {
+    const delay = remoteCloudAuthStatusRefreshDelay(config?.remote_cloud_auth);
+    if (delay === null) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setAuthStatusRefreshTick((current) => current + 1);
+    }, delay);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [
+    config?.remote_cloud_auth.access_token,
+    config?.remote_cloud_auth.expires_at,
+    config?.remote_cloud_auth.user_id,
+    authStatusRefreshTick,
+  ]);
 
   useEffect(() => {
     document.documentElement.lang = language === "zh" ? "zh-CN" : "en";
@@ -7800,7 +7819,25 @@ function hasRemoteCloudIdentity(auth: RemoteCloudAuthConfig | null | undefined) 
     return false;
   }
 
+  if (!auth.access_token.trim()) {
+    return false;
+  }
+
   return auth.expires_at === 0 || auth.expires_at > Math.floor(Date.now() / 1000) + 60;
+}
+
+function remoteCloudAuthStatusRefreshDelay(auth: RemoteCloudAuthConfig | null | undefined) {
+  if (!auth?.user_id.trim() || !auth.access_token.trim() || auth.expires_at === 0) {
+    return null;
+  }
+
+  const refreshAtMs = auth.expires_at * 1000 - 60_000;
+  const delayMs = refreshAtMs - Date.now();
+  if (delayMs <= 0) {
+    return null;
+  }
+
+  return Math.min(delayMs, MAX_AUTH_STATUS_REFRESH_DELAY_MS);
 }
 
 function remoteCloudDisplayName(auth: RemoteCloudAuthConfig) {

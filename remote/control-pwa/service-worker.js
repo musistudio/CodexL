@@ -1,5 +1,5 @@
-const CACHE_NAME = "codexl-remote-v44-codexl-runtime-bridge";
-const WEB_CACHE_NAME = "codexl-remote-web-v12-codexl-runtime-bridge";
+const CACHE_NAME = "codexl-remote-v48-web-runtime-network";
+const WEB_CACHE_NAME = "codexl-remote-web-v16-web-runtime-network";
 const WEB_CACHE_CONFIG_KEY = new URL("__codex-web-cache-config.json", self.registration.scope).toString();
 const WEB_VERSION_CACHE_KEY = new URL("__codex-web-version.json", self.registration.scope).toString();
 const WEB_PATH_PREFIX = new URL("web/", self.registration.scope).pathname;
@@ -37,13 +37,13 @@ const ASSETS = [
   "./",
   "index.html",
   "control.html",
-  "app.js?v=20260524-codexl-runtime-bridge-v1",
-  "qrDecoder.js?v=20260524-codexl-runtime-bridge-v1",
-  "realtimeTransport.js?v=20260524-codexl-runtime-bridge-v1",
-  "react-app.css?v=20260524-codexl-runtime-bridge-v1",
-  "react-app.js?v=20260524-codexl-runtime-bridge-v1",
-  "vendor/jsQR.js?v=20260524-codexl-runtime-bridge-v1",
-  "styles.css?v=20260524-codexl-runtime-bridge-v1",
+  "app.js?v=20260531-web-runtime-network-v1",
+  "qrDecoder.js?v=20260531-web-runtime-network-v1",
+  "realtimeTransport.js?v=20260531-web-runtime-network-v1",
+  "react-app.css?v=20260531-web-runtime-network-v1",
+  "react-app.js?v=20260531-web-runtime-network-v1",
+  "vendor/jsQR.js?v=20260531-web-runtime-network-v1",
+  "styles.css?v=20260531-web-runtime-network-v1",
   "manifest.webmanifest",
   "icon.png",
 ].map((asset) => new URL(asset, self.registration.scope).toString());
@@ -200,7 +200,35 @@ async function prepareWebCacheUnlocked(message) {
 }
 
 async function webResourceResponse(request) {
+  if (shouldFetchWebResourceFromNetworkFirst(request)) {
+    const response = await networkWebResourceResponse(request);
+    if (response) {
+      return response;
+    }
+  }
   return webCacheFirst(request);
+}
+
+function shouldFetchWebResourceFromNetworkFirst(request) {
+  try {
+    const url = new URL(request.url);
+    const tail = webResourcePathTail(url.pathname);
+    return tail === "" || tail.endsWith(".html") || tail.startsWith("_");
+  } catch {
+    return false;
+  }
+}
+
+async function networkWebResourceResponse(request) {
+  try {
+    const response = await fetch(request, { cache: "no-store" });
+    if (response.ok) {
+      return response;
+    }
+  } catch {
+    // Fall back to the prepared web cache when the remote endpoint is unavailable.
+  }
+  return null;
 }
 
 async function webCacheFirst(request) {

@@ -175,6 +175,8 @@ pub async fn get_web_resource(
         if let Ok(text) = String::from_utf8(bytes.to_vec()) {
             let sanitized = strip_html_content_security_policy(&text);
             let rewritten = rewrite_html_resource_links(&sanitized, WEB_PATH_PREFIX);
+            let rewritten =
+                append_html_asset_auth_query(&rewritten, WEB_PATH_PREFIX, request_query);
             bytes = Bytes::from(inject_web_bridge_script(&rewritten, request_query));
         }
     } else if content_type.starts_with("text/css") {
@@ -1561,6 +1563,21 @@ pub(super) fn rewrite_html_resource_links(input: &str, prefix: &str) -> String {
     rewrite_css_resource_links(&output, prefix)
 }
 
+pub(super) fn append_html_asset_auth_query(
+    input: &str,
+    prefix: &str,
+    request_query: Option<&str>,
+) -> String {
+    let Some(auth_query) = web_bridge_script_auth_query(request_query) else {
+        return input.to_string();
+    };
+    let mut output = input.to_string();
+    for marker in ["src=\"", "src='", "href=\"", "href='"] {
+        output = append_auth_query_after_html_marker(&output, marker, prefix, &auth_query);
+    }
+    output
+}
+
 pub(super) fn strip_html_content_security_policy(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut index = 0;
@@ -1670,6 +1687,94 @@ fn web_bridge_script_auth_query(request_query: Option<&str>) -> Option<String> {
     } else {
         Some(filtered)
     }
+}
+
+fn append_auth_query_after_html_marker(
+    input: &str,
+    marker: &str,
+    prefix: &str,
+    auth_query: &str,
+) -> String {
+    let quote = marker.as_bytes().last().copied().unwrap_or(b'"') as char;
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+    while let Some(relative_pos) = input[index..].find(marker) {
+        let marker_start = index + relative_pos;
+        let value_start = marker_start + marker.len();
+        let Some(value_end_offset) = input[value_start..].find(quote) else {
+            break;
+        };
+        let value_end = value_start + value_end_offset;
+        let value = &input[value_start..value_end];
+        output.push_str(&input[index..value_start]);
+        if html_value_is_local_asset(value, prefix) && !html_value_has_auth_query(value) {
+            output.push_str(&append_query_to_html_value(value, auth_query));
+        } else {
+            output.push_str(value);
+        }
+        index = value_end;
+    }
+    output.push_str(&input[index..]);
+    output
+}
+
+fn html_value_is_local_asset(value: &str, prefix: &str) -> bool {
+    if value.is_empty()
+        || value.starts_with('#')
+        || value.starts_with("data:")
+        || value.starts_with("http:")
+        || value.starts_with("https:")
+        || value.starts_with("//")
+    {
+        return false;
+    }
+    let path = value
+        .split('#')
+        .next()
+        .unwrap_or(value)
+        .split('?')
+        .next()
+        .unwrap_or(value)
+        .trim_start_matches("./");
+    path.starts_with("assets/")
+        || path.starts_with(&format!("{}/assets/", prefix.trim_start_matches('/')))
+        || path.starts_with("/assets/")
+        || path.starts_with(&format!("{}/assets/", prefix))
+}
+
+fn html_value_has_auth_query(value: &str) -> bool {
+    let Some(query) = value
+        .split('#')
+        .next()
+        .unwrap_or(value)
+        .split_once('?')
+        .map(|(_, query)| query)
+    else {
+        return false;
+    };
+    html_query_has_key(query, "token")
+        || html_query_has_key(query, "auth")
+        || html_query_has_key(query, "jwt")
+}
+
+fn html_query_has_key(query: &str, key: &str) -> bool {
+    query
+        .split('&')
+        .any(|part| part.split_once('=').map(|(name, _)| name).unwrap_or(part) == key)
+}
+
+fn append_query_to_html_value(value: &str, query: &str) -> String {
+    let (without_hash, hash) = match value.split_once('#') {
+        Some((value, hash)) => (value, Some(hash)),
+        None => (value, None),
+    };
+    let separator = if without_hash.contains('?') { '&' } else { '?' };
+    let mut output = format!("{}{}{}", without_hash, separator, query);
+    if let Some(hash) = hash {
+        output.push('#');
+        output.push_str(hash);
+    }
+    output
 }
 
 fn rewrite_absolute_paths_after_marker(input: &str, marker: &str, prefix: &str) -> String {

@@ -1088,11 +1088,18 @@ where
     F: Fn(Value) + Send + Sync,
 {
     let (id, message) = parse_web_bridge_socket_message(raw);
-    eprintln!(
-        "[codex-web] bridge socket message: id={} parseOk={}",
-        id.as_deref().unwrap_or("<none>"),
-        message.is_ok()
-    );
+    match &message {
+        Ok(message) => eprintln!(
+            "[codex-web] bridge socket message: id={} parseOk=true {}",
+            id.as_deref().unwrap_or("<none>"),
+            web_bridge_socket_message_log_label(message)
+        ),
+        Err(err) => eprintln!(
+            "[codex-web] bridge socket message: id={} parseOk=false error={}",
+            id.as_deref().unwrap_or("<none>"),
+            err
+        ),
+    }
     let result = match message {
         Ok(message) if is_web_bridge_socket_heartbeat(&message) => {
             Ok(json!({ "type": "bridge-heartbeat-ack" }))
@@ -1104,6 +1111,45 @@ where
         Err(err) => Err(err),
     };
     web_bridge_socket_response(id, result)
+}
+
+fn web_bridge_socket_message_log_label(message: &Value) -> String {
+    let mut parts = Vec::new();
+    let message_type = message
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    parts.push(format!("type={}", log_bridge_value(message_type)));
+    if let Some(request_id) = message.get("requestId").and_then(Value::as_str) {
+        parts.push(format!("requestId={}", log_bridge_value(request_id)));
+    }
+    if let Some(url) = message.get("url").and_then(Value::as_str) {
+        parts.push(format!("url={}", log_bridge_url(url)));
+    }
+    if let Some(method) = message
+        .get("request")
+        .and_then(|request| request.get("method"))
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("method={}", log_bridge_value(method)));
+    }
+    parts.join(" ")
+}
+
+fn log_bridge_url(url: &str) -> String {
+    log_bridge_value(url.split('?').next().unwrap_or(url))
+}
+
+fn log_bridge_value(value: &str) -> String {
+    let mut preview = value
+        .chars()
+        .map(|ch| if ch.is_control() { '_' } else { ch })
+        .take(120)
+        .collect::<String>();
+    if value.chars().count() > preview.chars().count() {
+        preview.push_str("...");
+    }
+    preview
 }
 
 pub(crate) fn is_web_bridge_socket_heartbeat(message: &Value) -> bool {

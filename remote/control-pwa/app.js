@@ -1,5 +1,5 @@
-import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260524-codexl-runtime-bridge-v1";
-import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260524-codexl-runtime-bridge-v1";
+import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260531-web-runtime-network-v1";
+import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260531-web-runtime-network-v1";
 
 const urlParams = new URLSearchParams(location.search);
 const initialConnection = connectionFromUrlParams(urlParams);
@@ -14,6 +14,8 @@ const WEB_BRIDGE_STATUS_MESSAGE = "codex-web-bridge-status";
 const WEB_RECONNECT_MAX_MS = 8000;
 const WEB_RECONNECT_MIN_MS = 1000;
 const WEB_CACHE_PREPARE_TIMEOUT_MS = 120000;
+const REMOTE_INFO_AUTH_ERROR = "remote-info-auth";
+const REMOTE_INFO_UNAVAILABLE_ERROR = "remote-info-unavailable";
 const DEFAULT_WEB_ASSET_REGISTRY_URL = "https://web.codexl.io";
 const VIEWPORT_SEND_DEBOUNCE_MS = 120;
 const PAGE_ZOOM_SEND_DEBOUNCE_MS = 120;
@@ -35,7 +37,7 @@ const SIDEBAR_SWIPE_RIGHT_OPEN_REGION_RATIO = 0.22;
 const SIDEBAR_SWIPE_MIN_DISTANCE_PX = 72;
 const SIDEBAR_SWIPE_MAX_VERTICAL_PX = 52;
 const SIDEBAR_SWIPE_DIRECTION_RATIO = 1.35;
-const PWA_BUILD = "20260524-codexl-runtime-bridge-v1";
+const PWA_BUILD = "20260531-web-runtime-network-v1";
 const WEB_BRIDGE_URL_PARAM = "codexBridgeUrl";
 const PARENT_BRIDGE_OPEN_MESSAGE = "codex-web-parent-bridge-open";
 const PARENT_BRIDGE_OPENED_MESSAGE = "codex-web-parent-bridge-opened";
@@ -816,7 +818,21 @@ async function startConnection(connection, { instanceId = connection.id || "" } 
   remoteOrigin = connectionUrl.origin;
   remotePathPrefix = websocketBasePath(connectionUrl.pathname);
 
-  const remoteInfo = await fetchRemoteInfo();
+  let remoteInfo = null;
+  try {
+    remoteInfo = await fetchRemoteInfo();
+  } catch (error) {
+    const message = error?.message || "Remote connection unavailable.";
+    setScanStatus(message);
+    setStatus(message);
+    if (emptyState) {
+      emptyState.textContent = message;
+    }
+    if (instanceId) {
+      updateInstanceStatus(instanceId, message);
+    }
+    return;
+  }
   const requiresPassword = connectionRequiresPassword(connection, connectionUrl, remoteInfo);
   if (requiresPassword && (!remoteCrypto || remoteCrypto.token !== nextToken)) {
     remoteCrypto = null;
@@ -2350,15 +2366,29 @@ async function fetchRemoteInfo() {
     const response = await fetch(infoUrl, { cache: "no-store", signal: controller.signal }).finally(() => {
       window.clearTimeout(timeout);
     });
+    if (response.status === 401 || response.status === 403) {
+      throw remoteInfoError(REMOTE_INFO_AUTH_ERROR, "Connection token expired. Scan the latest remote QR code.");
+    }
     if (!response.ok) {
       return null;
     }
     const info = await response.json();
     return info && typeof info === "object" ? info : null;
   } catch (error) {
-    console.warn("[remote-info] unable to load connection metadata", error);
-    return null;
+    if (error?.code === REMOTE_INFO_AUTH_ERROR) {
+      throw error;
+    }
+    if (error?.name === "AbortError") {
+      throw remoteInfoError(REMOTE_INFO_UNAVAILABLE_ERROR, "Remote metadata timed out.");
+    }
+    throw remoteInfoError(REMOTE_INFO_UNAVAILABLE_ERROR, "Remote service is unavailable.");
   }
+}
+
+function remoteInfoError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
 }
 
 function webAssetRegistryEnabled() {
@@ -2828,7 +2858,7 @@ function canLoadWebFrameDirectly() {
 }
 
 function shouldOpenRemoteControlPageDirectly() {
-  return location.protocol === "https:" && remoteOrigin.startsWith("http:") && !webAssetRegistryEnabled();
+  return location.protocol === "https:" && remoteOrigin.startsWith("http:");
 }
 
 function openRemoteControlPageDirectly() {
@@ -3108,6 +3138,28 @@ function retryingStatus(text) {
   return /\bretrying\b/i.test(value) ? value : `${value}, retrying`;
 }
 
+function markWebBridgeConnected(reason = "bridge") {
+  if (state.remoteMode !== REMOTE_MODE_WEB) {
+    return;
+  }
+  const wasConnected = state.connected && state.webFrameLoaded;
+  const connectedAt = Date.now();
+  state.connected = true;
+  state.webFrameLoaded = true;
+  state.webBridgeLastConnectedAt = connectedAt;
+  state.webReconnectDelayMs = WEB_RECONNECT_MIN_MS;
+  clearReconnectTimer();
+  clearWebBridgeStaleTimer();
+  applyRemoteModeLayout();
+  setStatus("Web connected");
+  if (!wasConnected) {
+    console.info("[remote-control] web bridge connected", { reason });
+  }
+  if (activeInstanceId) {
+    updateInstanceStatus(activeInstanceId, "Web connected", { lastConnectedAt: connectedAt });
+  }
+}
+
 function handleWebBridgeStatusMessage(event) {
   if (handleParentBridgeFrameMessage(event)) {
     return;
@@ -3116,7 +3168,12 @@ function handleWebBridgeStatusMessage(event) {
   if (!message || message.type !== WEB_BRIDGE_STATUS_MESSAGE) {
     return;
   }
-  if (webFrame?.contentWindow && event.source && event.source !== webFrame.contentWindow) {
+  if (!isExpectedWebFrameMessage(event)) {
+    console.info("[remote-control] ignored web bridge status from unexpected frame", {
+      expectedOrigin: webFrameTargetOrigin(),
+      origin: event.origin || "",
+      status: message.status || "",
+    });
     return;
   }
   if (state.remoteMode !== REMOTE_MODE_WEB) {
@@ -3125,17 +3182,7 @@ function handleWebBridgeStatusMessage(event) {
 
   const status = String(message.status || "");
   if (status === "connected") {
-    state.connected = true;
-    state.webFrameLoaded = true;
-    state.webBridgeLastConnectedAt = Date.now();
-    state.webReconnectDelayMs = WEB_RECONNECT_MIN_MS;
-    clearReconnectTimer();
-    clearWebBridgeStaleTimer();
-    applyRemoteModeLayout();
-    setStatus("Web connected");
-    if (activeInstanceId) {
-      updateInstanceStatus(activeInstanceId, "Web connected", { lastConnectedAt: Date.now() });
-    }
+    markWebBridgeConnected("status");
     return;
   }
 
@@ -3163,7 +3210,12 @@ function handleParentBridgeFrameMessage(event) {
   ) {
     return false;
   }
-  if (!webFrame?.contentWindow || event.source !== webFrame.contentWindow) {
+  if (!isExpectedWebFrameMessage(event)) {
+    console.info("[remote-control] ignored parent bridge message from unexpected frame", {
+      expectedOrigin: webFrameTargetOrigin(),
+      origin: event.origin || "",
+      type,
+    });
     return true;
   }
   const clientId = typeof message.clientId === "string" ? message.clientId : "";
@@ -3183,6 +3235,7 @@ function handleParentBridgeFrameMessage(event) {
 function openParentBridgeClient(clientId) {
   const existing = parentBridgeClients.get(clientId);
   if (existing?.socket?.readyState === WebSocket.OPEN) {
+    markWebBridgeConnected("parent-existing");
     postParentBridgeFrameMessage(clientId, { type: PARENT_BRIDGE_OPENED_MESSAGE });
     return;
   }
@@ -3197,9 +3250,11 @@ function openParentBridgeClient(clientId) {
 
   socket.addEventListener("open", () => {
     client.opened = true;
+    markWebBridgeConnected("parent-open");
     postParentBridgeFrameMessage(clientId, { type: PARENT_BRIDGE_OPENED_MESSAGE });
   });
   socket.addEventListener("message", (event) => {
+    markWebBridgeConnected("parent-message");
     postParentBridgeFrameMessage(clientId, {
       raw: typeof event.data === "string" ? event.data : "",
       type: PARENT_BRIDGE_MESSAGE,
@@ -3266,6 +3321,17 @@ function postParentBridgeFrameMessage(clientId, payload) {
     },
     webFrameTargetOrigin(),
   );
+}
+
+function isExpectedWebFrameMessage(event) {
+  if (!webFrame?.contentWindow) {
+    return false;
+  }
+  if (event.source === webFrame.contentWindow) {
+    return true;
+  }
+  const expectedOrigin = webFrameTargetOrigin();
+  return Boolean(event.origin && expectedOrigin !== "*" && event.origin === expectedOrigin);
 }
 
 function webFrameTargetOrigin() {

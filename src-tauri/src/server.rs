@@ -211,6 +211,31 @@ pub async fn launch_codex_instance(
     }
     macos::request_automation_permission(&executable)?;
 
+    let requested_remote_frontend_mode = requested_config
+        .provider_profile(&requested_config.active_provider)
+        .map(|profile| config::normalized_remote_frontend_mode(&profile.remote_frontend_mode))
+        .unwrap_or_else(|| config::REMOTE_FRONTEND_MODE_APP.to_string());
+    if should_reuse_external_cdp_endpoint(&base_config, &request, &profile_name)
+        && !config::remote_frontend_mode_uses_cli(&requested_remote_frontend_mode)
+    {
+        let external_info = launch_info(&requested_config, None, None);
+        if cdp_endpoint_has_codex_app_target(&external_info).await {
+            let mut info = external_info;
+            info.running = true;
+            eprintln!(
+                "Reusing existing Codex CDP endpoint for profile {} at http://{}:{}",
+                info.profile_name, info.cdp_host, info.cdp_port
+            );
+            cdp_resources::spawn_codex_plugin_injector(
+                info.cdp_host.clone(),
+                info.cdp_port,
+                info.http_host.clone(),
+                info.http_port,
+            );
+            return Ok(info);
+        }
+    }
+
     let mut instances = state.instances.lock().await;
     if let Some(instance) = instances.get_mut(&profile_name) {
         if let Some(pid) = running_child_pid(&mut instance.child)? {
@@ -350,6 +375,32 @@ fn apply_launch_request(config: &mut AppConfig, request: &LaunchRequest) -> Resu
     Ok(())
 }
 
+fn should_reuse_external_cdp_endpoint(
+    base_config: &AppConfig,
+    request: &LaunchRequest,
+    requested_profile_name: &str,
+) -> bool {
+    if requested_profile_name != base_config.active_provider {
+        return false;
+    }
+    if let Some(profile_name) = request
+        .profile_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if profile_name != base_config.active_provider {
+            return false;
+        }
+    }
+    request
+        .codex_home
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+}
+
 fn requires_new_process(current: &LaunchInfo, requested: &AppConfig) -> bool {
     let requested_proxy_url = requested
         .provider_profile(&requested.active_provider)
@@ -417,7 +468,12 @@ pub async fn current_launch_info(state: &AppState) -> Result<LaunchInfo, String>
         return Ok(info);
     }
     let config = state.config.lock().await.clone();
-    Ok(launch_info(&config, None, None))
+    let mut info = launch_info(&config, None, None);
+    if !config::remote_frontend_mode_uses_cli(&info.core_mode) && cdp_endpoint_is_alive(&info).await
+    {
+        info.running = true;
+    }
+    Ok(info)
 }
 
 pub async fn instance_statuses(state: &AppState) -> Result<Vec<InstanceStatus>, String> {
@@ -1168,7 +1224,7 @@ async fn bridge_websocket(
 
 async fn running_launch_infos(state: &AppState) -> Result<Vec<LaunchInfo>, String> {
     let mut stopped_profiles = Vec::new();
-    let infos = {
+    let mut infos = {
         let mut instances = state.instances.lock().await;
         let mut infos = Vec::new();
 
@@ -1196,6 +1252,17 @@ async fn running_launch_infos(state: &AppState) -> Result<Vec<LaunchInfo>, Strin
 
     if !stopped_profiles.is_empty() {
         stop_gateway_if_no_running_next_ai_instances(state).await?;
+    }
+
+    if infos.is_empty() {
+        let config = state.config.lock().await.clone();
+        let mut info = launch_info(&config, None, None);
+        if !config::remote_frontend_mode_uses_cli(&info.core_mode)
+            && cdp_endpoint_is_alive(&info).await
+        {
+            info.running = true;
+            infos.push(info);
+        }
     }
 
     Ok(infos)
@@ -1253,6 +1320,35 @@ async fn cdp_endpoint_is_alive(info: &LaunchInfo) -> bool {
         return false;
     };
     response.status().is_success()
+}
+
+async fn cdp_endpoint_has_codex_app_target(info: &LaunchInfo) -> bool {
+    let url = format!("http://{}:{}/json/list", info.cdp_host, info.cdp_port);
+    let Ok(result) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), reqwest::get(url)).await
+    else {
+        return false;
+    };
+    let Ok(response) = result else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Ok(targets) = response.json::<serde_json::Value>().await else {
+        return false;
+    };
+    cdp_target_list_has_codex_app_target(&targets)
+}
+
+fn cdp_target_list_has_codex_app_target(targets: &serde_json::Value) -> bool {
+    targets.as_array().into_iter().flatten().any(|target| {
+        target.get("type").and_then(serde_json::Value::as_str) == Some("page")
+            && target
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|url| url == "app://-/index.html")
+    })
 }
 
 fn launch_info_from_instance(info: &LaunchInfo, pid: Option<u32>) -> LaunchInfo {
@@ -1461,5 +1557,58 @@ mod tests {
         assert!(actual_port > preferred_port);
         drop(listener);
         drop(occupied);
+    }
+
+    #[test]
+    fn external_cdp_reuse_is_limited_to_active_profile() {
+        let mut config = AppConfig {
+            active_provider: "default".to_string(),
+            ..AppConfig::default()
+        };
+        config.provider_profiles = vec![
+            config::ProviderProfile {
+                id: "default".to_string(),
+                name: "Default".to_string(),
+                ..config::ProviderProfile::default()
+            },
+            config::ProviderProfile {
+                id: "nextai".to_string(),
+                name: "nextai".to_string(),
+                ..config::ProviderProfile::default()
+            },
+        ];
+
+        assert!(should_reuse_external_cdp_endpoint(
+            &config,
+            &LaunchRequest::default(),
+            "default"
+        ));
+        assert!(!should_reuse_external_cdp_endpoint(
+            &config,
+            &LaunchRequest {
+                profile_name: Some("nextai".to_string()),
+                ..LaunchRequest::default()
+            },
+            "nextai"
+        ));
+        assert!(!should_reuse_external_cdp_endpoint(
+            &config,
+            &LaunchRequest {
+                codex_home: Some("/tmp/other-codex-home".to_string()),
+                ..LaunchRequest::default()
+            },
+            "default"
+        ));
+    }
+
+    #[test]
+    fn cdp_target_list_requires_codex_app_page() {
+        assert!(cdp_target_list_has_codex_app_target(&json!([
+            { "type": "page", "url": "app://-/index.html" }
+        ])));
+        assert!(!cdp_target_list_has_codex_app_target(&json!([
+            { "type": "page", "url": "https://example.com" },
+            { "type": "service_worker", "url": "app://-/index.html" }
+        ])));
     }
 }

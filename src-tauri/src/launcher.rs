@@ -209,19 +209,22 @@ pub fn stop_stale_profile_processes(profile_name: &str) -> Result<(), String> {
 
         for entry in entries
             .iter()
-            .filter(|entry| is_codex_app_server_for_profile(&entry.command, profile_name))
+            .filter(|entry| is_codex_process_for_profile(&entry.command, profile_name))
         {
             pids.insert(entry.pid);
             pgids.insert(entry.pgid);
 
-            if let Some(parent) = entries.iter().find(|parent| {
-                parent.pid == entry.ppid && is_codexl_middleware_command(&parent.command)
-            }) {
-                pids.insert(parent.pid);
-                collect_descendant_pids(&entries, parent.pid, &mut pids);
-            } else {
-                collect_descendant_pids(&entries, entry.pid, &mut pids);
+            if is_codex_app_server_for_profile(&entry.command, profile_name) {
+                if let Some(parent) = entries.iter().find(|parent| {
+                    parent.pid == entry.ppid && is_codexl_middleware_command(&parent.command)
+                }) {
+                    pids.insert(parent.pid);
+                    collect_descendant_pids(&entries, parent.pid, &mut pids);
+                    continue;
+                }
             }
+
+            collect_descendant_pids(&entries, entry.pid, &mut pids);
         }
 
         for entry in entries.iter().filter(|entry| pgids.contains(&entry.pgid)) {
@@ -248,17 +251,20 @@ pub fn stop_stale_profile_processes(profile_name: &str) -> Result<(), String> {
 
         for entry in entries
             .iter()
-            .filter(|entry| is_codex_app_server_for_profile(&entry.command, profile_name))
+            .filter(|entry| is_codex_process_for_profile(&entry.command, profile_name))
         {
             pids.insert(entry.pid);
-            if let Some(parent) = entries.iter().find(|parent| {
-                parent.pid == entry.ppid && is_codexl_middleware_command(&parent.command)
-            }) {
-                pids.insert(parent.pid);
-                collect_windows_descendant_pids(&entries, parent.pid, &mut pids);
-            } else {
-                collect_windows_descendant_pids(&entries, entry.pid, &mut pids);
+            if is_codex_app_server_for_profile(&entry.command, profile_name) {
+                if let Some(parent) = entries.iter().find(|parent| {
+                    parent.pid == entry.ppid && is_codexl_middleware_command(&parent.command)
+                }) {
+                    pids.insert(parent.pid);
+                    collect_windows_descendant_pids(&entries, parent.pid, &mut pids);
+                    continue;
+                }
             }
+
+            collect_windows_descendant_pids(&entries, entry.pid, &mut pids);
         }
 
         for entry in entries
@@ -959,6 +965,32 @@ fn is_codex_app_server_for_profile(command: &str, profile_name: &str) -> bool {
 }
 
 #[cfg(any(unix, windows))]
+fn is_codex_process_for_profile(command: &str, profile_name: &str) -> bool {
+    is_codex_app_server_for_profile(command, profile_name)
+        || is_codex_electron_app_for_profile(command, profile_name)
+}
+
+#[cfg(any(unix, windows))]
+fn is_codex_electron_app_for_profile(command: &str, profile_name: &str) -> bool {
+    if !command_looks_like_codex_electron_app(command) {
+        return false;
+    }
+    let segment = safe_path_segment(profile_name);
+    let normalized = command.replace('\\', "/");
+    normalized.contains(&format!("/codex-app-user-data/{}", segment))
+        || normalized.contains(&format!("--user-data-dir={}", segment))
+}
+
+#[cfg(any(unix, windows))]
+fn command_looks_like_codex_electron_app(command: &str) -> bool {
+    let normalized = command.replace('\\', "/").to_ascii_lowercase();
+    (normalized.contains(".app/contents/macos/codex")
+        || normalized.contains("/codex.exe")
+        || normalized.ends_with("codex.exe"))
+        && normalized.contains("--remote-debugging-port=")
+}
+
+#[cfg(any(unix, windows))]
 fn command_looks_like_codex_app_server(command: &str) -> bool {
     let normalized = command.replace('\\', "/").to_ascii_lowercase();
     normalized.contains(".app/contents/resources/codex")
@@ -1143,6 +1175,18 @@ mod tests {
 
         assert!(is_codex_app_server_for_profile(command, "nextai"));
         assert!(!is_codex_app_server_for_profile(command, "other"));
+    }
+
+    #[test]
+    fn detects_codex_electron_app_for_profile() {
+        let command = "/Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9227 --user-data-dir=/Users/me/.codex/.codexl/codex-app-user-data/17fd99a1";
+
+        assert!(is_codex_electron_app_for_profile(command, "17fd99a1"));
+        assert!(!is_codex_electron_app_for_profile(command, "other"));
+        assert!(!is_codex_electron_app_for_profile(
+            "/Applications/Codex.app/Contents/Resources/codex app-server",
+            "17fd99a1"
+        ));
     }
 
     #[test]
