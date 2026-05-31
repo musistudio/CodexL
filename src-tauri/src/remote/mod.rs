@@ -4957,6 +4957,7 @@ fn cli_statsig_initialize_response() -> Value {
         "feature_gates": {
             "4100906017": cli_enabled_feature_gate("4100906017"),
             "2380644311": cli_enabled_feature_gate("2380644311"),
+            "1506311413": cli_enabled_feature_gate("1506311413"),
         },
         "dynamic_configs": {},
         "layer_configs": {},
@@ -8353,6 +8354,13 @@ mod tests {
         assert_eq!(
             feature_gates
                 .get("2380644311")
+                .and_then(|gate| gate.get("value"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            feature_gates
+                .get("1506311413")
                 .and_then(|gate| gate.get("value"))
                 .and_then(Value::as_bool),
             Some(true)

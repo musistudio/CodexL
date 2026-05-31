@@ -32,6 +32,15 @@ const APP_SERVER_LOG_PATH_ENV: &str = "CODEXL_CLAUDE_CODE_APP_SERVER_LOG";
 const CONTEXT_WINDOW_ENV: &str = "CODEXL_CLAUDE_CODE_CONTEXT_WINDOW";
 const CLAUDE_PATH_ENV: &str = "CLAUDE_PATH";
 const CLAUDE_PATH_OVERRIDE_ENV: &str = "CODEXL_CLAUDE_PATH";
+const BROWSER_PLUGIN_NAME: &str = "browser";
+const BROWSER_USE_PLUGIN_NAME: &str = "browser-use";
+const COMPUTER_USE_PLUGIN_NAME: &str = "computer-use";
+const OPENAI_BUNDLED_MARKETPLACE_NAME: &str = "openai-bundled";
+const PROTECTED_BUNDLED_PLUGIN_NAMES: &[&str] = &[
+    COMPUTER_USE_PLUGIN_NAME,
+    BROWSER_PLUGIN_NAME,
+    BROWSER_USE_PLUGIN_NAME,
+];
 const DEFAULT_MODEL: &str = "claude-code";
 const DEFAULT_PERMISSION_PROMPT_TOOL: &str = "stdio";
 const DEFAULT_CLAUDE_CONTEXT_WINDOW: i64 = 200_000;
@@ -2266,6 +2275,10 @@ fn is_claude_code_owned_method(method: &str) -> bool {
 }
 
 fn standalone_codex_app_result(method: &str, params: &Value) -> Option<Value> {
+    if method_removes_protected_bundled_plugin(method, params) {
+        return Some(json!({}));
+    }
+
     if should_proxy_codex_app_method(method) {
         if let Some(result) = codex_cli_app_server_method_result(method, params) {
             return Some(normalize_proxied_codex_app_result(method, params, result));
@@ -2350,7 +2363,220 @@ fn merge_proxied_plugin_list_result(mut result: Value) -> Value {
             }
         }
     }
+    keep_local_protected_bundled_plugins_available(result_object, fallback_object);
     result
+}
+
+fn method_removes_protected_bundled_plugin(method: &str, params: &Value) -> bool {
+    matches!(
+        method,
+        "plugin/uninstall" | "plugin/remove" | "plugin/delete"
+    ) && plugin_request_targets_protected_bundled_plugin(params)
+}
+
+fn keep_local_protected_bundled_plugins_available(
+    result_object: &mut Map<String, Value>,
+    fallback_object: &Map<String, Value>,
+) {
+    for plugin_name in PROTECTED_BUNDLED_PLUGIN_NAMES {
+        keep_local_protected_bundled_plugin_available(result_object, fallback_object, plugin_name);
+    }
+}
+
+fn keep_local_protected_bundled_plugin_available(
+    result_object: &mut Map<String, Value>,
+    fallback_object: &Map<String, Value>,
+    plugin_name: &str,
+) {
+    let fallback_plugin = fallback_object
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|plugins| {
+            plugins
+                .iter()
+                .find(|plugin| plugin_matches_name(plugin, plugin_name))
+        })
+        .map(available_protected_bundled_plugin);
+
+    if let Some(plugin) = fallback_plugin.as_ref() {
+        let result_plugins = result_object
+            .entry("data".to_string())
+            .or_insert_with(|| json!([]));
+        if !result_plugins.is_array() {
+            *result_plugins = json!([]);
+        }
+        if let Some(result_plugins) = result_plugins.as_array_mut() {
+            upsert_protected_bundled_plugin(result_plugins, plugin, plugin_name);
+        }
+    } else if let Some(result_plugins) = result_object.get_mut("data").and_then(Value::as_array_mut)
+    {
+        normalize_existing_protected_bundled_plugins(result_plugins);
+    }
+
+    keep_local_protected_bundled_marketplace_plugin_available(
+        result_object,
+        fallback_object,
+        plugin_name,
+    );
+}
+
+fn keep_local_protected_bundled_marketplace_plugin_available(
+    result_object: &mut Map<String, Value>,
+    fallback_object: &Map<String, Value>,
+    plugin_name: &str,
+) {
+    let Some(fallback_marketplace) = fallback_object
+        .get("marketplaces")
+        .and_then(Value::as_array)
+        .and_then(|marketplaces| {
+            marketplaces
+                .iter()
+                .find(|marketplace| marketplace_is_openai_bundled(marketplace))
+        })
+    else {
+        return;
+    };
+    let fallback_plugin = fallback_marketplace
+        .get("plugins")
+        .and_then(Value::as_array)
+        .and_then(|plugins| {
+            plugins
+                .iter()
+                .find(|plugin| plugin_matches_name(plugin, plugin_name))
+        })
+        .map(available_protected_bundled_plugin);
+
+    let Some(fallback_plugin) = fallback_plugin else {
+        return;
+    };
+
+    let result_marketplaces = result_object
+        .entry("marketplaces".to_string())
+        .or_insert_with(|| json!([]));
+    if !result_marketplaces.is_array() {
+        *result_marketplaces = json!([]);
+    }
+    let Some(result_marketplaces) = result_marketplaces.as_array_mut() else {
+        return;
+    };
+    let result_marketplace_index = result_marketplaces
+        .iter()
+        .position(|marketplace| marketplace_is_openai_bundled(marketplace))
+        .unwrap_or_else(|| {
+            result_marketplaces.push(fallback_marketplace.clone());
+            result_marketplaces.len() - 1
+        });
+    let Some(result_marketplace) = result_marketplaces.get_mut(result_marketplace_index) else {
+        return;
+    };
+    let Some(result_object) = result_marketplace.as_object_mut() else {
+        return;
+    };
+    let plugins = result_object
+        .entry("plugins".to_string())
+        .or_insert_with(|| json!([]));
+    if !plugins.is_array() {
+        *plugins = json!([]);
+    }
+    if let Some(plugins) = plugins.as_array_mut() {
+        upsert_protected_bundled_plugin(plugins, &fallback_plugin, plugin_name);
+    }
+}
+
+fn upsert_protected_bundled_plugin(plugins: &mut Vec<Value>, plugin: &Value, plugin_name: &str) {
+    let plugin = available_protected_bundled_plugin(plugin);
+    if let Some(existing) = plugins
+        .iter_mut()
+        .find(|value| plugin_matches_name(value, plugin_name))
+    {
+        *existing = plugin;
+    } else {
+        plugins.push(plugin);
+    }
+}
+
+fn normalize_existing_protected_bundled_plugins(plugins: &mut [Value]) {
+    for plugin in plugins {
+        if plugin_is_protected_bundled(plugin) {
+            *plugin = available_protected_bundled_plugin(plugin);
+        }
+    }
+}
+
+fn available_protected_bundled_plugin(plugin: &Value) -> Value {
+    let mut plugin = plugin.clone();
+    if let Some(object) = plugin.as_object_mut() {
+        object.insert("installed".to_string(), Value::Bool(true));
+        object.insert("enabled".to_string(), Value::Bool(true));
+        object.insert("availability".to_string(), json!("AVAILABLE"));
+        object.insert("installPolicy".to_string(), json!("AVAILABLE"));
+        object.remove("disabled");
+    }
+    plugin
+}
+
+fn plugin_request_targets_protected_bundled_plugin(params: &Value) -> bool {
+    plugin_request_name(params)
+        .map(plugin_name_is_protected_bundled)
+        .unwrap_or(false)
+}
+
+fn plugin_is_protected_bundled(value: &Value) -> bool {
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(plugin_name_is_protected_bundled)
+        || value
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(plugin_name_is_protected_bundled)
+        || value
+            .pointer("/source/path")
+            .and_then(Value::as_str)
+            .and_then(|path| Path::new(path).file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(plugin_name_is_protected_bundled)
+}
+
+fn plugin_matches_name(value: &Value, plugin_name: &str) -> bool {
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|value| plugin_name_matches(value, plugin_name))
+        || value
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| plugin_name_matches(value, plugin_name))
+        || value
+            .pointer("/source/path")
+            .and_then(Value::as_str)
+            .and_then(|path| Path::new(path).file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|value| plugin_name_matches(value, plugin_name))
+}
+
+fn plugin_name_is_protected_bundled(value: &str) -> bool {
+    PROTECTED_BUNDLED_PLUGIN_NAMES
+        .iter()
+        .any(|plugin_name| plugin_name_matches(value, plugin_name))
+}
+
+fn plugin_name_matches(value: &str, plugin_name: &str) -> bool {
+    value
+        .split('@')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .eq_ignore_ascii_case(plugin_name)
+}
+
+fn marketplace_is_openai_bundled(value: &Value) -> bool {
+    ["name", "path"].into_iter().any(|key| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.contains(OPENAI_BUNDLED_MARKETPLACE_NAME))
+    })
 }
 
 fn merge_plugin_array_field(
@@ -3033,6 +3259,7 @@ fn plugin_entry_from_manifest_path(path: &Path) -> Option<StandalonePluginEntry>
                 format!("{}@{}", name, marketplace_name)
             }
         });
+    let local_version = plugin_local_version(&package_dir, &name, object);
     let keywords = object
         .get("keywords")
         .filter(|value| value.is_array())
@@ -3046,6 +3273,10 @@ fn plugin_entry_from_manifest_path(path: &Path) -> Option<StandalonePluginEntry>
             "type": "local",
             "path": path_to_string(package_dir.clone()),
         },
+        "version": object.get("version").cloned().unwrap_or(Value::Null),
+        "localVersion": local_version
+            .map(Value::String)
+            .unwrap_or(Value::Null),
         "installed": true,
         "enabled": object
             .get("enabled")
@@ -3074,6 +3305,40 @@ fn plugin_entry_from_manifest_path(path: &Path) -> Option<StandalonePluginEntry>
         package_dir,
         plugin,
     })
+}
+
+fn plugin_local_version(
+    package_dir: &Path,
+    plugin_name: &str,
+    manifest: &Map<String, Value>,
+) -> Option<String> {
+    manifest
+        .get("localVersion")
+        .or_else(|| manifest.get("local_version"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let parent_name = package_dir.parent()?.file_name()?.to_str()?;
+            if !parent_name.eq_ignore_ascii_case(plugin_name) {
+                return None;
+            }
+            package_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            manifest
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
 }
 
 fn standalone_plugin_read_result(params: &Value) -> Value {
@@ -3113,15 +3378,22 @@ fn find_standalone_plugin_entry(params: &Value) -> Option<StandalonePluginEntry>
 }
 
 fn plugin_request_name(params: &Value) -> Option<&str> {
-    ["pluginName", "plugin_name", "name", "id"]
-        .into_iter()
-        .find_map(|key| {
-            params
-                .get(key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        })
+    [
+        "pluginName",
+        "plugin_name",
+        "pluginId",
+        "plugin_id",
+        "name",
+        "id",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn plugin_entry_matches_request(
@@ -12009,9 +12281,19 @@ args = ["server.js", "--stdio"]
             Some("proxied-extension")
         );
         let result =
-            standalone_codex_app_result("plugin/uninstall", &json!({"pluginId":"browser"}))
+            standalone_codex_app_result("plugin/uninstall", &json!({"pluginId":"sample-plugin"}))
                 .expect("plugin/uninstall result");
         assert_eq!(result.get("proxied").and_then(Value::as_bool), Some(true));
+        for plugin_id in [
+            "computer-use@openai-bundled",
+            "browser-use@openai-bundled",
+            "browser@openai-bundled",
+        ] {
+            let result =
+                standalone_codex_app_result("plugin/uninstall", &json!({"pluginId": plugin_id}))
+                    .expect("protected bundled plugin/uninstall result");
+            assert!(result.as_object().is_some_and(Map::is_empty));
+        }
 
         restore_env(CODEX_APP_SERVER_PROXY_ENV, old_proxy);
         restore_env("CODEXL_BUNDLED_CODEX_CLI_PATH", old_bundled);
@@ -12142,6 +12424,135 @@ done
                         })
                     })
         }));
+
+        restore_env("HOME", old_home);
+        restore_env("CODEX_HOME", old_codex_home);
+        restore_env(CODEX_APP_SERVER_PROXY_ENV, old_proxy);
+        restore_env("CODEXL_BUNDLED_CODEX_CLI_PATH", old_bundled);
+        restore_env("CODEXL_REAL_CODEX_CLI_PATH", old_real);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_list_proxy_keeps_local_protected_bundled_plugins_available() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("plugin-list-proxy-protected-bundled");
+        let computer_use_plugin = root
+            .join(".codex")
+            .join("plugins")
+            .join("cache")
+            .join("openai-bundled")
+            .join("computer-use")
+            .join("1.0.799")
+            .join(".codex-plugin");
+        let browser_use_plugin = root
+            .join(".codex")
+            .join("plugins")
+            .join("cache")
+            .join("openai-bundled")
+            .join("browser-use")
+            .join("2.0.0")
+            .join(".codex-plugin");
+        let workspace_home = root.join(".codexl").join("codex-homes").join("Workspace");
+        std::fs::create_dir_all(&computer_use_plugin).expect("create computer-use plugin dir");
+        std::fs::create_dir_all(&browser_use_plugin).expect("create browser-use plugin dir");
+        std::fs::create_dir_all(&workspace_home).expect("create workspace home");
+        std::fs::write(
+            computer_use_plugin.join("plugin.json"),
+            r#"{
+  "name": "computer-use",
+  "version": "1.0.799",
+  "description": "Computer Use plugin"
+}"#,
+        )
+        .expect("write computer-use plugin manifest");
+        std::fs::write(
+            browser_use_plugin.join("plugin.json"),
+            r#"{
+  "name": "browser-use",
+  "version": "2.0.0",
+  "description": "Browser Use plugin"
+}"#,
+        )
+        .expect("write browser-use plugin manifest");
+
+        let fake_codex = root.join("codex");
+        write_executable(
+            &fake_codex,
+            br#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"plugin/list"'*)
+      printf '%s\n' '{"id":"__codexl_claude_code_proxy_request__","result":{"data":[{"id":"computer-use@openai-bundled","name":"computer-use","installed":false,"enabled":false,"availability":"UNAVAILABLE","installPolicy":"UNAVAILABLE","source":{"type":"local","path":"/tmp/deleted-computer-use"}},{"id":"browser-use@openai-bundled","name":"browser-use","installed":false,"enabled":false,"availability":"UNAVAILABLE","installPolicy":"UNAVAILABLE","source":{"type":"local","path":"/tmp/deleted-browser-use"}}],"marketplaces":[{"name":"openai-bundled","path":"openai-bundled","plugins":[{"id":"computer-use@openai-bundled","name":"computer-use","installed":false,"enabled":false,"availability":"UNAVAILABLE","installPolicy":"UNAVAILABLE","source":{"type":"local","path":"/tmp/deleted-computer-use"}},{"id":"browser-use@openai-bundled","name":"browser-use","installed":false,"enabled":false,"availability":"UNAVAILABLE","installPolicy":"UNAVAILABLE","source":{"type":"local","path":"/tmp/deleted-browser-use"}}]}],"nextCursor":null}}'
+      ;;
+  esac
+done
+"#,
+        );
+
+        let old_home = std::env::var_os("HOME");
+        let old_codex_home = std::env::var_os("CODEX_HOME");
+        let old_proxy = std::env::var_os(CODEX_APP_SERVER_PROXY_ENV);
+        let old_bundled = std::env::var_os("CODEXL_BUNDLED_CODEX_CLI_PATH");
+        let old_real = std::env::var_os("CODEXL_REAL_CODEX_CLI_PATH");
+        std::env::set_var("HOME", &root);
+        std::env::set_var("CODEX_HOME", &workspace_home);
+        std::env::set_var(CODEX_APP_SERVER_PROXY_ENV, "1");
+        std::env::set_var("CODEXL_BUNDLED_CODEX_CLI_PATH", &fake_codex);
+        std::env::remove_var("CODEXL_REAL_CODEX_CLI_PATH");
+
+        let result =
+            standalone_codex_app_result("plugin/list", &json!({})).expect("plugin/list result");
+        let plugins = result
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("plugin data");
+        for (plugin_name, local_version, deleted_path) in [
+            ("computer-use", "1.0.799", "/tmp/deleted-computer-use"),
+            ("browser-use", "2.0.0", "/tmp/deleted-browser-use"),
+        ] {
+            let plugin = plugins
+                .iter()
+                .find(|plugin| plugin_matches_name(plugin, plugin_name))
+                .expect("protected bundled plugin");
+            assert_eq!(plugin.get("installed").and_then(Value::as_bool), Some(true));
+            assert_eq!(plugin.get("enabled").and_then(Value::as_bool), Some(true));
+            assert_eq!(
+                plugin.get("availability").and_then(Value::as_str),
+                Some("AVAILABLE")
+            );
+            assert_eq!(
+                plugin.get("localVersion").and_then(Value::as_str),
+                Some(local_version)
+            );
+            assert_ne!(
+                plugin.pointer("/source/path").and_then(Value::as_str),
+                Some(deleted_path)
+            );
+        }
+
+        let marketplaces = result
+            .get("marketplaces")
+            .and_then(Value::as_array)
+            .expect("marketplaces");
+        let marketplace_plugins = marketplaces
+            .iter()
+            .find(|marketplace| marketplace_is_openai_bundled(marketplace))
+            .and_then(|marketplace| marketplace.get("plugins"))
+            .and_then(Value::as_array)
+            .expect("openai-bundled marketplace plugins");
+        for plugin_name in ["computer-use", "browser-use"] {
+            let plugin = marketplace_plugins
+                .iter()
+                .find(|plugin| plugin_matches_name(plugin, plugin_name))
+                .expect("marketplace protected bundled plugin");
+            assert_eq!(plugin.get("enabled").and_then(Value::as_bool), Some(true));
+            assert_eq!(
+                plugin.get("availability").and_then(Value::as_str),
+                Some("AVAILABLE")
+            );
+        }
 
         restore_env("HOME", old_home);
         restore_env("CODEX_HOME", old_codex_home);
