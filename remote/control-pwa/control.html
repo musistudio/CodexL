@@ -8,7 +8,7 @@
     <link rel="icon" type="image/png" href="icon.png" />
     <link rel="apple-touch-icon" href="icon.png" />
     <link rel="manifest" href="manifest.webmanifest" />
-    <link rel="stylesheet" href="styles.css?v=20260531-web-runtime-network-v1" />
+    <link rel="stylesheet" href="styles.css?v=20260601-control-refresh-token-v4" />
   </head>
   <body>
     <div id="controlView" class="control-view">
@@ -67,7 +67,7 @@
         <div id="screenWrap" class="screen-wrap">
           <canvas id="screen" class="screen" aria-label="Codex app screen" hidden></canvas>
           <iframe id="webFrame" class="web-frame" title="Codex web bridge" allow="camera *; microphone *" hidden></iframe>
-          <div id="emptyState" class="empty-state">Waiting for CDP screencast</div>
+          <div id="emptyState" class="empty-state">Loading web bridge</div>
         </div>
       </main>
 
@@ -100,7 +100,7 @@
       ></textarea>
     </div>
 
-    <script src="vendor/jsQR.js?v=20260531-web-runtime-network-v1"></script>
-    <script src="app.js?v=20260531-web-runtime-network-v1" type="module"></script>
+    <script src="vendor/jsQR.js?v=20260601-control-refresh-token-v4"></script>
+    <script src="app.js?v=20260601-control-refresh-token-v4" type="module"></script>
   </body>
 </html>

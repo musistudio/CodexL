@@ -1162,6 +1162,12 @@ impl RemoteRuntimeState {
             )) {
                 response.headers_mut().append(SET_COOKIE, value);
             }
+            if let Ok(value) = HeaderValue::from_str(&format!(
+                "{}={}; Path=/api; HttpOnly; SameSite=Lax",
+                REMOTE_AUTH_COOKIE_NAME, self.config.token
+            )) {
+                response.headers_mut().append(SET_COOKIE, value);
+            }
         }
         response
     }
@@ -2442,17 +2448,13 @@ fn profile_web_asset_base_url(
     app_config: &AppConfig,
     profile: Option<&ProviderProfile>,
 ) -> Option<String> {
-    if !profile_uses_cli_remote_frontend(profile) {
-        return None;
-    }
-
     profile
         .and_then(|profile| non_empty_trimmed(profile.remote_web_asset_registry_url.clone()))
         .or_else(|| non_empty_trimmed(app_config.remote_web_asset_registry_url.clone()))
 }
 
 fn profile_web_asset_version(app_config: &AppConfig, profile: Option<&ProviderProfile>) -> String {
-    if !profile_uses_cli_remote_frontend(profile) {
+    if profile_web_asset_base_url(app_config, profile).is_none() {
         return "latest".to_string();
     }
 
@@ -8063,7 +8065,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_profile_uses_app_frontend_and_claude_backend() {
+    fn claude_code_profile_uses_profile_web_asset_registry_and_claude_backend() {
         let app_config = AppConfig {
             remote_web_asset_registry_url: "https://global.example.com".to_string(),
             remote_web_asset_version: "global".to_string(),
@@ -8078,17 +8080,17 @@ mod tests {
 
         assert_eq!(
             profile_web_asset_base_url(&app_config, Some(&profile)).as_deref(),
-            None
+            Some("https://profile.example.com")
         );
         assert_eq!(
             profile_web_asset_version(&app_config, Some(&profile)),
-            "latest"
+            "26.513.31313"
         );
         assert!(profile_uses_claude_code_app_server(&profile));
     }
 
     #[test]
-    fn app_profile_ignores_web_asset_registry() {
+    fn app_profile_uses_profile_web_asset_registry_when_configured() {
         let app_config = AppConfig {
             remote_web_asset_registry_url: "https://global.example.com".to_string(),
             remote_web_asset_version: "global".to_string(),
@@ -8098,6 +8100,24 @@ mod tests {
             remote_frontend_mode: "app".to_string(),
             remote_web_asset_registry_url: "https://profile.example.com".to_string(),
             remote_web_asset_version: "26.513.31313".to_string(),
+            ..ProviderProfile::default()
+        };
+
+        assert_eq!(
+            profile_web_asset_base_url(&app_config, Some(&profile)).as_deref(),
+            Some("https://profile.example.com")
+        );
+        assert_eq!(
+            profile_web_asset_version(&app_config, Some(&profile)),
+            "26.513.31313"
+        );
+    }
+
+    #[test]
+    fn app_profile_without_web_asset_registry_uses_local_app_assets() {
+        let app_config = AppConfig::default();
+        let profile = ProviderProfile {
+            remote_frontend_mode: "app".to_string(),
             ..ProviderProfile::default()
         };
 

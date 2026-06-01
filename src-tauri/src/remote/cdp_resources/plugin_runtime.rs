@@ -1224,7 +1224,7 @@ fn safe_relative_path(value: &str) -> Option<PathBuf> {
 
 const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   const RUNTIME_VERSION = "__CODEXL_PLUGIN_RUNTIME_VERSION__";
-  const RUNTIME_BUILD = "settings-context-18";
+  const RUNTIME_BUILD = "mobile-sidebar-actions-1";
   const BRIDGE_URL = "__CODEXL_PLUGIN_BRIDGE_URL__";
   const ROOT_ID = "codexl-plugin-runtime-root";
   const CORE_PLUGIN_ID = "codexl.core";
@@ -2498,6 +2498,33 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
         text-overflow: ellipsis;
         white-space: nowrap;
         z-index: 2147483647;
+      }
+      @media (hover: none), (pointer: coarse) {
+        [data-app-action-sidebar-thread-row] [class*="group-hover:opacity-100"],
+        [data-app-action-sidebar-thread-row] [class*="group-focus-within:opacity-100"],
+        [data-app-action-sidebar-thread-row] [class*="group-hover:opacity-50"] {
+          opacity: 1 !important;
+        }
+        [data-app-action-sidebar-thread-row] [class*="group-hover:pointer-events-auto"],
+        [data-app-action-sidebar-thread-row] [class*="group-focus-within:pointer-events-auto"] {
+          pointer-events: auto !important;
+        }
+        [data-app-action-sidebar-thread-row] [class*="group-hover:opacity-0"],
+        [data-app-action-sidebar-thread-row] [class*="group-focus-within:opacity-0"] {
+          opacity: 0 !important;
+        }
+        [data-app-action-sidebar-thread-row] [class*="group-hover:min-w-5"],
+        [data-app-action-sidebar-thread-row] [class*="group-has-"][class*="min-w-5"] {
+          min-width: 1.25rem !important;
+        }
+        [data-app-action-sidebar-thread-row] [class*="group-hover:min-w-12"],
+        [data-app-action-sidebar-thread-row] [class*="group-has-"][class*="min-w-12"] {
+          min-width: 3rem !important;
+        }
+        [data-app-action-sidebar-thread-row] [class*="group-hover:min-w-20"],
+        [data-app-action-sidebar-thread-row] [class*="group-has-"][class*="min-w-20"] {
+          min-width: 5rem !important;
+        }
       }
     `;
     (document.head || document.documentElement).appendChild(style);
@@ -4908,6 +4935,10 @@ mod tests {
         assert!(script.contains("clearActiveContextUsage"));
         assert!(script.contains("clearActiveContextUsage(\"thread-start\")"));
         assert!(script.contains("const usage = runtime.contextUsageByThread.get(threadId) || null"));
+        assert!(script.contains("mobile-sidebar-actions-1"));
+        assert!(script.contains("@media (hover: none), (pointer: coarse)"));
+        assert!(script.contains("[data-app-action-sidebar-thread-row]"));
+        assert!(script.contains("[class*=\"group-hover:pointer-events-auto\"]"));
         assert!(script.contains("if (!usage)"));
         assert!(!script.contains("new MutationObserver"));
         assert!(!script.contains("setInterval(refreshCodexLSettingsNav"));

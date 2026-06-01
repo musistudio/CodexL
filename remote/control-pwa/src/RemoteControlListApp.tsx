@@ -28,8 +28,9 @@ import { cn } from "../../../src/lib/utils";
 import { decodeCodexQrFromVideo } from "../qrDecoder.js";
 
 const INSTANCE_STORAGE_KEY = "codexl-remote.instances";
+const CONTROL_CONNECTION_STORAGE_PREFIX = "codexl-remote.control-connection.";
 const REMOTE_MODE_WEB = "web";
-const PWA_BUILD = "20260531-web-runtime-network-v1";
+const PWA_BUILD = "20260601-control-refresh-token-v4";
 const SERVICE_WORKER_URL = `service-worker.js?v=${PWA_BUILD}`;
 const SPRING_TRANSITION = { damping: 30, mass: 0.72, stiffness: 430, type: "spring" } as const;
 const SOFT_SPRING_TRANSITION = { damping: 34, mass: 0.85, stiffness: 300, type: "spring" } as const;
@@ -112,7 +113,7 @@ export function RemoteControlListApp() {
 
       persistInstances(result.instances);
       if (connect) {
-        navigateToControl(result.instance.id);
+        navigateToControl(result.instance);
         return result.instance;
       }
 
@@ -218,7 +219,7 @@ export function RemoteControlListApp() {
       const result = upsertInstanceFromConnection(resetResult.instances, initialConnection, { status: "Not connected" });
       if (result.instance) {
         persistInstances(result.instances);
-        navigateToControl(result.instance.id);
+        navigateToControl(result.instance);
         return;
       }
     }
@@ -452,7 +453,7 @@ export function RemoteControlListApp() {
               <InstanceCard
                 instance={instance}
                 key={instance.id}
-                onConnect={() => navigateToControl(instance.id)}
+                onConnect={() => navigateToControl(instance)}
                 onDelete={() => setDeleteInstance(instance)}
                 onEdit={() => openEditDialog(instance)}
                 reduceMotion={reduceMotion}
@@ -908,6 +909,10 @@ function buildInstanceFromConnection(
     connectionUrl.searchParams.set("webAssetBaseUrl", nextWebAssetBaseUrl);
     connectionUrl.searchParams.set("webAssetVersion", nextWebAssetVersion);
   }
+  if (!connectionUsesCloudRemote(connection, connectionUrl)) {
+    connectionUrl.searchParams.delete("requirePassword");
+    connectionUrl.searchParams.delete("e2ee");
+  }
 
   const now = Date.now();
   const remoteMode = normalizeRemoteMode(
@@ -1008,7 +1013,10 @@ function formatTime(value: number) {
 function connectionFromUrlParams(params: URLSearchParams): Connection | null {
   const encodedUrl = params.get("url") || params.get("connection") || "";
   if (encodedUrl) {
-    return parseConnection(encodedUrl);
+    const parsed = parseConnection(encodedUrl);
+    if (parsed) {
+      return parsed;
+    }
   }
 
   const directToken = params.get("token") || "";
@@ -1161,6 +1169,22 @@ function connectionWebAssetVersion(connection: Connection, connectionUrl: URL) {
   );
 }
 
+function connectionUsesCloudRemote(connection: Connection | RemoteInstance, connectionUrl: URL) {
+  const candidate = connection as Connection & {
+    auth?: string;
+    authMode?: string;
+    auth_mode?: string;
+    cloud_user?: string;
+  };
+  const authMode = String(candidate.auth || candidate.authMode || candidate.auth_mode || connectionUrl.searchParams.get("auth") || "")
+    .trim()
+    .toLowerCase();
+  return (
+    authMode === "cloud" ||
+    Boolean(candidate.cloudUser || candidate.cloud_user || candidate.jwt || connectionUrl.searchParams.get("cloudUser") || connectionUrl.searchParams.get("jwt"))
+  );
+}
+
 function normalizeWebAssetBaseUrl(value: string | undefined) {
   const raw = String(value || "").trim();
   if (!raw) {
@@ -1204,10 +1228,76 @@ function websocketBasePath(pathname: string) {
   return pathname.endsWith("/") ? pathname.slice(0, -1) : "";
 }
 
-function navigateToControl(instanceId: string) {
+function navigateToControl(instance: RemoteInstance) {
   const url = new URL("control.html", location.href);
-  url.searchParams.set("id", instanceId);
+  const connectionUrl = connectionUrlForNavigation(instance);
+  url.searchParams.set("id", instance.id);
+  url.searchParams.set("url", connectionUrl);
+  applyControlConnectionParams(url.searchParams, instance, connectionUrl);
+  rememberControlConnection(instance);
   location.href = url.toString();
+}
+
+function connectionUrlForNavigation(instance: RemoteInstance) {
+  try {
+    const url = normalizeConnectionUrl(instance.url);
+    if (instance.token) {
+      url.searchParams.set("token", instance.token);
+    }
+    if (!connectionUsesCloudRemote(instance, url)) {
+      url.searchParams.delete("requirePassword");
+      url.searchParams.delete("e2ee");
+    }
+    return url.toString();
+  } catch {
+    return instance.url || "";
+  }
+}
+
+function applyControlConnectionParams(params: URLSearchParams, instance: RemoteInstance, connectionUrl: string) {
+  if (instance.token) {
+    params.set("token", instance.token);
+  }
+  if (instance.remoteMode) {
+    params.set("remoteMode", instance.remoteMode);
+  }
+  if (instance.webAssetBaseUrl) {
+    params.set("webAssetBaseUrl", instance.webAssetBaseUrl);
+  }
+  if (instance.webAssetVersion) {
+    params.set("webAssetVersion", instance.webAssetVersion);
+  }
+  try {
+    const url = normalizeConnectionUrl(connectionUrl);
+    for (const key of ["cloudUser", "jwt", "transport"]) {
+      const value = url.searchParams.get(key);
+      if (value) {
+        params.set(key, value);
+      }
+    }
+    if (connectionUsesCloudRemote(instance, url)) {
+      for (const key of ["requirePassword", "e2ee"]) {
+        const value = url.searchParams.get(key);
+        if (value) {
+          params.set(key, value);
+        }
+      }
+    }
+  } catch {
+    // The nested connection URL remains the primary source when it is parseable.
+  }
+}
+
+function rememberControlConnection(instance: RemoteInstance) {
+  try {
+    sessionStorage.setItem(controlConnectionStorageKey(instance.id), JSON.stringify(instance));
+  } catch {
+    // URL parameters still carry the connection for reloads when session storage is unavailable.
+  }
+}
+
+function controlConnectionStorageKey(instanceId: string) {
+  return `${CONTROL_CONNECTION_STORAGE_PREFIX}${instanceId}`;
 }
 
 function normalizeSearchQuery(value: string) {

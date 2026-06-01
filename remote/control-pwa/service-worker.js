@@ -1,5 +1,5 @@
-const CACHE_NAME = "codexl-remote-v48-web-runtime-network";
-const WEB_CACHE_NAME = "codexl-remote-web-v16-web-runtime-network";
+const CACHE_NAME = "codexl-remote-v52-control-refresh-token";
+const WEB_CACHE_NAME = "codexl-remote-web-v20-control-refresh-token";
 const WEB_CACHE_CONFIG_KEY = new URL("__codex-web-cache-config.json", self.registration.scope).toString();
 const WEB_VERSION_CACHE_KEY = new URL("__codex-web-version.json", self.registration.scope).toString();
 const WEB_PATH_PREFIX = new URL("web/", self.registration.scope).pathname;
@@ -9,6 +9,7 @@ const WEB_TRANSPORT_CONNECT_TIMEOUT_MS = 2500;
 const WEB_RESOURCE_SOCKET_CONNECT_TIMEOUT_MS = 10000;
 const WEB_RESOURCE_REQUEST_TIMEOUT_MS = 60000;
 const WEB_RESOURCE_SHARED_TRANSPORT_IDLE_MS = 60000;
+const WEB_CACHE_PRELOAD_CONCURRENCY = 8;
 const E2EE_AAD = new TextEncoder().encode("codexl-remote-e2ee-v1");
 const WEB_CACHE_IGNORED_PARAMS = [
   "token",
@@ -37,13 +38,13 @@ const ASSETS = [
   "./",
   "index.html",
   "control.html",
-  "app.js?v=20260531-web-runtime-network-v1",
-  "qrDecoder.js?v=20260531-web-runtime-network-v1",
-  "realtimeTransport.js?v=20260531-web-runtime-network-v1",
-  "react-app.css?v=20260531-web-runtime-network-v1",
-  "react-app.js?v=20260531-web-runtime-network-v1",
-  "vendor/jsQR.js?v=20260531-web-runtime-network-v1",
-  "styles.css?v=20260531-web-runtime-network-v1",
+  "app.js?v=20260601-control-refresh-token-v4",
+  "qrDecoder.js?v=20260601-control-refresh-token-v4",
+  "realtimeTransport.js?v=20260601-control-refresh-token-v4",
+  "react-app.css?v=20260601-control-refresh-token-v4",
+  "react-app.js?v=20260601-control-refresh-token-v4",
+  "vendor/jsQR.js?v=20260601-control-refresh-token-v4",
+  "styles.css?v=20260601-control-refresh-token-v4",
   "manifest.webmanifest",
   "icon.png",
 ].map((asset) => new URL(asset, self.registration.scope).toString());
@@ -188,15 +189,102 @@ async function prepareWebCacheUnlocked(message) {
     if (versionChanged) {
       await caches.delete(WEB_CACHE_NAME);
     }
-    await writeWebCacheVersion({ cached: 0, ts: Date.now(), version });
+    const cache = await caches.open(WEB_CACHE_NAME);
+    const preload = await preloadWebCacheResources(cache, transport, manifest.resources, cacheIframeUrl);
+    await writeWebCacheVersion({
+      cached: preload.cached,
+      failed: preload.failed,
+      fetched: preload.fetched,
+      total: preload.total,
+      ts: Date.now(),
+      version,
+    });
 
     return {
-      cached: 0,
-      total: Array.isArray(manifest.resources) ? manifest.resources.length : 0,
+      cached: preload.cached,
+      failed: preload.failed,
+      fetched: preload.fetched,
+      total: preload.total,
       updated: versionChanged,
       version,
     };
   });
+}
+
+async function preloadWebCacheResources(cache, transport, resources, cacheIframeUrl) {
+  const entries = webManifestResourceEntries(resources, cacheIframeUrl);
+  let cached = 0;
+  let failed = 0;
+  let fetched = 0;
+
+  await runWithConcurrency(entries, WEB_CACHE_PRELOAD_CONCURRENCY, async (resource) => {
+    try {
+      const result = await requestAndCacheWebResource(cache, transport, resource);
+      cached += 1;
+      if (result.fetched) {
+        fetched += 1;
+      }
+    } catch (error) {
+      failed += 1;
+      console.warn("[web-cache] resource preload failed", resource.requestUrl, error);
+    }
+  });
+
+  return {
+    cached,
+    failed,
+    fetched,
+    total: entries.length,
+  };
+}
+
+function webManifestResourceEntries(resources, cacheIframeUrl) {
+  if (!Array.isArray(resources)) {
+    return [];
+  }
+  const entries = [];
+  const seen = new Set();
+  for (const resource of resources) {
+    const requestUrl = webManifestResourceUrl(resource, cacheIframeUrl);
+    if (!requestUrl) {
+      continue;
+    }
+    const cacheUrl = webCacheUrlForResource(requestUrl);
+    const key = normalizedWebCacheKey(cacheUrl);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    entries.push(webResourceCacheEntry(requestUrl, cacheUrl));
+  }
+  return entries;
+}
+
+function webManifestResourceUrl(resource, cacheIframeUrl) {
+  const value = String(resource || "").trim();
+  if (!value) {
+    return "";
+  }
+  try {
+    const url = new URL(value, cacheIframeUrl || self.registration.scope);
+    return webResourcePathTail(url.pathname) === null ? "" : url.toString();
+  } catch {
+    return "";
+  }
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  let index = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (index < items.length) {
+        const item = items[index];
+        index += 1;
+        await worker(item);
+      }
+    }),
+  );
 }
 
 async function webResourceResponse(request) {
