@@ -17,6 +17,7 @@ const CODEXL_PLUGIN_INJECT_RETRY_MS: u64 = 150;
 const CODEXL_PLUGIN_RUNTIME_VERSION: &str = "0.1.18";
 const CODEXL_RENDERER_PLUGIN_ENTRY_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
 const CODEXL_CORE_PLUGIN_ID: &str = "codexl.core";
+#[cfg(test)]
 const CODEXL_PLUGIN_REMOTE_WEB_BRIDGE_URL: &str =
     "ws://127.0.0.1:0/plugin/_bridge?token=remote-web-bridge";
 const CODEXL_PLUGIN_WEB_BRIDGE_MESSAGE_TYPE: &str = "codexl-plugin-bridge";
@@ -129,6 +130,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn web_plugin_runtime_script_response() -> WebResourceResponse {
     WebResourceResponse {
         status: StatusCode::OK,
@@ -137,10 +139,12 @@ pub(super) fn web_plugin_runtime_script_response() -> WebResourceResponse {
     }
 }
 
+#[cfg(test)]
 pub(super) fn web_plugin_runtime_version() -> &'static str {
     CODEXL_PLUGIN_RUNTIME_VERSION
 }
 
+#[cfg(test)]
 pub(super) fn web_plugin_runtime_script() -> String {
     codex_plugin_bootstrap_script(CODEXL_PLUGIN_REMOTE_WEB_BRIDGE_URL)
 }

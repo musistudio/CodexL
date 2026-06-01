@@ -1,6 +1,5 @@
 use super::cdp::{connect_target, list_targets, select_target};
 use super::file_picker::{dispatch_web_file_picker_message, is_web_file_picker_message};
-use super::resource::log_web_resource_targets;
 use super::*;
 use crate::remote::crypto::RemoteCrypto;
 use std::collections::{HashMap, VecDeque};
@@ -783,7 +782,11 @@ async fn load_web_bridge_target(cdp_host: &str, cdp_port: u16) -> Result<CdpTarg
     let targets = list_targets(cdp_host, cdp_port).await?;
     let target = select_target(&targets)
         .ok_or_else(|| "no page target with webSocketDebuggerUrl".to_string())?;
-    log_web_resource_targets(&targets, &target);
+    eprintln!(
+        "[codex-web] selected bridge target: {} totalTargets={}",
+        web_bridge_target_label(&target),
+        targets.len()
+    );
     store_web_bridge_target(cdp_host, cdp_port, target.clone());
     Ok(target)
 }

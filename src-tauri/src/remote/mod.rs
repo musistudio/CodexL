@@ -62,7 +62,6 @@ const HEARTBEAT_INTERVAL_MS: u64 = 5000;
 const RELAY_RECONNECT_MAX_MS: u64 = 8000;
 const RELAY_RECONNECT_MIN_MS: u64 = 1000;
 const RELAY_WEB_BRIDGE_TASK_LIMIT: usize = 128;
-const RELAY_WEB_RESOURCE_TASK_LIMIT: usize = 64;
 const RELAY_WEB_BRIDGE_NOTIFICATION_PUMP_TTL_MS: u64 = 10 * 60_000;
 const FRAME_META_INTERVAL_MS: u64 = 250;
 const CLI_APP_SERVER_REQUEST_TIMEOUT_MS: u64 = 5 * 60_000;
@@ -88,6 +87,9 @@ const MAX_PAGE_ZOOM_SCALE: f64 = 3.0;
 const REMOTE_AUTH_COOKIE_NAME: &str = "codexl_remote_token";
 const CLOUD_RELAY_DISCOVERY_URL: &str = "https://relay.codexl.io/";
 const CLOUD_RELAY_DISCOVERY_TIMEOUT_MS: u64 = 8000;
+const DEFAULT_REMOTE_WEB_ASSET_REGISTRY_URL: &str = "https://web.codexl.io";
+const RETIRED_CDP_WEB_RESOURCE_MESSAGE: &str =
+    "Codex web assets are served from the configured registry.";
 
 const GOOD_PROFILE: ScreenProfile = ScreenProfile {
     every_nth_frame: 2,
@@ -711,7 +713,7 @@ async fn route_remote_request(
             }
             Ok(json_response(StatusCode::OK, runtime.bridge_status().await))
         }
-        (&Method::GET, "/web") => cdp_resources::web_root_redirect(request.uri().query()),
+        (&Method::GET, "/web") => Ok(retired_cdp_web_resource_response()),
         (&Method::POST, "/web/_bridge") => {
             let body = request
                 .body_mut()
@@ -723,20 +725,7 @@ async fn route_remote_request(
             let response = runtime.dispatch_web_bridge_message(message).await?;
             Ok(json_response(StatusCode::OK, response))
         }
-        (&Method::GET, _) if path.starts_with("/web/") => match &runtime.backend {
-            RemoteBackend::App => cdp_resources::get_web_resource(
-                &runtime.config.cdp_host,
-                runtime.config.cdp_port,
-                request.uri().path(),
-                request.uri().query(),
-            )
-            .await?
-            .into_response(),
-            RemoteBackend::Cli(_) => Ok(json_response(
-                StatusCode::NOT_FOUND,
-                json!({ "error": "CLI remote mode serves Codex web assets from the configured registry." }),
-            )),
-        },
+        (&Method::GET, _) if path.starts_with("/web/") => Ok(retired_cdp_web_resource_response()),
         (&Method::GET, _) => static_response(&path),
         _ => Ok(json_response(
             StatusCode::NOT_FOUND,
@@ -816,63 +805,17 @@ async fn web_resource_websocket_response(
         return Ok(empty_response(StatusCode::UNAUTHORIZED));
     }
 
-    let key = request
-        .headers()
-        .get(SEC_WEBSOCKET_KEY)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| "missing Sec-WebSocket-Key".to_string())?
-        .to_string();
-    let backend = runtime.backend.clone();
-    let cdp_host = runtime.config.cdp_host.clone();
-    let cdp_port = runtime.config.cdp_port;
-    let on_upgrade = hyper::upgrade::on(request);
+    Ok(retired_cdp_web_resource_response())
+}
 
-    tokio::spawn(async move {
-        match on_upgrade.await {
-            Ok(upgraded) => {
-                let io = TokioIo::new(upgraded);
-                let websocket =
-                    tokio_tungstenite::WebSocketStream::from_raw_socket(io, Role::Server, None)
-                        .await;
-                match backend {
-                    RemoteBackend::Cli(_) => {
-                        let (mut write, _) = websocket.split();
-                        let _ = write
-                            .send(Message::Text(
-                                json!({
-                                    "error": "CLI remote mode serves Codex web assets from the configured registry.",
-                                    "messages": [],
-                                })
-                                .to_string(),
-                            ))
-                            .await;
-                        let _ = write.send(Message::Close(None)).await;
-                    }
-                    RemoteBackend::App => {
-                        if let Err(err) = cdp_resources::handle_web_resource_websocket(
-                            websocket, cdp_host, cdp_port, None,
-                        )
-                        .await
-                        {
-                            eprintln!("Remote Codex web resource WebSocket failed: {}", err);
-                        }
-                    }
-                }
-            }
-            Err(err) => eprintln!(
-                "Remote Codex web resource WebSocket upgrade failed: {}",
-                err
-            ),
-        }
-    });
-
-    Response::builder()
-        .status(StatusCode::SWITCHING_PROTOCOLS)
-        .header(UPGRADE, "websocket")
-        .header(CONNECTION, "Upgrade")
-        .header(SEC_WEBSOCKET_ACCEPT, derive_accept_key(key.as_bytes()))
-        .body(Full::new(Bytes::new()))
-        .map_err(|e| e.to_string())
+fn retired_cdp_web_resource_response() -> Response<HttpBody> {
+    json_response(
+        StatusCode::GONE,
+        json!({
+            "error": RETIRED_CDP_WEB_RESOURCE_MESSAGE,
+            "webAssetMode": "registry",
+        }),
+    )
 }
 
 fn remote_request_query_summary(request: &Request<Incoming>) -> String {
@@ -1010,7 +953,6 @@ struct RemoteRuntimeState {
     relay_frame_tx: Mutex<Option<watch::Sender<Option<Arc<Vec<u8>>>>>>,
     relay_web_bridge_notification_pumps: Mutex<HashSet<String>>,
     relay_web_bridge_tasks: Arc<Semaphore>,
-    relay_web_resource_tasks: Arc<Semaphore>,
     stopped: AtomicBool,
     transcribe_api: Mutex<TranscribeApiConfig>,
 }
@@ -1043,7 +985,6 @@ impl RemoteRuntimeState {
             relay_frame_tx: Mutex::new(None),
             relay_web_bridge_notification_pumps: Mutex::new(HashSet::new()),
             relay_web_bridge_tasks: Arc::new(Semaphore::new(RELAY_WEB_BRIDGE_TASK_LIMIT)),
-            relay_web_resource_tasks: Arc::new(Semaphore::new(RELAY_WEB_RESOURCE_TASK_LIMIT)),
             stopped: AtomicBool::new(false),
             transcribe_api: Mutex::new(transcribe_api),
         });
@@ -1878,10 +1819,7 @@ impl RemoteRuntimeState {
 
     fn spawn_relay_web_message(self: &Arc<Self>, message: Value) {
         let runtime = self.clone();
-        let semaphore = match message.get("type").and_then(Value::as_str) {
-            Some("webResourceFromClient") => self.relay_web_resource_tasks.clone(),
-            _ => self.relay_web_bridge_tasks.clone(),
-        };
+        let semaphore = self.relay_web_bridge_tasks.clone();
         tokio::spawn(async move {
             let Ok(_permit) = semaphore.acquire_owned().await else {
                 return;
@@ -2056,19 +1994,11 @@ impl RemoteRuntimeState {
                 }
             }
             "webResourceFromClient" => {
-                if self.backend.cli_bridge().is_some() {
-                    json!({
-                        "error": "CLI remote mode serves Codex web assets from the configured registry.",
-                        "messages": [],
-                    })
-                } else {
-                    cdp_resources::dispatch_web_resource_socket_payload(
-                        &self.config.cdp_host,
-                        self.config.cdp_port,
-                        &payload,
-                    )
-                    .await
-                }
+                json!({
+                    "error": RETIRED_CDP_WEB_RESOURCE_MESSAGE,
+                    "messages": [],
+                    "webAssetMode": "registry",
+                })
             }
             _ => return,
         };
@@ -2444,6 +2374,13 @@ fn normalized_web_asset_version(value: String) -> String {
     }
 }
 
+fn default_web_asset_registry_url() -> String {
+    std::env::var("CODEXL_REMOTE_WEB_ASSET_REGISTRY_URL")
+        .ok()
+        .and_then(non_empty_trimmed)
+        .unwrap_or_else(|| DEFAULT_REMOTE_WEB_ASSET_REGISTRY_URL.to_string())
+}
+
 fn profile_web_asset_base_url(
     app_config: &AppConfig,
     profile: Option<&ProviderProfile>,
@@ -2451,6 +2388,7 @@ fn profile_web_asset_base_url(
     profile
         .and_then(|profile| non_empty_trimmed(profile.remote_web_asset_registry_url.clone()))
         .or_else(|| non_empty_trimmed(app_config.remote_web_asset_registry_url.clone()))
+        .or_else(|| Some(default_web_asset_registry_url()))
 }
 
 fn profile_web_asset_version(app_config: &AppConfig, profile: Option<&ProviderProfile>) -> String {
@@ -8114,7 +8052,7 @@ mod tests {
     }
 
     #[test]
-    fn app_profile_without_web_asset_registry_uses_local_app_assets() {
+    fn app_profile_without_web_asset_registry_uses_default_registry() {
         let app_config = AppConfig::default();
         let profile = ProviderProfile {
             remote_frontend_mode: "app".to_string(),
@@ -8122,8 +8060,8 @@ mod tests {
         };
 
         assert_eq!(
-            profile_web_asset_base_url(&app_config, Some(&profile)),
-            None
+            profile_web_asset_base_url(&app_config, Some(&profile)).as_deref(),
+            Some(DEFAULT_REMOTE_WEB_ASSET_REGISTRY_URL)
         );
         assert_eq!(
             profile_web_asset_version(&app_config, Some(&profile)),

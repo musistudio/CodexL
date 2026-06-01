@@ -26,6 +26,9 @@ use tokio_tungstenite::tungstenite::protocol::{Message, Role};
 
 type HttpBody = Full<Bytes>;
 
+const RETIRED_CDP_WEB_RESOURCE_MESSAGE: &str =
+    "Codex web assets are served from the configured registry.";
+
 #[derive(Debug)]
 pub(crate) struct ManagedInstance {
     child: Child,
@@ -584,11 +587,9 @@ async fn route_request(
             stop_codex_instance(&state, stop_request.profile_name).await?;
             Ok(json_response(StatusCode::OK, json!({ "stopped": true })))
         }
-        _ if path == "/web" => {
-            cdp_resources::web_root_redirect(request.uri().query()).map(add_cors)
-        }
+        _ if path == "/web" => Ok(retired_cdp_web_resource_response()),
         (&Method::GET, "/web/_resource") if is_websocket_upgrade(request) => {
-            proxy_codex_web_resource_websocket(request, state).await
+            Ok(retired_cdp_web_resource_response())
         }
         (&Method::GET, "/web/_bridge") if is_websocket_upgrade(request) => {
             proxy_codex_web_bridge_websocket(request, state).await
@@ -598,7 +599,7 @@ async fn route_request(
         }
         (&Method::GET, "/plugin/_bridge") => probe_codex_plugin_bridge(request).await,
         (&Method::POST, "/web/_bridge") => proxy_codex_web_bridge(request, state).await,
-        _ if path.starts_with("/web/") => proxy_codex_web_resource(request, state).await,
+        _ if path.starts_with("/web/") => Ok(retired_cdp_web_resource_response()),
         _ if path.starts_with("/json") => proxy_cdp_http(request, state).await,
         _ if path.starts_with("/devtools/") && is_websocket_upgrade(request) => {
             proxy_cdp_websocket(request, state).await
@@ -771,20 +772,14 @@ fn plugin_bridge_query_token(query: &str) -> Option<String> {
     })
 }
 
-async fn proxy_codex_web_resource(
-    request: &Request<Incoming>,
-    state: AppState,
-) -> Result<Response<HttpBody>, String> {
-    let info = current_launch_info(&state).await?;
-    cdp_resources::get_web_resource(
-        &info.cdp_host,
-        info.cdp_port,
-        request.uri().path(),
-        request.uri().query(),
-    )
-    .await?
-    .into_response()
-    .map(add_cors)
+fn retired_cdp_web_resource_response() -> Response<HttpBody> {
+    add_cors(json_response(
+        StatusCode::GONE,
+        json!({
+            "error": RETIRED_CDP_WEB_RESOURCE_MESSAGE,
+            "webAssetMode": "registry",
+        }),
+    ))
 }
 
 async fn proxy_codex_web_bridge(
@@ -973,50 +968,6 @@ async fn proxy_codex_web_bridge_websocket(
                 }
             }
             Err(err) => eprintln!("Codex web bridge WebSocket upgrade failed: {}", err),
-        }
-    });
-
-    Response::builder()
-        .status(StatusCode::SWITCHING_PROTOCOLS)
-        .header(UPGRADE, "websocket")
-        .header(CONNECTION, "Upgrade")
-        .header(SEC_WEBSOCKET_ACCEPT, derive_accept_key(key.as_bytes()))
-        .body(Full::new(Bytes::new()))
-        .map(add_cors)
-        .map_err(|e| e.to_string())
-}
-
-async fn proxy_codex_web_resource_websocket(
-    request: &mut Request<Incoming>,
-    state: AppState,
-) -> Result<Response<HttpBody>, String> {
-    let key = request
-        .headers()
-        .get(SEC_WEBSOCKET_KEY)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| "missing Sec-WebSocket-Key".to_string())?
-        .to_string();
-    let info = current_launch_info(&state).await?;
-    let cdp_host = info.cdp_host.clone();
-    let cdp_port = info.cdp_port;
-    let on_upgrade = hyper::upgrade::on(request);
-
-    tokio::spawn(async move {
-        match on_upgrade.await {
-            Ok(upgraded) => {
-                let io = TokioIo::new(upgraded);
-                let websocket =
-                    tokio_tungstenite::WebSocketStream::from_raw_socket(io, Role::Server, None)
-                        .await;
-                if let Err(err) = cdp_resources::handle_web_resource_websocket(
-                    websocket, cdp_host, cdp_port, None,
-                )
-                .await
-                {
-                    eprintln!("Codex web resource WebSocket failed: {}", err);
-                }
-            }
-            Err(err) => eprintln!("Codex web resource WebSocket upgrade failed: {}", err),
         }
     });
 

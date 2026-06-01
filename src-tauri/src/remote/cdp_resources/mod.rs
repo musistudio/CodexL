@@ -1,7 +1,11 @@
+#[cfg(test)]
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+#[cfg(test)]
 use http_body_util::Full;
-use hyper::header::{CONTENT_TYPE, LOCATION};
+#[cfg(test)]
+use hyper::header::CONTENT_TYPE;
+#[cfg(test)]
 use hyper::{Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -16,10 +20,12 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 mod bridge;
+#[cfg(test)]
 mod bridge_script;
 mod cdp;
 mod file_picker;
 mod plugin_runtime;
+#[cfg(test)]
 mod resource;
 
 #[cfg(test)]
@@ -27,7 +33,7 @@ mod tests;
 
 pub use bridge::{
     dispatch_web_bridge_message, dispatch_web_bridge_socket_payload_with_emitter,
-    handle_web_bridge_websocket, spawn_web_bridge_notification_pump,
+    spawn_web_bridge_notification_pump,
 };
 pub(crate) use bridge::{
     is_web_bridge_socket_heartbeat, parse_web_bridge_socket_message, web_bridge_socket_response,
@@ -39,9 +45,6 @@ pub(crate) use plugin_runtime::{
 };
 pub use plugin_runtime::{
     handle_plugin_bridge_websocket, plugin_bridge_token_valid, spawn_codex_plugin_injector,
-};
-pub use resource::{
-    dispatch_web_resource_socket_payload, get_web_resource, handle_web_resource_websocket,
 };
 
 #[cfg(test)]
@@ -65,15 +68,22 @@ use resource::{
 };
 
 const CDP_COMMAND_TIMEOUT_MS: u64 = 15000;
+#[cfg(test)]
 const DEBUG_RESOURCE_SAMPLE_LIMIT: usize = 12;
+#[cfg(test)]
 const WEB_BRIDGE_SCRIPT_PATH: &str = "_bridge.js";
+#[cfg(test)]
 const WEB_PLUGIN_RUNTIME_SCRIPT_PATH: &str = "_codexl_plugin.js";
 const WEB_FILE_PICKER_LIST_MESSAGE: &str = "web-file-picker-list";
 const WEB_FILE_PICKER_ENTRY_LIMIT: usize = 500;
+#[cfg(test)]
 const WEB_RESOURCE_SOCKET_PATH: &str = "_resource";
+#[cfg(test)]
 const WEB_RESOURCE_VERSION_PATH: &str = "_version";
+#[cfg(test)]
 const WEB_PATH_PREFIX: &str = "/web";
 
+#[cfg(test)]
 struct LoadedResourceContent {
     content_type: Option<String>,
     result: Value,
@@ -81,6 +91,7 @@ struct LoadedResourceContent {
     url: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct WebResourceSocketRequest {
     request_type: String,
@@ -89,6 +100,7 @@ struct WebResourceSocketRequest {
     url: String,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub struct WebResourceResponse {
     status: StatusCode,
@@ -96,6 +108,7 @@ pub struct WebResourceResponse {
     body: Bytes,
 }
 
+#[cfg(test)]
 impl WebResourceResponse {
     pub fn into_response(self) -> Result<Response<Full<Bytes>>, String> {
         Response::builder()
@@ -105,19 +118,6 @@ impl WebResourceResponse {
             .body(Full::new(self.body))
             .map_err(|e| e.to_string())
     }
-}
-
-pub fn web_root_redirect(request_query: Option<&str>) -> Result<Response<Full<Bytes>>, String> {
-    let location = match request_query {
-        Some(query) if !query.is_empty() => format!("{}/?{}", WEB_PATH_PREFIX, query),
-        _ => format!("{}/", WEB_PATH_PREFIX),
-    };
-    Response::builder()
-        .status(StatusCode::PERMANENT_REDIRECT)
-        .header("Cache-Control", "no-store")
-        .header(LOCATION, location)
-        .body(Full::new(Bytes::new()))
-        .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -134,6 +134,7 @@ struct CdpTarget {
     web_socket_debugger_url: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 struct PageResource {
     frame_id: String,
@@ -144,6 +145,7 @@ struct PageResource {
     url: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebResourceLookup {
     is_index: bool,
