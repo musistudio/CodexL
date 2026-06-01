@@ -634,13 +634,19 @@ fn find_windows_app() -> Option<String> {
         }
     }
 
-    for candidate in windows_where_codex_candidates() {
+    for candidate in windows_appx_package_candidates() {
         if let Some(path) = normalize_windows_codex_app_candidate(candidate) {
             return Some(path.to_string_lossy().to_string());
         }
     }
 
     for candidate in windows_app_candidates() {
+        if let Some(path) = normalize_windows_codex_app_candidate(candidate) {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+
+    for candidate in windows_where_codex_candidates() {
         if let Some(path) = normalize_windows_codex_app_candidate(candidate) {
             return Some(path.to_string_lossy().to_string());
         }
@@ -747,7 +753,6 @@ fn windows_app_candidates() -> Vec<PathBuf> {
             }
         }
     }
-    candidates.extend(windows_appx_package_candidates());
     candidates
 }
 
