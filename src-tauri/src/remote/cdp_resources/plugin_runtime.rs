@@ -1282,12 +1282,101 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     version: RUNTIME_VERSION,
   };
   window.__codexlPluginRuntime = runtime;
+  installClipboardFallback();
 
   function log(level, message, detail) {
     try {
       console[level === "error" ? "error" : "info"]("[codex-plugin]", message, detail || "");
     } catch {}
     send({ type: "log", level, message, detail });
+  }
+
+  function installClipboardFallback() {
+    if (window.isSecureContext) {
+      return;
+    }
+
+    const marker = "__codexlClipboardFallbackInstalled";
+    if (window[marker]) {
+      return;
+    }
+    window[marker] = true;
+
+    const shim = {
+      async writeText(text) {
+        await fallbackCopyText(String(text ?? ""));
+      },
+    };
+
+    try {
+      const existing = navigator.clipboard;
+      if (existing && typeof existing.writeText === "function") {
+        existing.writeText = shim.writeText.bind(shim);
+        return;
+      }
+    } catch {}
+
+    try {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: shim,
+      });
+      return;
+    } catch {}
+
+    try {
+      Object.defineProperty(Navigator.prototype, "clipboard", {
+        configurable: true,
+        get() {
+          return shim;
+        },
+      });
+    } catch {}
+  }
+
+  async function fallbackCopyText(text) {
+    if (!text) {
+      return;
+    }
+    if (!document.body) {
+      return;
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.top = "-9999px";
+    textarea.style.left = "-9999px";
+    textarea.style.opacity = "0";
+
+    const selection = document.getSelection?.();
+    const previousRange = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+    const activeElement = document.activeElement;
+
+    document.body.appendChild(textarea);
+    textarea.focus({ preventScroll: true });
+    textarea.select();
+    textarea.setSelectionRange(0, textarea.value.length);
+
+    try {
+      document.execCommand("copy");
+    } catch {}
+
+    textarea.remove();
+
+    try {
+      if (activeElement && typeof activeElement.focus === "function") {
+        activeElement.focus({ preventScroll: true });
+      }
+    } catch {}
+
+    try {
+      if (selection && previousRange) {
+        selection.removeAllRanges();
+        selection.addRange(previousRange);
+      }
+    } catch {}
   }
 
   function installReactHook() {
@@ -4897,6 +4986,8 @@ mod tests {
         assert!(script.contains("installGatewayModelQuerySelectorRepair"));
         assert!(script.contains("codex-message-from-view"));
         assert!(script.contains("installDesktopApiTranscribeInterceptor"));
+        assert!(script.contains("installClipboardFallback"));
+        assert!(script.contains("fallbackCopyText"));
         assert!(script.contains("setting-storage-"));
         assert!(script.contains("new WebSocket"));
         assert!(script.contains("ws://127.0.0.1:14588/plugin/_bridge?token=t"));

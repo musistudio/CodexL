@@ -26,3 +26,4 @@ dist-ssr
 .env
 .env.prod
 .env.test
+.history
