@@ -47,6 +47,11 @@ const ASSETS = [
   "styles.css?v=20260601-control-refresh-token-v4",
   "manifest.webmanifest",
   "icon.png",
+  "favicon-32x32.png",
+  "apple-touch-icon.png",
+  "icon-192.png",
+  "icon-512.png",
+  "icon-maskable-512.png",
 ].map((asset) => new URL(asset, self.registration.scope).toString());
 
 self.addEventListener("install", (event) => {

@@ -23,7 +23,15 @@ const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const iconsDir = path.join(rootDir, "src-tauri", "icons");
 const sourceIcon = path.join(iconsDir, "icon.png");
-const pwaIcon = path.join(rootDir, "remote", "control-pwa", "icon.png");
+const pwaDir = path.join(rootDir, "remote", "control-pwa");
+const pwaIcon = path.join(pwaDir, "icon.png");
+const pwaIconAssets = [
+  { name: "favicon-32x32.png", size: 32 },
+  { name: "apple-touch-icon.png", size: 180 },
+  { name: "icon-192.png", size: 192 },
+  { name: "icon-512.png", size: 512 },
+  { name: "icon-maskable-512.png", size: 512 },
+];
 const tauriBin = path.join(
   rootDir,
   "node_modules",
@@ -54,7 +62,7 @@ if (!existsSync(tauriBin)) {
 mkdirSync(iconsDir, { recursive: true });
 normalizeSourceIcon(sourceIcon);
 removeEdgeBackground(sourceIcon);
-copyFileSync(sourceIcon, pwaIcon);
+syncPwaIcons(sourceIcon);
 
 const tempDir = await mkdtemp(path.join(tmpdir(), "codexl-reicon-"));
 try {
@@ -64,7 +72,7 @@ try {
 
   runTauriIcon(tempSource, tempOutput);
   syncGeneratedIcons(tempOutput);
-  copyFileSync(sourceIcon, pwaIcon);
+  syncPwaIcons(sourceIcon);
 
   console.log("Regenerated icon resources from src-tauri/icons/icon.png");
 } finally {
@@ -88,7 +96,7 @@ function runTauriIcon(input, output) {
 
 function syncGeneratedIcons(outputDir) {
   for (const entry of readdirSync(outputDir)) {
-    if (entry === "icon.png") {
+    if (entry === "icon.png" || entry === "android" || entry === "ios") {
       continue;
     }
 
@@ -102,6 +110,25 @@ function syncGeneratedIcons(outputDir) {
     } else if (stat.isFile()) {
       copyFileSync(from, to);
     }
+  }
+}
+
+function syncPwaIcons(file) {
+  copyFileSync(file, pwaIcon);
+
+  const png = readPng(file);
+  if (png.colorType !== 6 || png.bitDepth !== 8 || png.interlace !== 0) {
+    fail("Source icon must be an 8-bit RGBA PNG before generating PWA icons.");
+  }
+
+  const rows = unfilterScanlines(zlib.inflateSync(png.imageData), png.width, png.height, 4);
+  for (const asset of pwaIconAssets) {
+    writeRgbaPng(
+      path.join(pwaDir, asset.name),
+      asset.size,
+      asset.size,
+      resizeRgbaRows(rows, png.width, png.height, asset.size),
+    );
   }
 }
 
@@ -206,6 +233,78 @@ function isOpaqueCheckerboardPixel(row, offset) {
   const min = Math.min(red, green, blue);
 
   return max >= 220 && max - min <= 14;
+}
+
+function resizeRgbaRows(rows, sourceWidth, sourceHeight, targetSize) {
+  const targetRows = [];
+  const xScale = sourceWidth / targetSize;
+  const yScale = sourceHeight / targetSize;
+
+  for (let targetY = 0; targetY < targetSize; targetY += 1) {
+    const output = Buffer.alloc(targetSize * 4);
+    const sourceYStart = targetY * yScale;
+    const sourceYEnd = (targetY + 1) * yScale;
+    const sourceYMin = Math.floor(sourceYStart);
+    const sourceYMax = Math.ceil(sourceYEnd);
+
+    for (let targetX = 0; targetX < targetSize; targetX += 1) {
+      const sourceXStart = targetX * xScale;
+      const sourceXEnd = (targetX + 1) * xScale;
+      const sourceXMin = Math.floor(sourceXStart);
+      const sourceXMax = Math.ceil(sourceXEnd);
+      let totalWeight = 0;
+      let alpha = 0;
+      let red = 0;
+      let green = 0;
+      let blue = 0;
+
+      for (let sourceY = sourceYMin; sourceY < sourceYMax; sourceY += 1) {
+        if (sourceY < 0 || sourceY >= sourceHeight) {
+          continue;
+        }
+
+        const yWeight =
+          Math.min(sourceY + 1, sourceYEnd) - Math.max(sourceY, sourceYStart);
+        if (yWeight <= 0) {
+          continue;
+        }
+
+        const sourceRow = rows[sourceY];
+        for (let sourceX = sourceXMin; sourceX < sourceXMax; sourceX += 1) {
+          if (sourceX < 0 || sourceX >= sourceWidth) {
+            continue;
+          }
+
+          const xWeight =
+            Math.min(sourceX + 1, sourceXEnd) - Math.max(sourceX, sourceXStart);
+          if (xWeight <= 0) {
+            continue;
+          }
+
+          const weight = xWeight * yWeight;
+          const offset = sourceX * 4;
+          const sourceAlpha = sourceRow[offset + 3] / 255;
+          totalWeight += weight;
+          alpha += sourceAlpha * weight;
+          red += sourceRow[offset] * sourceAlpha * weight;
+          green += sourceRow[offset + 1] * sourceAlpha * weight;
+          blue += sourceRow[offset + 2] * sourceAlpha * weight;
+        }
+      }
+
+      const outputOffset = targetX * 4;
+      if (alpha > 0) {
+        output[outputOffset] = clampByte(red / alpha);
+        output[outputOffset + 1] = clampByte(green / alpha);
+        output[outputOffset + 2] = clampByte(blue / alpha);
+        output[outputOffset + 3] = clampByte((alpha / totalWeight) * 255);
+      }
+    }
+
+    targetRows.push(output);
+  }
+
+  return targetRows;
 }
 
 function writeRgbaPng(file, width, height, rows) {
@@ -346,11 +445,15 @@ function uint32(value) {
   return buffer;
 }
 
+function clampByte(value) {
+  return Math.max(0, Math.min(255, Math.round(value)));
+}
+
 function printHelp() {
   console.log(`Usage: pnpm reicon
 
 Regenerates platform icon resources from src-tauri/icons/icon.png.
-The source icon.png is preserved and synced to remote/control-pwa/icon.png.`);
+The source icon.png is preserved and synced to remote/control-pwa with PWA icon sizes.`);
 }
 
 function fail(message) {

@@ -18,6 +18,13 @@ const MANIFEST: &str = include_str!("../../../remote/control-pwa/manifest.webman
 const SERVICE_WORKER: &str = include_str!("../../../remote/control-pwa/service-worker.js");
 const JS_QR_JS: &str = include_str!("../../../remote/control-pwa/vendor/jsQR.js");
 const ICON_PNG: &[u8] = include_bytes!("../../icons/icon.png");
+const FAVICON_32_PNG: &[u8] = include_bytes!("../../../remote/control-pwa/favicon-32x32.png");
+const APPLE_TOUCH_ICON_PNG: &[u8] =
+    include_bytes!("../../../remote/control-pwa/apple-touch-icon.png");
+const ICON_192_PNG: &[u8] = include_bytes!("../../../remote/control-pwa/icon-192.png");
+const ICON_512_PNG: &[u8] = include_bytes!("../../../remote/control-pwa/icon-512.png");
+const ICON_MASKABLE_512_PNG: &[u8] =
+    include_bytes!("../../../remote/control-pwa/icon-maskable-512.png");
 
 pub(super) fn static_response(path: &str) -> Result<Response<HttpBody>, String> {
     match path {
@@ -46,6 +53,15 @@ pub(super) fn static_response(path: &str) -> Result<Response<HttpBody>, String> 
             REALTIME_TRANSPORT_JS,
         ),
         "/icon.png" => binary_response(StatusCode::OK, "image/png", ICON_PNG),
+        "/favicon-32x32.png" => binary_response(StatusCode::OK, "image/png", FAVICON_32_PNG),
+        "/apple-touch-icon.png" => {
+            binary_response(StatusCode::OK, "image/png", APPLE_TOUCH_ICON_PNG)
+        }
+        "/icon-192.png" => binary_response(StatusCode::OK, "image/png", ICON_192_PNG),
+        "/icon-512.png" => binary_response(StatusCode::OK, "image/png", ICON_512_PNG),
+        "/icon-maskable-512.png" => {
+            binary_response(StatusCode::OK, "image/png", ICON_MASKABLE_512_PNG)
+        }
         "/manifest.webmanifest" => text_response(
             StatusCode::OK,
             "application/manifest+json; charset=utf-8",
