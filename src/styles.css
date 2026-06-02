@@ -52,6 +52,10 @@ html[data-theme="dark"] {
     --app-ring: oklch(0.556 0 0);
     --app-emerald: oklch(0.7 0.17 163);
     --app-emerald-foreground: oklch(0.15 0.05 163);
+    --app-scrollbar-track: transparent;
+    --app-scrollbar-thumb: rgba(255, 255, 255, 0.18);
+    --app-scrollbar-thumb-hover: rgba(255, 255, 255, 0.3);
+    --app-scrollbar-thumb-active: rgba(255, 255, 255, 0.42);
 }
 
 html[data-theme="light"] {
@@ -74,6 +78,10 @@ html[data-theme="light"] {
     --app-ring: oklch(0.5 0 0);
     --app-emerald: oklch(0.56 0.16 163);
     --app-emerald-foreground: oklch(0.98 0.02 163);
+    --app-scrollbar-track: transparent;
+    --app-scrollbar-thumb: rgba(0, 0, 0, 0.16);
+    --app-scrollbar-thumb-hover: rgba(0, 0, 0, 0.28);
+    --app-scrollbar-thumb-active: rgba(0, 0, 0, 0.38);
 }
 
 #root {
@@ -86,6 +94,50 @@ html[data-theme="light"] {
     }
     body {
         @apply bg-background text-foreground font-sans;
+    }
+
+    * {
+        scrollbar-color: var(--app-scrollbar-thumb) var(--app-scrollbar-track);
+        scrollbar-width: thin;
+    }
+
+    *::-webkit-scrollbar {
+        -webkit-appearance: none;
+        width: 0.625rem;
+        height: 0.625rem;
+    }
+
+    *::-webkit-scrollbar-track,
+    *::-webkit-scrollbar-track-piece {
+        background-color: var(--app-scrollbar-track);
+    }
+
+    *::-webkit-scrollbar-button {
+        display: none;
+        width: 0;
+        height: 0;
+    }
+
+    *::-webkit-scrollbar-thumb {
+        min-height: 2rem;
+        border: 0.1875rem solid transparent;
+        border-radius: 9999px;
+        background-color: var(--app-scrollbar-thumb);
+        background-clip: padding-box;
+    }
+
+    *::-webkit-scrollbar-thumb:hover {
+        background-color: var(--app-scrollbar-thumb-hover);
+        background-clip: padding-box;
+    }
+
+    *::-webkit-scrollbar-thumb:active {
+        background-color: var(--app-scrollbar-thumb-active);
+        background-clip: padding-box;
+    }
+
+    *::-webkit-scrollbar-corner {
+        background-color: transparent;
     }
 
     html,

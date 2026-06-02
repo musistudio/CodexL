@@ -272,7 +272,6 @@ const BOT_PLATFORM_SPECS: readonly BotPlatformSpec[] = [
 
 const BOT_PLATFORM_OPTIONS = BOT_PLATFORM_SPECS.map(({ value, label }) => ({ value, label }));
 const NEXT_AI_GATEWAY_PROVIDER_NAME = "next-ai-gateway";
-const WORKSPACE_PROVIDER_NONE_VALUE = "__workspace_provider_none__";
 const DEFAULT_CODEX_WEB_ASSET_REGISTRY_URL = "https://web.codexl.io";
 const DEFAULT_CODEX_WEB_ASSET_VERSION = "latest";
 const DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
@@ -496,6 +495,10 @@ type CodexWebAssetVersions = {
   versions: string[];
 };
 
+type ProviderModelsProbeResponse = {
+  models: string[];
+};
+
 type InstanceStatus = LaunchInfo & {
   remote_control: RemoteControlInfo | null;
 };
@@ -569,7 +572,15 @@ type UpdateWorkspaceProvider = WorkspaceProvider & {
 
 type ProviderMode = "none" | "existing" | "new" | "gateway";
 type DialogMode = "add" | "edit";
-type AppSettingsSection = "general" | "transcribe" | "extensions" | "bot" | "gateway" | "usage" | "updates";
+type AppSettingsSection =
+  | "general"
+  | "profiles"
+  | "transcribe"
+  | "extensions"
+  | "bot"
+  | "gateway"
+  | "usage"
+  | "updates";
 type AppUpdateStatus = "idle" | "checking" | "available" | "current" | "downloading" | "ready" | "error";
 type AppUpdateState = {
   status: AppUpdateStatus;
@@ -781,6 +792,7 @@ type GatewayConfigForm = {
   host: string;
   port: string;
   usageCaptureEnabled: boolean;
+  requestLoggingEnabled: boolean;
   providers: GatewayProviderForm[];
   mcpServers: GatewayMcpServerForm[];
   virtualModelProfiles: GatewayVirtualProfileForm[];
@@ -798,7 +810,11 @@ type GatewayVirtualProfileDialogState = {
   mode: "add" | "edit";
   profile: GatewayVirtualProfileForm;
 };
-type GatewaySettingsTab = "providers" | "mcp" | "tools";
+type DefaultProviderDialogState = {
+  mode: "add" | "edit";
+  profile: DefaultProviderProfile;
+};
+type GatewaySettingsTab = "settings" | "providers" | "mcp" | "tools";
 
 type ProviderForm = {
   workspaceName: string;
@@ -927,6 +943,12 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     appSettingsTitle: t("settings.settings"),
     appSettingsDescription: t("settings.description"),
     general: t("settings.general"),
+    profiles: t("settings.profiles"),
+    profileSettingsDescription: t("settings.profileSettingsDescription"),
+    addProfileConfig: t("settings.addProfileConfig"),
+    editProfileConfig: t("settings.editProfileConfig"),
+    noProfileConfigs: t("settings.noProfileConfigs"),
+    profileUsedByWorkspace: (workspace: string) => t("settings.profileUsedByWorkspace", { workspace }),
     extensions: t("settings.extensions"),
     transcribe: t("settings.transcribe"),
     transcribeSettingsDescription: t("settings.transcribeSettingsDescription"),
@@ -956,6 +978,8 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     gatewayUsageSettingsDescription: t("gateway.usageSettingsDescription"),
     gatewayUsageCapture: t("gateway.usageCapture"),
     gatewayUsageCaptureDescription: t("gateway.usageCaptureDescription"),
+    gatewayRequestLogging: t("gateway.requestLogging"),
+    gatewayRequestLoggingDescription: t("gateway.requestLoggingDescription"),
     gatewayUsageDashboard: t("gateway.usageDashboard"),
     gatewayUsageOverview: t("gateway.usageOverview"),
     gatewayUsageDetails: t("gateway.usageDetails"),
@@ -1263,10 +1287,13 @@ const emptyHandoffScanState: BotHandoffScanState = {
 
 const HANDOFF_TARGET_NONE_VALUE = "__codexl_handoff_target_none__";
 const BOT_CONFIG_CUSTOM_VALUE = "__codexl_bot_config_custom__";
-const WORKSPACE_PROVIDER_GATEWAY_VALUE = "__codexl_workspace_provider_gateway__";
 const DEFAULT_CODEXL_SERVER_URL = "https://codexl.io";
 const MAX_AUTH_STATUS_REFRESH_DELAY_MS = 2_147_483_647;
 let initialAppUpdateCheckStarted = false;
+const providerModelProbeCache = new Map<string, string[]>();
+const providerModelProbeInFlight = new Map<string, Promise<string[]>>();
+const providerModelProbeFailureUntil = new Map<string, number>();
+const PROVIDER_MODEL_PROBE_FAILURE_COOLDOWN_MS = 30_000;
 
 function isEditableTextTarget(target: EventTarget | null) {
   if (!(target instanceof Element)) {
@@ -1283,6 +1310,89 @@ function isEditableTextTarget(target: EventTarget | null) {
   }
 
   return editable.getAttribute("contenteditable") !== "false";
+}
+
+function useProviderModelProbe(baseUrl: string, apiKey: string, enabled = true, providerHint = "") {
+  const [models, setModels] = useState<string[]>([]);
+
+  useEffect(() => {
+    const normalizedBaseUrl = baseUrl.trim();
+    const normalizedApiKey = apiKey.trim();
+    const normalizedProviderHint = providerHint.trim();
+    if (!enabled || !isHttpUrl(normalizedBaseUrl)) {
+      setModels([]);
+      return;
+    }
+
+    const key = providerModelProbeKey(normalizedBaseUrl, normalizedApiKey, normalizedProviderHint);
+    const cached = providerModelProbeCache.get(key);
+    if (cached) {
+      setModels(cached);
+      return;
+    }
+    const failureUntil = providerModelProbeFailureUntil.get(key);
+    if (failureUntil && failureUntil > Date.now()) {
+      setModels([]);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      loadProviderModelsProbe(key, normalizedBaseUrl, normalizedApiKey, normalizedProviderHint)
+        .then((nextModels) => {
+          if (!cancelled) {
+            setModels(nextModels);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setModels([]);
+          }
+        });
+    }, 900);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [apiKey, baseUrl, enabled, providerHint]);
+
+  return models;
+}
+
+function providerModelProbeKey(baseUrl: string, apiKey: string, providerHint: string) {
+  return `${baseUrl.trim()}\n${apiKey.trim()}\n${providerHint.trim()}`;
+}
+
+async function loadProviderModelsProbe(key: string, baseUrl: string, apiKey: string, providerHint: string) {
+  const existing = providerModelProbeInFlight.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const request = invoke<ProviderModelsProbeResponse>("probe_provider_models", {
+    request: {
+      base_url: baseUrl,
+      api_key: apiKey,
+      provider_hint: providerHint,
+    },
+  })
+    .then((response) => normalizeModelOptions(response.models))
+    .then((models) => {
+      providerModelProbeFailureUntil.delete(key);
+      providerModelProbeCache.set(key, models);
+      return models;
+    })
+    .catch((error) => {
+      providerModelProbeFailureUntil.set(key, Date.now() + PROVIDER_MODEL_PROBE_FAILURE_COOLDOWN_MS);
+      throw error;
+    })
+    .finally(() => {
+      providerModelProbeInFlight.delete(key);
+    });
+
+  providerModelProbeInFlight.set(key, request);
+  return request;
 }
 
 function App() {
@@ -1320,8 +1430,6 @@ function App() {
   const existingProviderSelectRef = useRef<HTMLButtonElement>(null);
   const workspaceNameInputRef = useRef<HTMLInputElement>(null);
   const providerNameInputRef = useRef<HTMLInputElement>(null);
-  const existingProviderBaseUrlRef = useRef<HTMLInputElement>(null);
-  const existingProviderModelRef = useRef<HTMLInputElement>(null);
   const newProviderBaseUrlRef = useRef<HTMLInputElement>(null);
   const newProviderApiKeyRef = useRef<HTMLInputElement>(null);
   const newProviderModelRef = useRef<HTMLInputElement>(null);
@@ -1332,6 +1440,10 @@ function App() {
   const language = normalizeLanguage(config?.language);
   const appearance = normalizeAppearance(config?.appearance);
   const gatewayProfileEnabled = nextAiGatewayEnabled(config?.extensions);
+  const workspaceDefaultProviders = useMemo(
+    () => workspaceSelectableDefaultProviders(defaultProviders, gatewayProfileEnabled),
+    [defaultProviders, gatewayProfileEnabled],
+  );
 
   useEffect(() => {
     if (import.meta.env.DEV) {
@@ -1500,6 +1612,11 @@ function App() {
       return [];
     }
   }, []);
+
+  const openAppSettingsDialog = useCallback(() => {
+    setAppSettingsOpen(true);
+    loadDefaultProviders().catch(showSettingsError);
+  }, [loadDefaultProviders, showSettingsError]);
 
   const saveRemoteCloudAuth = useCallback(async (remoteCloudAuth: RemoteCloudAuthConfig, remoteRelayUrl: string) => {
     const nextConfig = await invoke<AppConfig>("update_remote_cloud_auth", {
@@ -1686,7 +1803,7 @@ function App() {
   }, [profiles, searchQuery]);
 
   const syncExistingProviderFields = useCallback(
-    (profileName: string, providers = defaultProviders) => {
+    (profileName: string, providers = workspaceDefaultProviders) => {
       const profile = providers.find((item) => item.name === profileName);
       setForm((current) => ({
         ...current,
@@ -1696,7 +1813,7 @@ function App() {
         existingModel: profile?.model || "",
       }));
     },
-    [defaultProviders],
+    [workspaceDefaultProviders],
   );
 
   const openAddProviderDialog = useCallback(async () => {
@@ -1710,7 +1827,8 @@ function App() {
       gatewayProfileEnabled ? loadGatewayModels() : Promise.resolve([]),
       detectCodexAppPath(),
     ]);
-    const nextMode: ProviderMode = providers.length > 0 ? "existing" : "none";
+    const selectableProviders = workspaceSelectableDefaultProviders(providers, gatewayProfileEnabled);
+    const nextMode: ProviderMode = selectableProviders.length > 0 ? "existing" : "none";
     setForm({
       ...emptyForm,
       ...defaultRemoteFrontendFormFields(detectedCodexAppPath),
@@ -1718,7 +1836,7 @@ function App() {
     });
     setProviderMode(nextMode);
     if (nextMode === "existing") {
-      syncExistingProviderFields(providers[0].name, providers);
+      syncExistingProviderFields(selectableProviders[0].name, selectableProviders);
     }
     setSettingsOpen(true);
     window.requestAnimationFrame(() => {
@@ -1740,13 +1858,13 @@ function App() {
       setSettingsError("");
       setSaveDisabled(false);
       setForm(emptyForm);
-      const isGatewayProfile =
-        gatewayProfileEnabled && profile.provider_name === NEXT_AI_GATEWAY_PROVIDER_NAME;
+      const isGatewayProfile = gatewayProfileEnabled && isNextAiGatewayProvider(profile);
       const [providers, detectedCodexAppPath, models] = await Promise.all([
         loadDefaultProviders(),
         detectCodexAppPath(),
         isGatewayProfile ? loadGatewayModels() : Promise.resolve([]),
       ]);
+      const selectableProviders = workspaceSelectableDefaultProviders(providers, gatewayProfileEnabled);
 
       if (isProviderlessWorkspace(profile)) {
         setProviderMode("none");
@@ -1785,7 +1903,7 @@ function App() {
         return;
       }
 
-      if (providers.length === 0) {
+      if (selectableProviders.length === 0) {
         setProviderMode("existing");
         setSettingsError(strings.noProviderFound);
         setSaveDisabled(false);
@@ -1806,7 +1924,7 @@ function App() {
         return;
       }
 
-      const selected = selectProviderForProfile(profile, providers);
+      const selected = selectProviderForProfile(profile, selectableProviders);
       setProviderMode("existing");
       setForm({
         ...emptyForm,
@@ -1853,12 +1971,16 @@ function App() {
         setProviderMode("none");
         return;
       }
-      if (mode === "existing" && defaultProviders.length === 0) {
+      if (mode === "existing" && workspaceDefaultProviders.length === 0) {
         setSettingsError(strings.noProviderFound);
         return;
       }
       if (mode === "existing") {
-        const selectedProfileName = form.existingProfileName || defaultProviders[0]?.name || "";
+        const selectedProfileName = workspaceDefaultProviders.some(
+          (profile) => profile.name === form.existingProfileName,
+        )
+          ? form.existingProfileName
+          : workspaceDefaultProviders[0]?.name || "";
         setProviderMode("existing");
         if (selectedProfileName) {
           syncExistingProviderFields(selectedProfileName);
@@ -1877,26 +1999,22 @@ function App() {
           })
           .catch(console.error);
       }
-      if (mode === "gateway") {
-        setForm((current) => ({
-          ...current,
-          providerName:
-            current.providerName.trim() ||
-            current.existingProfileName.trim() ||
-            current.workspaceName.trim() ||
-            "next-ai-gateway",
-        }));
+      if (mode === "gateway" && dialogMode === "add") {
+        setForm((current) =>
+          current.providerName ? { ...current, providerName: "" } : current,
+        );
       }
       setProviderMode(mode);
     },
     [
-      defaultProviders,
+      dialogMode,
       form.existingProfileName,
       gatewayModels.length,
       gatewayProfileEnabled,
       loadGatewayModels,
       strings.noProviderFound,
       syncExistingProviderFields,
+      workspaceDefaultProviders,
     ],
   );
 
@@ -1953,7 +2071,6 @@ function App() {
         const provider = readNextAiGatewayProviderForm(
           form,
           workspaceNameInputRef,
-          providerNameInputRef,
           gatewayModelTriggerRef,
           strings,
           showSettingsError,
@@ -1978,7 +2095,6 @@ function App() {
           form,
           workspaceNameInputRef,
           existingProviderSelectRef,
-          existingProviderModelRef,
           strings,
           showSettingsError,
           extensionsEnabled,
@@ -2103,6 +2219,28 @@ function App() {
       return refreshConfig();
     },
     [config, refreshConfig],
+  );
+
+  const saveDefaultProviderProfile = useCallback(
+    async (provider: DefaultProviderProfile) => {
+      const nextConfig = await invoke<AppConfig>("save_default_provider_profile", { provider });
+      setConfig(nextConfig);
+      await loadDefaultProviders();
+      await refreshStatus();
+      return nextConfig;
+    },
+    [loadDefaultProviders, refreshStatus],
+  );
+
+  const deleteDefaultProviderProfile = useCallback(
+    async (name: string) => {
+      const nextConfig = await invoke<AppConfig>("delete_default_provider_profile", { name });
+      setConfig(nextConfig);
+      await loadDefaultProviders();
+      await refreshStatus();
+      return nextConfig;
+    },
+    [loadDefaultProviders, refreshStatus],
   );
 
   const requestRemoteE2eePassword = useCallback(
@@ -2433,7 +2571,7 @@ function App() {
               size="icon"
               aria-label={strings.settings}
               className="h-8 w-8"
-              onClick={() => setAppSettingsOpen(true)}
+              onClick={openAppSettingsDialog}
             >
               <Settings className="w-4 h-4" />
             </Button>
@@ -2526,10 +2664,13 @@ function App() {
           transcribeApiKey={config.remote_transcribe_api_key || ""}
           transcribeModel={config.remote_transcribe_model || DEFAULT_TRANSCRIBE_MODEL}
           botConfigs={config.bot_configs || []}
+          defaultProviders={defaultProviders}
           profiles={profiles}
           onClose={() => setAppSettingsOpen(false)}
           onSave={saveAppSettings}
           onSaveBotConfigs={saveBotConfigs}
+          onSaveDefaultProvider={saveDefaultProviderProfile}
+          onDeleteDefaultProvider={deleteDefaultProviderProfile}
           appUpdateState={appUpdateState}
           onCheckForAppUpdate={checkForAppUpdate}
           onInstallAppUpdate={installAppUpdate}
@@ -2550,8 +2691,6 @@ function App() {
           existingProviderSelectRef={existingProviderSelectRef}
           workspaceNameInputRef={workspaceNameInputRef}
           providerNameInputRef={providerNameInputRef}
-          existingProviderBaseUrlRef={existingProviderBaseUrlRef}
-          existingProviderModelRef={existingProviderModelRef}
           newProviderBaseUrlRef={newProviderBaseUrlRef}
           newProviderApiKeyRef={newProviderApiKeyRef}
           newProviderModelRef={newProviderModelRef}
@@ -3107,11 +3246,14 @@ function AppSettingsDialog({
   transcribeApiKey,
   transcribeModel,
   botConfigs,
+  defaultProviders,
   profiles,
   appUpdateState,
   onClose,
   onSave,
   onSaveBotConfigs,
+  onSaveDefaultProvider,
+  onDeleteDefaultProvider,
   onCheckForAppUpdate,
   onInstallAppUpdate,
 }: {
@@ -3123,6 +3265,7 @@ function AppSettingsDialog({
   transcribeApiKey: string;
   transcribeModel: string;
   botConfigs: SavedBotConfig[];
+  defaultProviders: DefaultProviderProfile[];
   profiles: ProviderProfile[];
   appUpdateState: AppUpdateState;
   onClose: () => void;
@@ -3136,6 +3279,8 @@ function AppSettingsDialog({
     botConfigs?: SavedBotConfig[];
   }) => Promise<void>;
   onSaveBotConfigs: (botConfigs: SavedBotConfig[]) => Promise<AppConfig | null>;
+  onSaveDefaultProvider: (provider: DefaultProviderProfile) => Promise<AppConfig>;
+  onDeleteDefaultProvider: (name: string) => Promise<AppConfig>;
   onCheckForAppUpdate: () => Promise<void>;
   onInstallAppUpdate: () => Promise<void>;
 }) {
@@ -3405,6 +3550,8 @@ function AppSettingsDialog({
       ? strings.extensions
       : activeSection === "transcribe"
         ? strings.transcribe
+      : activeSection === "profiles"
+        ? strings.profiles
       : activeSection === "bot"
         ? strings.bot
       : activeSection === "gateway"
@@ -3419,6 +3566,8 @@ function AppSettingsDialog({
       ? strings.extensionSettingsDescription
       : activeSection === "transcribe"
         ? strings.transcribeSettingsDescription
+      : activeSection === "profiles"
+        ? strings.profileSettingsDescription
       : activeSection === "bot"
         ? strings.botSettingsDescription
       : activeSection === "gateway"
@@ -3466,6 +3615,12 @@ function AppSettingsDialog({
               icon={<RefreshCw className="h-4 w-4" />}
               label={strings.updates}
               onClick={() => setActiveSection("updates")}
+            />
+            <SettingsNavButton
+              active={activeSection === "profiles"}
+              icon={<CircleUserRound className="h-4 w-4" />}
+              label={strings.profiles}
+              onClick={() => setActiveSection("profiles")}
             />
             <SettingsNavButton
               active={activeSection === "transcribe"}
@@ -3688,6 +3843,14 @@ function AppSettingsDialog({
                   </div>
                 </div>
               </div>
+            ) : activeSection === "profiles" ? (
+              <ProfileSettingsPanel
+                defaultProviders={defaultProviders}
+                workspaceProfiles={profiles}
+                strings={strings}
+                onSaveProfile={onSaveDefaultProvider}
+                onDeleteProfile={onDeleteDefaultProvider}
+              />
             ) : activeSection === "bot" ? (
               <BotSettingsPanel
                 botConfigs={draftBotConfigs}
@@ -3820,6 +3983,265 @@ function SettingsNavButton({
       {icon}
       <span className="hidden min-w-0 truncate sm:inline">{label}</span>
     </button>
+  );
+}
+
+function ProfileSettingsPanel({
+  defaultProviders,
+  workspaceProfiles,
+  strings,
+  onSaveProfile,
+  onDeleteProfile,
+}: {
+  defaultProviders: DefaultProviderProfile[];
+  workspaceProfiles: ProviderProfile[];
+  strings: AppStrings;
+  onSaveProfile: (profile: DefaultProviderProfile) => Promise<AppConfig>;
+  onDeleteProfile: (name: string) => Promise<AppConfig>;
+}) {
+  const profiles = useMemo(
+    () => profileManagementDefaultProviders(defaultProviders),
+    [defaultProviders],
+  );
+  const [dialog, setDialog] = useState<DefaultProviderDialogState | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [showApiKey, setShowApiKey] = useState(false);
+  const profileModelOptions = useProviderModelProbe(
+    dialog?.profile.base_url ?? "",
+    dialog?.profile.api_key ?? "",
+    dialog !== null,
+    dialog?.profile.provider_name ?? "",
+  );
+
+  const updateDialogProfile = (patch: Partial<DefaultProviderProfile>) =>
+    setDialog((current) =>
+      current
+        ? {
+            ...current,
+            profile: { ...current.profile, ...patch },
+          }
+        : current,
+    );
+
+  const saveDialogProfile = async () => {
+    if (!dialog) return;
+    setSaving(true);
+    setError("");
+    try {
+      await onSaveProfile(normalizeDefaultProviderProfileForm(dialog.profile));
+      setDialog(null);
+    } catch (error) {
+      setError(errorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const deleteProfile = async (profile: DefaultProviderProfile) => {
+    const linkedWorkspace = workspaceProfilesUsingDefaultProvider(profile, workspaceProfiles)[0];
+    if (linkedWorkspace) {
+      setError(strings.profileUsedByWorkspace(linkedWorkspace.name));
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      await onDeleteProfile(profile.name);
+    } catch (error) {
+      setError(errorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="max-w-5xl space-y-4">
+      {error ? (
+        <p className="rounded-md border border-destructive/50 bg-destructive/12 px-3 py-2.5 text-sm leading-relaxed text-red-300">
+          {error}
+        </p>
+      ) : null}
+
+      <div className="flex items-center justify-between gap-3">
+        <SectionTitle icon={<CircleUserRound className="h-4 w-4" />} title={strings.profiles} />
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            setShowApiKey(false);
+            setDialog({ mode: "add", profile: createDefaultProviderProfileForm() });
+          }}
+        >
+          <Plus className="h-4 w-4" />
+          {strings.addProfileConfig}
+        </Button>
+      </div>
+
+      <div className="space-y-3">
+        {profiles.length > 0 ? (
+          profiles.map((profile) => {
+            const linkedWorkspace = workspaceProfilesUsingDefaultProvider(profile, workspaceProfiles)[0];
+            const deleteDisabled = Boolean(linkedWorkspace);
+            return (
+              <div key={profile.name} className="rounded-md border border-border bg-muted/10 px-3 py-3">
+                <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
+                  <div className="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,0.8fr)_minmax(0,0.8fr)_minmax(0,1fr)_minmax(0,1.2fr)_100px]">
+                    <GatewayProviderSummaryField label={strings.providerProfileName} value={profile.name} />
+                    <GatewayProviderSummaryField label={strings.provider} value={profile.provider_name || strings.none} />
+                    <GatewayProviderSummaryField label={strings.model} value={profile.model || strings.none} />
+                    <GatewayProviderSummaryField label={strings.baseUrl} value={profile.base_url || strings.none} />
+                    <GatewayProviderSummaryField
+                      label={strings.apiKey}
+                      value={profile.api_key ? strings.ready : strings.notConfigured}
+                    />
+                  </div>
+                  <div className="flex items-center justify-end gap-2">
+                    <IconButton
+                      title={strings.editProfileConfig}
+                      onClick={() => {
+                        setShowApiKey(false);
+                        setDialog({ mode: "edit", profile: cloneDefaultProviderProfile(profile) });
+                      }}
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </IconButton>
+                    <IconButton
+                      title={
+                        linkedWorkspace
+                          ? strings.profileUsedByWorkspace(linkedWorkspace.name)
+                          : strings.delete
+                      }
+                      tooltip={
+                        linkedWorkspace
+                          ? strings.profileUsedByWorkspace(linkedWorkspace.name)
+                          : undefined
+                      }
+                      disabled={deleteDisabled || saving}
+                      className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
+                      onClick={() => deleteProfile(profile).catch(console.error)}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </IconButton>
+                  </div>
+                </div>
+              </div>
+            );
+          })
+        ) : (
+          <div className="rounded-md border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
+            {strings.noProfileConfigs}
+          </div>
+        )}
+      </div>
+
+      <Dialog
+        open={dialog !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setShowApiKey(false);
+            setDialog(null);
+          }
+        }}
+      >
+        {dialog ? (
+          <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle>
+                {dialog.mode === "add" ? strings.addProfileConfig : strings.editProfileConfig}
+              </DialogTitle>
+              <DialogDescription className="sr-only">{strings.profileSettingsDescription}</DialogDescription>
+            </DialogHeader>
+            <div className="grid gap-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="defaultProfileNameInput">{strings.providerProfileName}</Label>
+                  <Input
+                    id="defaultProfileNameInput"
+                    value={dialog.profile.name}
+                    disabled={dialog.mode === "edit"}
+                    placeholder="my-profile"
+                    onChange={(event) => updateDialogProfile({ name: event.target.value })}
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="defaultProfileProviderInput">{strings.provider}</Label>
+                  <Input
+                    id="defaultProfileProviderInput"
+                    value={dialog.profile.provider_name}
+                    placeholder="openai"
+                    onChange={(event) => updateDialogProfile({ provider_name: event.target.value })}
+                  />
+                </div>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="defaultProfileBaseUrlInput">{strings.baseUrl}</Label>
+                  <Input
+                    id="defaultProfileBaseUrlInput"
+                    value={dialog.profile.base_url}
+                    placeholder="https://api.example.com/v1"
+                    onChange={(event) => updateDialogProfile({ base_url: event.target.value })}
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="defaultProfileApiKeyInput">{strings.apiKey}</Label>
+                  <div className="relative">
+                    <Input
+                      id="defaultProfileApiKeyInput"
+                      type={showApiKey ? "text" : "password"}
+                      className="pr-10"
+                      value={dialog.profile.api_key}
+                      placeholder="sk-..."
+                      onChange={(event) => updateDialogProfile({ api_key: event.target.value })}
+                    />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                      title={showApiKey ? strings.hidePassword : strings.showPassword}
+                      aria-label={showApiKey ? strings.hidePassword : strings.showPassword}
+                      onClick={() => setShowApiKey((current) => !current)}
+                    >
+                      {showApiKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="defaultProfileModelInput">{strings.model}</Label>
+                <div className="relative">
+                  <Input
+                    id="defaultProfileModelInput"
+                    className={profileModelOptions.length > 0 ? "pr-10" : undefined}
+                    value={dialog.profile.model}
+                    placeholder="gpt-5.5"
+                    onChange={(event) => updateDialogProfile({ model: event.target.value })}
+                  />
+                  <ModelOptionsDropdown
+                    options={profileModelOptions}
+                    selectedValues={[dialog.profile.model]}
+                    strings={strings}
+                    onSelect={(model) => updateDialogProfile({ model })}
+                  />
+                </div>
+              </div>
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" disabled={saving} onClick={() => setDialog(null)}>
+                {strings.cancel}
+              </Button>
+              <Button type="button" disabled={saving} onClick={() => saveDialogProfile().catch(console.error)}>
+                {saving ? <RefreshCw className="h-4 w-4 animate-spin" /> : null}
+                {strings.save}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        ) : null}
+      </Dialog>
+    </div>
   );
 }
 
@@ -4249,7 +4671,7 @@ function GatewaySettingsPanel({
   const [mcpServerDialog, setMcpServerDialog] = useState<GatewayMcpServerDialogState | null>(null);
   const [virtualProfileDialog, setVirtualProfileDialog] =
     useState<GatewayVirtualProfileDialogState | null>(null);
-  const [activeGatewayTab, setActiveGatewayTab] = useState<GatewaySettingsTab>("providers");
+  const [activeGatewayTab, setActiveGatewayTab] = useState<GatewaySettingsTab>("settings");
   const [availableTools, setAvailableTools] = useState<GatewayAvailableTool[]>([]);
   const [availableToolsLoading, setAvailableToolsLoading] = useState(false);
   const [availableToolsError, setAvailableToolsError] = useState("");
@@ -4428,6 +4850,7 @@ function GatewaySettingsPanel({
     label: string;
     icon: React.ReactNode;
   }> = [
+    { value: "settings", label: strings.settings, icon: <Settings className="h-4 w-4" /> },
     { value: "providers", label: strings.providers, icon: <Cpu className="h-4 w-4" /> },
     { value: "mcp", label: strings.mcpServers, icon: <Server className="h-4 w-4" /> },
     { value: "tools", label: strings.toolInjection, icon: <Wrench className="h-4 w-4" /> },
@@ -4440,35 +4863,6 @@ function GatewaySettingsPanel({
           {error}
         </p>
       ) : null}
-
-      <section className="space-y-3">
-        <SectionTitle icon={<Globe className="h-4 w-4" />} title={strings.listen} />
-        <div className="grid gap-3 sm:grid-cols-[1fr_120px]">
-          <Field label="Host">
-            <Input value={form.host} onChange={(event) => update({ host: event.target.value })} />
-          </Field>
-          <Field label={strings.port}>
-            <Input value={form.port} inputMode="numeric" onChange={(event) => update({ port: event.target.value })} />
-          </Field>
-        </div>
-      </section>
-
-      <section className="space-y-3">
-        <SectionTitle icon={<Activity className="h-4 w-4" />} title={strings.gatewayUsageCapture} />
-        <div className="flex flex-wrap items-center justify-between gap-4 rounded-md border border-border bg-muted/10 px-3 py-3">
-          <div className="min-w-0 flex-1">
-            <div className="text-sm font-medium">{strings.gatewayUsageCapture}</div>
-            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              {strings.gatewayUsageCaptureDescription}
-            </p>
-          </div>
-          <Switch
-            checked={form.usageCaptureEnabled}
-            aria-label={strings.gatewayUsageCapture}
-            onCheckedChange={(checked) => update({ usageCaptureEnabled: checked === true })}
-          />
-        </div>
-      </section>
 
       <div
         className="inline-flex max-w-full flex-wrap gap-1 rounded-md border border-border bg-muted/10 p-1"
@@ -4495,6 +4889,52 @@ function GatewaySettingsPanel({
           );
         })}
       </div>
+
+      {activeGatewayTab === "settings" ? (
+        <section className="space-y-5">
+          <div className="grid gap-3 sm:grid-cols-[1fr_120px]">
+            <Field label="Host">
+              <Input value={form.host} onChange={(event) => update({ host: event.target.value })} />
+            </Field>
+            <Field label={strings.port}>
+              <Input
+                value={form.port}
+                inputMode="numeric"
+                onChange={(event) => update({ port: event.target.value })}
+              />
+            </Field>
+          </div>
+
+          <div className="overflow-hidden rounded-md border border-border bg-muted/10">
+            <div className="flex flex-wrap items-center justify-between gap-4 px-3 py-3">
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium">{strings.gatewayUsageCapture}</div>
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                  {strings.gatewayUsageCaptureDescription}
+                </p>
+              </div>
+              <Switch
+                checked={form.usageCaptureEnabled}
+                aria-label={strings.gatewayUsageCapture}
+                onCheckedChange={(checked) => update({ usageCaptureEnabled: checked === true })}
+              />
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-4 border-t border-border px-3 py-3">
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium">{strings.gatewayRequestLogging}</div>
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                  {strings.gatewayRequestLoggingDescription}
+                </p>
+              </div>
+              <Switch
+                checked={form.requestLoggingEnabled}
+                aria-label={strings.gatewayRequestLogging}
+                onCheckedChange={(checked) => update({ requestLoggingEnabled: checked === true })}
+              />
+            </div>
+          </div>
+        </section>
+      ) : null}
 
       {activeGatewayTab === "providers" ? (
         <section className="space-y-3">
@@ -5355,18 +5795,18 @@ function GatewayUsageModelComparison({ items, strings }: { items: GatewayUsageBr
                 <div className="h-2 overflow-hidden rounded-full bg-muted" aria-label={item.label}>
                   <div className="flex h-full min-w-1 overflow-hidden rounded-full" style={{ width: barWidth }}>
                     {item.inputTokens > 0 ? <div className="h-full bg-sky-400" style={{ width: inputWidth }} /> : null}
-                    {item.outputTokens > 0 ? (
-                      <div className="h-full bg-emerald-400" style={{ width: outputWidth }} />
-                    ) : null}
                     {gatewayUsageCacheTokens(item) > 0 ? (
                       <div className="h-full bg-amber-500" style={{ width: cacheWidth }} />
+                    ) : null}
+                    {item.outputTokens > 0 ? (
+                      <div className="h-full bg-emerald-400" style={{ width: outputWidth }} />
                     ) : null}
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                   <span>{strings.gatewayUsageInput} {formatTokenCount(item.inputTokens)}</span>
-                  <span>{strings.gatewayUsageOutput} {formatTokenCount(item.outputTokens)}</span>
                   <span>{strings.gatewayUsageCache} {formatTokenCount(gatewayUsageCacheTokens(item))}</span>
+                  <span>{strings.gatewayUsageOutput} {formatTokenCount(item.outputTokens)}</span>
                   <span>{strings.gatewayUsageCacheRate} {formatPercent(gatewayUsageCacheRate(item))}</span>
                 </div>
               </div>
@@ -5623,11 +6063,23 @@ function GatewayProviderEditor({
   strings: AppStrings;
   onChange: (patch: Partial<GatewayProviderForm>) => void;
 }) {
+  const probedModels = useProviderModelProbe(provider.baseUrl, provider.apiKey, true, provider.type);
   const deepSeekV4Models = deepSeekV4ModelsFromProvider(provider);
   const selectedThinkingEffortModels = normalizeThinkingEffortModels(
     provider.thinkingEffortModels,
     provider.models,
   );
+  const selectedModels = commaList(provider.models);
+  const updateModels = (models: string) => {
+    onChange({
+      models,
+      thinkingEffortModels: normalizeThinkingEffortModels(provider.thinkingEffortModels, models),
+    });
+  };
+  const appendModel = (model: string) => {
+    const nextModels = normalizeModelOptions([...selectedModels, model]).join(", ");
+    updateModels(nextModels);
+  };
   const updateThinkingEffortModel = (model: string, enabled: boolean) => {
     const selected = new Set(selectedThinkingEffortModels);
     if (enabled) {
@@ -5675,17 +6127,20 @@ function GatewayProviderEditor({
         />
       </Field>
       <Field label={strings.models}>
-        <Input
-          value={provider.models}
-          placeholder="gpt-5.5, gpt-5.4"
-          onChange={(event) => {
-            const models = event.target.value;
-            onChange({
-              models,
-              thinkingEffortModels: normalizeThinkingEffortModels(provider.thinkingEffortModels, models),
-            });
-          }}
-        />
+        <div className="relative">
+          <Input
+            value={provider.models}
+            className={probedModels.length > 0 ? "pr-10" : undefined}
+            placeholder="gpt-5.5, gpt-5.4"
+            onChange={(event) => updateModels(event.target.value)}
+          />
+          <ModelOptionsDropdown
+            options={probedModels}
+            selectedValues={selectedModels}
+            strings={strings}
+            onSelect={appendModel}
+          />
+        </div>
       </Field>
       {deepSeekV4Models.length > 0 ? (
         <div className="rounded-md border border-border bg-muted/10 px-3 py-2.5">
@@ -6293,7 +6748,7 @@ function GatewayModelCombobox({
             />
           </div>
         </div>
-        <div className="max-h-56 overflow-y-auto p-1">
+        <ModelOptionsListScroll>
           {filteredOptions.length > 0 ? (
             filteredOptions.map((option) => (
               <DropdownMenuItem
@@ -6312,9 +6767,115 @@ function GatewayModelCombobox({
           ) : (
             <div className="px-2 py-6 text-center text-sm text-muted-foreground">{strings.noModelsFound}</div>
           )}
-        </div>
+        </ModelOptionsListScroll>
       </DropdownMenuContent>
     </DropdownMenu>
+  );
+}
+
+function ModelOptionsDropdown({
+  options,
+  selectedValues,
+  strings,
+  onSelect,
+}: {
+  options: string[];
+  selectedValues: string[];
+  strings: AppStrings;
+  onSelect: (model: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const selected = useMemo(() => new Set(selectedValues.map((item) => item.trim()).filter(Boolean)), [selectedValues]);
+  const modelOptions = useMemo(() => normalizeModelOptions(options), [options]);
+  const filteredOptions = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) {
+      return modelOptions;
+    }
+    return modelOptions.filter((option) => option.toLowerCase().includes(needle));
+  }, [modelOptions, query]);
+
+  if (modelOptions.length === 0) {
+    return null;
+  }
+
+  return (
+    <DropdownMenu
+      modal={false}
+      open={open}
+      onOpenChange={(nextOpen) => {
+        setOpen(nextOpen);
+        if (nextOpen) {
+          setQuery("");
+        }
+      }}
+    >
+      <DropdownMenuTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+          title={strings.selectModel}
+          aria-label={strings.selectModel}
+        >
+          <ChevronDown className="h-3.5 w-3.5" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="end"
+        className="w-[min(24rem,var(--radix-dropdown-menu-trigger-width))] min-w-64 p-0"
+        onCloseAutoFocus={(event) => event.preventDefault()}
+      >
+        <div className="border-b border-border p-2">
+          <div className="relative">
+            <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              autoFocus
+              value={query}
+              placeholder={strings.searchModel}
+              className="h-8 pl-8"
+              onChange={(event) => setQuery(event.target.value)}
+              onClick={(event) => event.stopPropagation()}
+              onKeyDown={(event) => event.stopPropagation()}
+            />
+          </div>
+        </div>
+        <ModelOptionsListScroll>
+          {filteredOptions.length > 0 ? (
+            filteredOptions.map((option) => (
+              <DropdownMenuItem
+                key={option}
+                className="justify-between gap-3"
+                onSelect={(event) => {
+                  event.preventDefault();
+                  onSelect(option);
+                  setOpen(false);
+                }}
+              >
+                <span className="min-w-0 truncate">{option}</span>
+                {selected.has(option) ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald" /> : null}
+              </DropdownMenuItem>
+            ))
+          ) : (
+            <div className="px-2 py-6 text-center text-sm text-muted-foreground">{strings.noModelsFound}</div>
+          )}
+        </ModelOptionsListScroll>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function ModelOptionsListScroll({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      className="max-h-56 overflow-y-auto overscroll-contain p-1"
+      onWheel={(event) => event.stopPropagation()}
+      onTouchMove={(event) => event.stopPropagation()}
+    >
+      {children}
+    </div>
   );
 }
 
@@ -6331,8 +6892,6 @@ type SettingsDialogProps = {
   existingProviderSelectRef: React.RefObject<HTMLButtonElement | null>;
   workspaceNameInputRef: React.RefObject<HTMLInputElement | null>;
   providerNameInputRef: React.RefObject<HTMLInputElement | null>;
-  existingProviderBaseUrlRef: React.RefObject<HTMLInputElement | null>;
-  existingProviderModelRef: React.RefObject<HTMLInputElement | null>;
   newProviderBaseUrlRef: React.RefObject<HTMLInputElement | null>;
   newProviderApiKeyRef: React.RefObject<HTMLInputElement | null>;
   newProviderModelRef: React.RefObject<HTMLInputElement | null>;
@@ -6360,8 +6919,6 @@ function SettingsDialog({
   existingProviderSelectRef,
   workspaceNameInputRef,
   providerNameInputRef,
-  existingProviderBaseUrlRef,
-  existingProviderModelRef,
   newProviderBaseUrlRef,
   newProviderApiKeyRef,
   newProviderModelRef,
@@ -6380,6 +6937,10 @@ function SettingsDialog({
   const botAuthType = normalizeBotAuthType(form.botPlatform, form.botAuthType);
   const botAuthFields = fieldsForBotAuth(form.botPlatform, botAuthType);
   const availableBotConfigs = useMemo(() => normalizeSavedBotConfigs(botConfigs), [botConfigs]);
+  const selectableDefaultProviders = useMemo(
+    () => workspaceSelectableDefaultProviders(defaultProviders, gatewayEnabled),
+    [defaultProviders, gatewayEnabled],
+  );
   const selectedBotConfigId = availableBotConfigs.some((item) => item.id === form.botConfigId)
     ? form.botConfigId
     : BOT_CONFIG_CUSTOM_VALUE;
@@ -6400,7 +6961,7 @@ function SettingsDialog({
       mode: "existing" as const,
       title: strings.providerSourceDefault,
       description: strings.providerSourceDefaultDescription,
-      disabled: defaultProviders.length === 0,
+      disabled: selectableDefaultProviders.length === 0,
       disabledReason: strings.providerSourceDefaultUnavailable,
     },
     ...(gatewayEnabled
@@ -6740,29 +7301,13 @@ function SettingsDialog({
               <Label htmlFor="existingProviderSelect">{strings.provider}</Label>
               <Select
                 value={form.existingProfileName}
-                onValueChange={(value) => {
-                  if (value === WORKSPACE_PROVIDER_NONE_VALUE) {
-                    onSelectProviderMode("none");
-                    return;
-                  }
-                  if (value === WORKSPACE_PROVIDER_GATEWAY_VALUE) {
-                    onSelectProviderMode("gateway");
-                    return;
-                  }
-                  onSyncExistingProvider(value);
-                }}
+                onValueChange={onSyncExistingProvider}
               >
                 <SelectTrigger id="existingProviderSelect" ref={existingProviderSelectRef}>
                   <SelectValue placeholder={strings.selectProvider} />
                 </SelectTrigger>
                 <SelectContent>
-                  {canChangeProviderMode ? (
-                    <SelectItem value={WORKSPACE_PROVIDER_NONE_VALUE}>{strings.providerSourceNone}</SelectItem>
-                  ) : null}
-                  {gatewayEnabled && canChangeProviderMode ? (
-                    <SelectItem value={WORKSPACE_PROVIDER_GATEWAY_VALUE}>{strings.nextAiGatewayProvider}</SelectItem>
-                  ) : null}
-                  {defaultProviders.map((profile) => (
+                  {selectableDefaultProviders.map((profile) => (
                     <SelectItem key={profile.name} value={profile.name}>
                       {profile.name} ({profile.provider_name} / {profile.model})
                     </SelectItem>
@@ -6770,64 +7315,26 @@ function SettingsDialog({
                 </SelectContent>
               </Select>
             </div>
-            <div className="grid grid-cols-2 gap-3.5">
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="existingProviderBaseUrlInput">{strings.baseUrl}</Label>
-                <Input
-                  id="existingProviderBaseUrlInput"
-                  ref={existingProviderBaseUrlRef}
-                  type="text"
-                  placeholder="https://api.example.com/v1"
-                  value={form.existingBaseUrl}
-                  onChange={(event) =>
-                    onSetForm((current) => ({ ...current, existingBaseUrl: event.target.value }))
-                  }
-                />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="existingProviderApiKeyInput">{strings.apiKey}</Label>
-                <Input
-                  id="existingProviderApiKeyInput"
-                  type="password"
-                  placeholder={strings.keepCurrentApiKey}
-                  value={form.existingApiKey}
-                  onChange={(event) =>
-                    onSetForm((current) => ({ ...current, existingApiKey: event.target.value }))
-                  }
-                />
-              </div>
-            </div>
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="existingProviderModelInput">{strings.model}</Label>
-              <Input
-                id="existingProviderModelInput"
-                ref={existingProviderModelRef}
-                type="text"
-                placeholder="gpt-5.5"
-                value={form.existingModel}
-                onChange={(event) =>
-                  onSetForm((current) => ({ ...current, existingModel: event.target.value }))
-                }
-              />
-            </div>
           </div>
         ) : null}
 
         {newProviderActive ? (
           <div className="flex flex-col gap-3.5">
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="providerNameInput">{strings.providerProfileName}</Label>
-              <Input
-                id="providerNameInput"
-                ref={providerNameInputRef}
-                type="text"
-                placeholder="nextai"
-                value={form.providerName}
-                onChange={(event) =>
-                  onSetForm((current) => ({ ...current, providerName: event.target.value }))
-                }
-              />
-            </div>
+            {providerMode === "new" ? (
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="providerNameInput">{strings.providerProfileName}</Label>
+                <Input
+                  id="providerNameInput"
+                  ref={providerNameInputRef}
+                  type="text"
+                  placeholder="nextai"
+                  value={form.providerName}
+                  onChange={(event) =>
+                    onSetForm((current) => ({ ...current, providerName: event.target.value }))
+                  }
+                />
+              </div>
+            ) : null}
             {providerMode === "gateway" ? (
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="gatewayModelInput">{strings.model}</Label>
@@ -8184,10 +8691,44 @@ function readWorkspaceProviderForm(
   return { ...provider, ...remoteFrontend };
 }
 
+function nextAiGatewayProfileName(form: ProviderForm) {
+  const explicitName = form.providerName.trim();
+  if (isProviderProfileName(explicitName)) {
+    return explicitName;
+  }
+
+  const source = form.workspaceName.trim() || form.gatewayModel.trim() || NEXT_AI_GATEWAY_PROVIDER_NAME;
+  const slug = providerProfileNameSlug(source);
+  return `${NEXT_AI_GATEWAY_PROVIDER_NAME}-${slug}-${shortStringHash(source)}`;
+}
+
+function isProviderProfileName(value: string) {
+  return /^[A-Za-z0-9_-]+$/.test(value) && value.toLowerCase() !== "default";
+}
+
+function providerProfileNameSlug(value: string) {
+  const slug = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48)
+    .replace(/^-+|-+$/g, "");
+  return slug || "workspace";
+}
+
+function shortStringHash(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
 function readNextAiGatewayProviderForm(
   form: ProviderForm,
   workspaceNameRef: React.RefObject<HTMLInputElement | null>,
-  nameRef: React.RefObject<HTMLInputElement | null>,
   modelRef: React.RefObject<HTMLButtonElement | null>,
   strings: AppStrings,
   showError: (error: unknown) => void,
@@ -8195,7 +8736,7 @@ function readNextAiGatewayProviderForm(
 ): NextAiGatewayProvider | null {
   const provider = {
     workspace_name: form.workspaceName.trim(),
-    name: form.providerName.trim(),
+    name: nextAiGatewayProfileName(form),
     model: form.gatewayModel.trim(),
     proxy_url: form.proxyUrl.trim(),
     bot: readBotConfig(form, form.workspaceName),
@@ -8204,11 +8745,6 @@ function readNextAiGatewayProviderForm(
   if (!provider.workspace_name) {
     showError(strings.nameRequired);
     workspaceNameRef.current?.focus();
-    return null;
-  }
-  if (!provider.name) {
-    showError(strings.nameRequired);
-    nameRef.current?.focus();
     return null;
   }
   if (!provider.model) {
@@ -8228,7 +8764,6 @@ function readExistingProviderForm(
   form: ProviderForm,
   workspaceNameRef: React.RefObject<HTMLInputElement | null>,
   providerRef: React.RefObject<HTMLButtonElement | null>,
-  modelRef: React.RefObject<HTMLInputElement | null>,
   strings: AppStrings,
   showError: (error: unknown) => void,
   extensionsEnabled: boolean,
@@ -8251,11 +8786,6 @@ function readExistingProviderForm(
   if (!provider.profile_name) {
     showError(strings.providerRequired);
     providerRef.current?.focus();
-    return null;
-  }
-  if (!provider.model) {
-    showError(strings.modelRequired);
-    modelRef.current?.focus();
     return null;
   }
   if (extensionsEnabled && !validateBotAuth(form, strings, showError)) {
@@ -8811,6 +9341,7 @@ function gatewayFormFromConfig(file: GatewayConfigFile): GatewayConfigForm {
     host: stringValue(config.host, "127.0.0.1"),
     port: numberString(config.port, "14589"),
     usageCaptureEnabled: gatewayUsageCaptureEnabledFromConfig(config),
+    requestLoggingEnabled: gatewayRequestLoggingEnabledFromConfig(config),
     providers: arrayValue(config.Providers ?? config.providers).map((item) =>
       gatewayProviderFormFromRaw(objectValue(item), providerPlugins),
     ),
@@ -8827,6 +9358,12 @@ function gatewayFormFromConfig(file: GatewayConfigFile): GatewayConfigForm {
 function gatewayUsageCaptureEnabledFromConfig(config: JsonObject): boolean {
   const codexlUsageCapture = objectValue(config.codexlUsageCapture);
   return booleanValue(codexlUsageCapture.enabled, false);
+}
+
+function gatewayRequestLoggingEnabledFromConfig(config: JsonObject): boolean {
+  const rawTrace = objectValue(config.rawTrace);
+  const mode = stringValue(rawTrace.mode, "").trim().toLowerCase();
+  return booleanValue(rawTrace.enabled, false) && mode !== "disabled";
 }
 
 function gatewayModelsFromConfig(config: JsonObject): string[] {
@@ -8931,6 +9468,18 @@ function gatewayConfigFromForm(form: GatewayConfigForm): JsonObject {
   const codexlUsageCapture = objectValue(config.codexlUsageCapture);
   codexlUsageCapture.enabled = form.usageCaptureEnabled;
   config.codexlUsageCapture = codexlUsageCapture;
+  const rawTrace = objectValue(config.rawTrace);
+  rawTrace.enabled = form.requestLoggingEnabled;
+  if (form.requestLoggingEnabled) {
+    const mode = stringValue(rawTrace.mode, "").trim().toLowerCase();
+    if (!mode || mode === "disabled") {
+      rawTrace.mode = "body_redacted";
+    }
+    if (rawTrace.deleteLocalAfterUpload === undefined) {
+      rawTrace.deleteLocalAfterUpload = false;
+    }
+  }
+  config.rawTrace = rawTrace;
   config.Providers = form.providers.map(gatewayProviderConfigFromForm);
   const providerPlugins = gatewayProviderPluginsFromForm(form);
   if (providerPlugins.length > 0) {
@@ -9494,6 +10043,20 @@ function commaList(value: string): string[] {
     .filter(Boolean);
 }
 
+function normalizeModelOptions(values: string[]) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const model = String(value || "").trim().replace(/^\/+/, "");
+    if (!model || seen.has(model)) {
+      continue;
+    }
+    seen.add(model);
+    result.push(model);
+  }
+  return result;
+}
+
 function stringListText(value: unknown): string {
   return stringListFromUnknown(value).join(", ");
 }
@@ -9599,6 +10162,69 @@ function isProviderlessWorkspace(profile: ProviderProfile) {
 
 function profileKey(profile: ProviderProfile) {
   return profile.id.trim() || profile.name;
+}
+
+function createDefaultProviderProfileForm(): DefaultProviderProfile {
+  return {
+    name: "",
+    provider_name: "",
+    base_url: "",
+    api_key: "",
+    model: "",
+    config_format: "profile",
+  };
+}
+
+function cloneDefaultProviderProfile(profile: DefaultProviderProfile): DefaultProviderProfile {
+  return {
+    name: profile.name,
+    provider_name: profile.provider_name,
+    base_url: profile.base_url,
+    api_key: profile.api_key,
+    model: profile.model,
+    config_format: profile.config_format || "profile",
+  };
+}
+
+function normalizeDefaultProviderProfileForm(profile: DefaultProviderProfile): DefaultProviderProfile {
+  const name = profile.name.trim();
+  return {
+    name,
+    provider_name: profile.provider_name.trim() || name,
+    base_url: profile.base_url.trim(),
+    api_key: profile.api_key.trim(),
+    model: profile.model.trim(),
+    config_format: profile.config_format || "profile",
+  };
+}
+
+function profileManagementDefaultProviders(providers: DefaultProviderProfile[]) {
+  return providers.filter((profile) => {
+    const name = profile.name.trim();
+    return name && name !== "Default" && !isNextAiGatewayProvider(profile);
+  });
+}
+
+function workspaceProfilesUsingDefaultProvider(
+  provider: DefaultProviderProfile,
+  profiles: ProviderProfile[],
+) {
+  const codexProfileName = provider.name.trim();
+  return profiles.filter((profile) => profile.codex_profile_name.trim() === codexProfileName);
+}
+
+function isNextAiGatewayProvider(profile: { provider_name: string }) {
+  return profile.provider_name.trim().toLowerCase() === NEXT_AI_GATEWAY_PROVIDER_NAME;
+}
+
+function workspaceSelectableDefaultProviders(
+  providers: DefaultProviderProfile[],
+  gatewayEnabled: boolean,
+) {
+  if (!gatewayEnabled) {
+    return providers;
+  }
+  return providers.filter((profile) => !isNextAiGatewayProvider(profile));
 }
 
 function selectProviderForProfile(profile: ProviderProfile, providers: DefaultProviderProfile[]) {

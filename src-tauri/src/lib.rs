@@ -20,7 +20,7 @@ use config::{
 };
 use extensions::builtins::bot_bridge;
 use extensions::builtins::gateway::{config as gateway_config, service as gateway_service};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -84,6 +84,20 @@ struct CodexWebAssetVersions {
     versions: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ProviderModelsProbeRequest {
+    base_url: String,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    provider_hint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderModelsProbeResponse {
+    models: Vec<String>,
+}
+
 #[tauri::command]
 async fn list_codex_web_asset_versions(
     registry_url: String,
@@ -129,6 +143,332 @@ async fn list_codex_web_asset_versions(
         return Err("versions.json does not contain any versions".to_string());
     }
     Ok(CodexWebAssetVersions { latest, versions })
+}
+
+#[tauri::command]
+async fn probe_provider_models(
+    request: ProviderModelsProbeRequest,
+) -> Result<ProviderModelsProbeResponse, String> {
+    let provider_hint = request.provider_hint.trim().to_ascii_lowercase();
+    let urls = provider_models_probe_urls(&request.base_url, &provider_hint)?;
+    let api_key = request.api_key.trim().to_string();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|err| err.to_string())?;
+
+    let mut last_error = String::new();
+    for url in urls {
+        let mut url = url;
+        let uses_gemini_key_query = provider_models_uses_gemini_key_query(&url, &provider_hint);
+        if uses_gemini_key_query && !api_key.is_empty() {
+            let has_key = url.query_pairs().any(|(key, _)| key == "key");
+            if !has_key {
+                url.query_pairs_mut().append_pair("key", &api_key);
+            }
+        }
+
+        let mut probe = client.get(url.clone());
+        if provider_models_uses_anthropic_headers(&url, &provider_hint) {
+            probe = probe.header("anthropic-version", "2023-06-01");
+        }
+        if !api_key.is_empty() && !uses_gemini_key_query {
+            probe = probe
+                .bearer_auth(&api_key)
+                .header("x-api-key", &api_key)
+                .header("api-key", &api_key);
+        }
+
+        match probe.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if !status.is_success() {
+                    last_error = format!("models request failed: {}", status);
+                    continue;
+                }
+                match response.json::<serde_json::Value>().await {
+                    Ok(value) => {
+                        return Ok(ProviderModelsProbeResponse {
+                            models: models_from_list_response(&value),
+                        });
+                    }
+                    Err(err) => {
+                        last_error = format!("invalid models response: {}", err);
+                    }
+                }
+            }
+            Err(err) => {
+                last_error = format!("failed to fetch models: {}", err);
+            }
+        }
+    }
+
+    Err(if last_error.is_empty() {
+        "failed to fetch models".to_string()
+    } else {
+        last_error
+    })
+}
+
+fn provider_models_probe_urls(
+    base_url: &str,
+    provider_hint: &str,
+) -> Result<Vec<reqwest::Url>, String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("base_url is required".to_string());
+    }
+    let base = reqwest::Url::parse(trimmed).map_err(|err| format!("invalid base_url: {}", err))?;
+    if base.scheme() != "http" && base.scheme() != "https" {
+        return Err("base_url must use http or https".to_string());
+    }
+    if base.path().trim_end_matches('/').ends_with("/models") {
+        return Ok(vec![base]);
+    }
+
+    let looks_like_gemini = provider_models_looks_like_gemini(&base, provider_hint);
+    let mut result: Vec<reqwest::Url> = Vec::new();
+    let mut push_url = |value: String| {
+        if let Ok(url) = reqwest::Url::parse(&value) {
+            if !result.iter().any(|item| item.as_str() == url.as_str()) {
+                result.push(url);
+            }
+        }
+    };
+    let normalized = format!("{}/", trimmed);
+    if base.path() == "/" || base.path().is_empty() {
+        if looks_like_gemini {
+            push_url(format!("{}v1beta/models", normalized));
+        }
+        push_url(format!("{}v1/models", normalized));
+    }
+    push_url(format!("{}models", normalized));
+    Ok(result)
+}
+
+fn provider_models_looks_like_gemini(url: &reqwest::Url, provider_hint: &str) -> bool {
+    provider_hint.contains("gemini")
+        || provider_hint.contains("google")
+        || url
+            .host_str()
+            .map(|host| host.contains("generativelanguage.googleapis.com"))
+            .unwrap_or(false)
+}
+
+fn provider_models_uses_gemini_key_query(url: &reqwest::Url, provider_hint: &str) -> bool {
+    provider_models_looks_like_gemini(url, provider_hint)
+        && url
+            .host_str()
+            .map(|host| host.ends_with("googleapis.com"))
+            .unwrap_or(false)
+}
+
+fn provider_models_uses_anthropic_headers(url: &reqwest::Url, provider_hint: &str) -> bool {
+    provider_hint.contains("anthropic")
+        || url
+            .host_str()
+            .map(|host| host.contains("anthropic.com"))
+            .unwrap_or(false)
+}
+
+fn models_from_list_response(value: &serde_json::Value) -> Vec<String> {
+    let mut models = Vec::new();
+    collect_models_from_value(value, &mut models);
+    models
+}
+
+fn collect_models_from_value(value: &serde_json::Value, models: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_model_item(item, models);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let mut found_list = false;
+            for key in ["data", "models", "items", "results", "model_list"] {
+                if let Some(list) = map.get(key) {
+                    found_list = true;
+                    collect_models_from_value(list, models);
+                }
+            }
+            if !found_list {
+                collect_model_item(value, models);
+            }
+        }
+        serde_json::Value::String(value) => push_model_list(models, value),
+        _ => {}
+    }
+}
+
+fn collect_model_item(value: &serde_json::Value, models: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) => push_model_list(models, value),
+        serde_json::Value::Object(map) => {
+            if map
+                .get("hidden")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            let mut found_list = false;
+            for key in ["data", "models", "items", "results", "model_list"] {
+                if let Some(list) = map.get(key) {
+                    found_list = true;
+                    collect_models_from_value(list, models);
+                }
+            }
+            if found_list {
+                return;
+            }
+            for key in ["id", "model", "name", "slug", "display_name", "displayName"] {
+                if let Some(model) = model_string_value(map.get(key)) {
+                    push_unique_model(models, &model);
+                    return;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_model_item(item, models);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn model_string_value(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(value) => Some(value.trim().to_string()),
+        serde_json::Value::Object(map) => ["id", "model", "name", "slug"]
+            .iter()
+            .find_map(|key| model_string_value(map.get(*key))),
+        _ => None,
+    }
+}
+
+fn push_model_list(models: &mut Vec<String>, value: &str) {
+    for model in value.split(',') {
+        push_unique_model(models, model);
+    }
+}
+
+fn push_unique_model(models: &mut Vec<String>, value: &str) {
+    let model = value.trim().trim_start_matches('/').to_string();
+    if !model.is_empty() && !models.iter().any(|item| item == &model) {
+        models.push(model);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn models_list_response_supports_common_shapes() {
+        let value = json!({
+            "data": [
+                { "id": "gpt-4.1" },
+                { "id": "hidden-model", "hidden": true },
+                { "model": { "id": "o3" } },
+                "claude-3-7-sonnet, /gemini-2.5-pro",
+                { "name": "gpt-4.1" }
+            ],
+            "models": [
+                "deepseek-chat",
+                { "slug": "qwen-max" }
+            ],
+            "items": [
+                { "displayName": "llama-3.3" }
+            ],
+            "results": [
+                { "model": "mistral-large" }
+            ],
+            "model_list": [
+                { "name": "command-r-plus" }
+            ]
+        });
+
+        assert_eq!(
+            models_from_list_response(&value),
+            vec![
+                "gpt-4.1",
+                "o3",
+                "claude-3-7-sonnet",
+                "gemini-2.5-pro",
+                "deepseek-chat",
+                "qwen-max",
+                "llama-3.3",
+                "mistral-large",
+                "command-r-plus"
+            ]
+        );
+    }
+
+    #[test]
+    fn models_list_response_prefers_nested_lists_over_provider_names() {
+        let value = json!({
+            "data": [
+                {
+                    "name": "openai",
+                    "models": [
+                        { "id": "gpt-4.1" },
+                        { "id": "gpt-4.1-mini" }
+                    ]
+                },
+                {
+                    "provider": "anthropic",
+                    "items": [
+                        { "name": "claude-3-7-sonnet" }
+                    ]
+                }
+            ]
+        });
+
+        assert_eq!(
+            models_from_list_response(&value),
+            vec!["gpt-4.1", "gpt-4.1-mini", "claude-3-7-sonnet"]
+        );
+    }
+
+    #[test]
+    fn provider_models_probe_urls_include_gemini_v1beta_for_google_root() {
+        let urls = provider_models_probe_urls(
+            "https://generativelanguage.googleapis.com",
+            "gemini_generate_content",
+        )
+        .expect("probe urls");
+
+        assert_eq!(
+            urls.iter().map(reqwest::Url::as_str).collect::<Vec<_>>(),
+            vec![
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                "https://generativelanguage.googleapis.com/v1/models",
+                "https://generativelanguage.googleapis.com/models"
+            ]
+        );
+        assert!(provider_models_uses_gemini_key_query(
+            &urls[0],
+            "gemini_generate_content"
+        ));
+    }
+
+    #[test]
+    fn provider_models_probe_urls_add_anthropic_header_hint() {
+        let urls = provider_models_probe_urls("https://api.anthropic.com/v1", "anthropic_messages")
+            .expect("probe urls");
+
+        assert_eq!(
+            urls.iter().map(reqwest::Url::as_str).collect::<Vec<_>>(),
+            vec!["https://api.anthropic.com/v1/models"]
+        );
+        assert!(provider_models_uses_anthropic_headers(
+            &urls[0],
+            "anthropic_messages"
+        ));
+    }
 }
 
 #[tauri::command]
@@ -401,17 +741,76 @@ async fn get_gateway_tools(state: tauri::State<'_, AppState>) -> Result<serde_js
 
 #[tauri::command]
 async fn get_gateway_usage_summary(
+    state: tauri::State<'_, AppState>,
     days: Option<u32>,
     start_date: Option<String>,
     end_date: Option<String>,
     hours: Option<u32>,
 ) -> Result<gateway_usage::GatewayUsageSummary, String> {
-    gateway_usage::load_usage_summary(days, start_date, end_date, hours).await
+    let codex_home = {
+        let config = state.config.lock().await;
+        config
+            .provider_profile(&config.active_provider)
+            .map(|profile| config::generated_codex_home(&profile))
+            .or_else(|| config.active_codex_home().map(std::path::PathBuf::from))
+    };
+    gateway_usage::load_usage_summary(days, start_date, end_date, hours, codex_home).await
 }
 
 #[tauri::command]
 fn get_default_providers() -> Result<Vec<DefaultProviderProfile>, String> {
     config::read_default_provider_profiles()
+}
+
+#[tauri::command]
+async fn save_default_provider_profile(
+    provider: DefaultProviderProfile,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<AppConfig, String> {
+    let profile_config_format = profile_config_format_for_state(state.inner()).await;
+    let provider =
+        config::save_default_provider_profile_with_format(provider, profile_config_format)?;
+    let config = {
+        let mut config = state.config.lock().await;
+        config::sync_workspace_profiles_for_default_provider(
+            &mut config,
+            &provider,
+            profile_config_format,
+        )?;
+        config.save()?;
+        config.clone()
+    };
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(config)
+}
+
+#[tauri::command]
+async fn delete_default_provider_profile(
+    name: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<AppConfig, String> {
+    let profile_name = name.trim().to_string();
+    let config = {
+        let mut config = state.config.lock().await;
+        if let Some(profile) = config
+            .provider_profiles
+            .iter()
+            .find(|profile| profile.codex_profile_name == profile_name)
+        {
+            return Err(format!(
+                "Provider profile is used by workspace {}",
+                profile.name
+            ));
+        }
+        config::delete_default_provider_profile(&profile_name)?;
+        config.normalize();
+        config.save()?;
+        config.clone()
+    };
+    refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(config)
 }
 
 #[tauri::command]
@@ -1013,6 +1412,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             find_codex,
             list_codex_web_asset_versions,
+            probe_provider_models,
             launch_codex,
             stop_codex,
             get_status,
@@ -1029,6 +1429,8 @@ pub fn run() {
             get_gateway_tools,
             get_gateway_usage_summary,
             get_default_providers,
+            save_default_provider_profile,
+            delete_default_provider_profile,
             add_existing_provider,
             create_workspace,
             create_provider,

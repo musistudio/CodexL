@@ -232,6 +232,7 @@ pub async fn load_usage_summary(
     start_date: Option<String>,
     end_date: Option<String>,
     hours: Option<u32>,
+    codex_home: Option<PathBuf>,
 ) -> Result<GatewayUsageSummary, String> {
     let range = normalize_date_range(days, start_date, end_date, hours)?;
     tokio::task::spawn_blocking(move || {
@@ -244,6 +245,7 @@ pub async fn load_usage_summary(
             &connection,
             range,
             database_path.to_string_lossy().to_string(),
+            codex_home,
         )
     })
     .await
@@ -434,13 +436,14 @@ fn load_summary_from_connection(
     connection: &Connection,
     range: GatewayUsageDateRange,
     database_path: String,
+    codex_home: Option<PathBuf>,
 ) -> Result<GatewayUsageSummary, String> {
     let totals = load_totals(connection, &range)?;
     let daily = load_daily(connection, &range)?;
     let by_provider = load_breakdown(connection, &range, BreakdownMode::Provider)?;
     let by_model = load_breakdown(connection, &range, BreakdownMode::Model)?;
     let session_ids = load_session_ids(connection, &range)?;
-    let codex_sessions = load_codex_session_metadata(&session_ids, &range);
+    let codex_sessions = load_codex_session_metadata(&session_ids, &range, codex_home.as_deref());
     let by_session = load_sessions(connection, &range, &codex_sessions)?;
     let by_project = load_projects(connection, &range, &codex_sessions)?;
     let requests = load_requests(connection, &range, &codex_sessions)?;
@@ -837,7 +840,7 @@ fn load_requests(
                 request_id: row.get(1)?,
                 emitted_at: row.get(2)?,
                 received_at_unix,
-                client_session_label: session_label(&session_id, metadata),
+                client_session_label: request_session_label(metadata),
                 client_project_label: project_label(&project_path),
                 client_project_path: project_path,
                 client_session_id: session_id,
@@ -964,7 +967,11 @@ fn max_optional_unix(left: Option<i64>, right: Option<i64>) -> Option<i64> {
 fn load_codex_session_metadata(
     session_ids: &HashSet<String>,
     range: &GatewayUsageDateRange,
+    codex_home: Option<&Path>,
 ) -> CodexSessionCatalog {
+    if let Some(codex_home) = codex_home {
+        return load_codex_session_metadata_from_home(codex_home, session_ids, range);
+    }
     load_codex_session_metadata_from_home(&codex_home_dir(), session_ids, range)
 }
 
@@ -1615,6 +1622,14 @@ fn session_label(session_id: &str, metadata: Option<&CodexSessionMetadata>) -> S
     }
 }
 
+fn request_session_label(metadata: Option<&CodexSessionMetadata>) -> String {
+    metadata
+        .map(|value| value.title.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn project_label(project_path: &str) -> String {
     let project_path = project_path.trim();
     if project_path.is_empty() {
@@ -1772,8 +1787,9 @@ mod tests {
         .expect("insert second event");
 
         let range = normalize_date_range(Some(30), None, None, None).expect("normalize date range");
-        let summary = load_summary_from_connection(&connection, range, ":memory:".to_string())
-            .expect("load summary");
+        let summary =
+            load_summary_from_connection(&connection, range, ":memory:".to_string(), None)
+                .expect("load summary");
 
         assert_eq!(summary.totals.request_count, 2);
         assert_eq!(summary.totals.success_count, 1);
@@ -1789,6 +1805,7 @@ mod tests {
         assert_eq!(summary.by_project[0].request_count, 2);
         assert_eq!(summary.requests.len(), 2);
         assert_eq!(summary.requests[0].client_session_id, "session-a");
+        assert_eq!(summary.requests[0].client_session_label, "-");
     }
 
     #[test]
@@ -1832,6 +1849,69 @@ mod tests {
         let session = catalog.by_id.get("session-a").expect("session metadata");
         assert_eq!(session.title, "Gateway Usage Dashboard");
         assert_eq!(session.project_path, "/Users/jinhuilee/products/CodexL");
+
+        let _ = std::fs::remove_dir_all(codex_home);
+    }
+
+    #[test]
+    fn usage_summary_uses_configured_codex_home_for_request_session_titles() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let codex_home =
+            std::env::temp_dir().join(format!("codexl-gateway-usage-config-home-test-{}", suffix));
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("27");
+        std::fs::create_dir_all(&session_dir).expect("create codex session dir");
+        std::fs::write(
+            codex_home.join("session_index.jsonl"),
+            r#"{"id":"session-a","thread_name":"Configured Home Session","updated_at":"2026-05-27T12:00:00Z"}
+"#,
+        )
+        .expect("write session index");
+        std::fs::write(
+            session_dir.join("rollout-2026-05-27T12-00-00-session-a.jsonl"),
+            r#"{"timestamp":"2026-05-27T12:00:00Z","type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/configured-home"}}"#,
+        )
+        .expect("write codex session");
+
+        let connection = Connection::open_in_memory().expect("open sqlite");
+        init_database(&connection).expect("init database");
+        insert_usage_event(
+            &connection,
+            json!({
+                "eventId": "evt_1",
+                "requestId": "req_1",
+                "target": { "provider": "openai", "providerName": "primary", "model": "gpt-4.1" },
+                "outcome": { "status": "success", "statusCode": 200 },
+                "clientContext": { "agentId": "codex", "sessionId": "session-a" },
+                "billing": {
+                    "provider": "openai",
+                    "usage": { "input_tokens": 10, "output_tokens": 20, "total_tokens": 30 }
+                }
+            }),
+        )
+        .expect("insert event");
+
+        let range = normalize_date_range(Some(30), None, None, None).expect("normalize date range");
+        let summary = load_summary_from_connection(
+            &connection,
+            range,
+            ":memory:".to_string(),
+            Some(codex_home.clone()),
+        )
+        .expect("load summary");
+
+        assert_eq!(summary.requests[0].client_session_id, "session-a");
+        assert_eq!(
+            summary.requests[0].client_session_label,
+            "Configured Home Session"
+        );
+        assert_eq!(summary.requests[0].client_project_label, "configured-home");
 
         let _ = std::fs::remove_dir_all(codex_home);
     }

@@ -1155,6 +1155,104 @@ pub fn read_default_provider_profiles() -> Result<Vec<DefaultProviderProfile>, S
     read_provider_profiles_from_codex_home(&PathBuf::from(default_codex_home()))
 }
 
+fn default_provider_profile_by_name(profile_name: &str) -> Result<DefaultProviderProfile, String> {
+    let profile_name = profile_name.trim();
+    let profile = read_default_provider_profiles()?
+        .into_iter()
+        .find(|profile| profile.name == profile_name)
+        .ok_or_else(|| format!("Provider profile not found: {}", profile_name))?;
+    validate_default_provider_profile(&profile)?;
+    Ok(profile)
+}
+
+fn validate_default_provider_profile(profile: &DefaultProviderProfile) -> Result<(), String> {
+    if profile.provider_name.trim().is_empty() {
+        return Err(format!("Provider is required for profile {}", profile.name));
+    }
+    if profile.model.trim().is_empty() {
+        return Err(format!("model is required for profile {}", profile.name));
+    }
+    Ok(())
+}
+
+pub fn save_default_provider_profile_with_format(
+    mut profile: DefaultProviderProfile,
+    profile_config_format: CodexProfileConfigFormat,
+) -> Result<DefaultProviderProfile, String> {
+    profile.name = profile.name.trim().to_string();
+    profile.provider_name = profile.provider_name.trim().to_string();
+    profile.base_url = profile.base_url.trim().to_string();
+    profile.api_key = profile.api_key.trim().to_string();
+    profile.model = profile.model.trim().to_string();
+    profile.config_format = normalized_provider_config_format(&profile.config_format);
+
+    validate_provider_name(&profile.name)?;
+    if profile.provider_name.is_empty() {
+        profile.provider_name = profile.name.clone();
+    }
+    if profile.model.is_empty() {
+        return Err("model is required".to_string());
+    }
+    if profile.api_key.is_empty() {
+        if let Ok(existing) = default_provider_profile_by_name(&profile.name) {
+            profile.api_key = existing.api_key;
+        }
+    }
+    if profile.api_key.is_empty() {
+        return Err("apikey is required".to_string());
+    }
+
+    write_default_provider_profile(&profile, true, profile_config_format)?;
+    Ok(profile)
+}
+
+pub fn delete_default_provider_profile(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    validate_provider_name(name)?;
+
+    let path = default_codex_config_path();
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = remove_legacy_profile_config(&content, name);
+    std::fs::write(&path, updated).map_err(|e| e.to_string())?;
+
+    if let Some(parent) = path.parent() {
+        let separate_path = parent.join(format!("{}.config.toml", name));
+        if separate_path.exists() {
+            std::fs::remove_file(separate_path).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn sync_workspace_profiles_for_default_provider(
+    config: &mut AppConfig,
+    provider: &DefaultProviderProfile,
+    profile_config_format: CodexProfileConfigFormat,
+) -> Result<(), String> {
+    let provider_profile_name = provider_codex_profile_name(provider);
+    for profile in config.provider_profiles.iter_mut() {
+        if profile.codex_profile_name != provider_profile_name {
+            continue;
+        }
+        if is_default_provider(profile) || is_providerless_workspace(profile) {
+            continue;
+        }
+        profile.provider_name = provider.provider_name.clone();
+        profile.provider_config_format = provider.config_format.clone();
+        profile.base_url = provider.base_url.clone();
+        profile.model = provider.model.clone();
+        write_codex_home_config(
+            provider,
+            &generated_codex_home(profile),
+            false,
+            profile_config_format,
+        )?;
+    }
+    config.normalize();
+    Ok(())
+}
+
 pub fn add_existing_provider_profile(
     input: ExistingProviderRequest,
 ) -> Result<ProviderProfile, String> {
@@ -1171,7 +1269,10 @@ pub fn add_existing_provider_profile_with_format(
     let remote_frontend_mode = input.remote_frontend_mode.clone();
     let remote_web_asset_registry_url = input.remote_web_asset_registry_url.clone();
     let remote_web_asset_version = input.remote_web_asset_version.clone();
-    let provider = update_existing_default_provider(input, profile_config_format)?;
+    let provider = default_provider_profile_by_name(&input.profile_name)?;
+    if profile_config_format == CodexProfileConfigFormat::SeparateProfileFiles {
+        write_default_provider_profile(&provider, false, profile_config_format)?;
+    }
     let mut profile = provider.to_provider_profile();
     profile.name = workspace_name;
     profile.codex_profile_name = provider_codex_profile_name(&provider);
@@ -1272,21 +1373,10 @@ pub fn update_existing_provider_profile_with_format(
     let remote_frontend_mode = input.remote_frontend_mode.clone();
     let remote_web_asset_registry_url = input.remote_web_asset_registry_url.clone();
     let remote_web_asset_version = input.remote_web_asset_version.clone();
-    let provider = update_existing_default_provider(
-        ExistingProviderRequest {
-            workspace_name: workspace_name.clone(),
-            profile_name: input.profile_name,
-            base_url: input.base_url,
-            api_key: input.api_key,
-            model: input.model,
-            proxy_url: String::new(),
-            remote_frontend_mode: String::new(),
-            remote_web_asset_registry_url: String::new(),
-            remote_web_asset_version: String::new(),
-            bot: BotProfileConfig::default(),
-        },
-        profile_config_format,
-    )?;
+    let provider = default_provider_profile_by_name(&input.profile_name)?;
+    if profile_config_format == CodexProfileConfigFormat::SeparateProfileFiles {
+        write_default_provider_profile(&provider, false, profile_config_format)?;
+    }
     let mut profile = provider.to_provider_profile();
     if is_uuid_like(&original_selector) {
         profile.id = original_selector;
@@ -3796,7 +3886,7 @@ requires_openai_auth = true
         let content = std::fs::read_to_string(generated_codex_home(&profile).join("config.toml"))
             .expect("read generated ccs config");
         assert!(content.contains("model_provider = \"custom\""));
-        assert!(content.contains("model = \"gpt-5.6\""));
+        assert!(content.contains("model = \"gpt-5.5\""));
         assert!(content.contains("requires_openai_auth = true"));
         assert!(!content.contains("[profiles.custom]"));
         assert!(!content.contains("base_url = \"\""));
@@ -4349,7 +4439,7 @@ model_provider = "nextai"
         let workspace_config =
             std::fs::read_to_string(workspace_config_path).expect("read workspace config");
         assert!(workspace_config.contains("[profiles.nextai]"));
-        assert!(workspace_config.contains("model = \"glm-4.6\""));
+        assert!(workspace_config.contains("model = \"glm\""));
 
         if let Some(value) = old_home {
             std::env::set_var("HOME", value);
@@ -4418,7 +4508,7 @@ model_reasoning_effort = "high"
         let default_profile_config =
             std::fs::read_to_string(root.join(".codex").join("bs.config.toml"))
                 .expect("read profile config");
-        assert!(default_profile_config.contains("model = \"new-model\""));
+        assert!(default_profile_config.contains("model = \"old-model\""));
         assert!(default_profile_config.contains("model_provider = \"bs\""));
         assert!(default_profile_config.contains("model_reasoning_effort = \"high\""));
 
@@ -4426,13 +4516,13 @@ model_reasoning_effort = "high"
         let workspace_config =
             std::fs::read_to_string(workspace_home.join("config.toml")).expect("read workspace");
         assert!(workspace_config.contains("model_provider = \"bs\""));
-        assert!(workspace_config.contains("model = \"new-model\""));
+        assert!(workspace_config.contains("model = \"old-model\""));
         assert!(!workspace_config.contains("[profiles.bs]"));
         assert!(workspace_config.contains("[model_providers.bs]"));
         let workspace_profile_config =
             std::fs::read_to_string(workspace_home.join("bs.config.toml"))
                 .expect("read workspace profile");
-        assert!(workspace_profile_config.contains("model = \"new-model\""));
+        assert!(workspace_profile_config.contains("model = \"old-model\""));
         assert!(workspace_profile_config.contains("model_provider = \"bs\""));
 
         let providers = read_default_provider_profiles().expect("read providers");
@@ -4440,7 +4530,7 @@ model_reasoning_effort = "high"
             .iter()
             .find(|item| item.name == "bs")
             .expect("provider from profile file");
-        assert_eq!(provider.model, "new-model");
+        assert_eq!(provider.model, "old-model");
         assert_eq!(provider.provider_name, "bs");
 
         if let Some(value) = old_home {
