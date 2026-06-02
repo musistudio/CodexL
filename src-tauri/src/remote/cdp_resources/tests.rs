@@ -305,6 +305,8 @@ fn web_bridge_snapshot_request_collects_owner_stream_snapshots() {
     assert!(expression.contains("type: \"ipc-broadcast\""));
     assert!(expression.contains("__codexWebBridgeNotificationForwarded"));
     assert!(expression.contains("snapshotCount: messages.length"));
+    assert!(expression.contains("snapshotIndexes"));
+    assert!(expression.contains("pushSnapshotMessage(broadcast);"));
     assert!(expression.contains("bridge-connected"));
     assert!(expression.contains("remote-client-1"));
 }
@@ -326,7 +328,7 @@ fn web_bridge_stream_expression_uses_incremental_buffer() {
 }
 
 #[test]
-fn web_bridge_notification_expression_forwards_all_bridge_events() {
+fn web_bridge_notification_expression_filters_background_fetch_events() {
     let install = web_bridge_notification_install_expression();
     let poll = web_bridge_notification_poll_expression(128);
 
@@ -334,6 +336,8 @@ fn web_bridge_notification_expression_forwards_all_bridge_events() {
     assert!(install.contains("MAX_QUEUE_MESSAGES"));
     assert!(install.contains("MAX_QUEUE_BYTES"));
     assert!(install.contains("typeof data.type !== \"string\""));
+    assert!(install.contains("data.type === \"fetch-response\""));
+    assert!(install.contains("data.type === \"fetch\" && !isFollowerHostResponseFetch(data)"));
     assert!(install.contains("return true;"));
     assert!(install.contains("data.__codexWebBridgeNotificationForwarded"));
     assert!(install.contains("__codexWebBridgeNotificationSeq"));
@@ -434,6 +438,10 @@ fn web_bridge_script_refreshes_stream_snapshot_after_thread_hydration() {
     assert!(WEB_BRIDGE_SCRIPT.contains("scheduleHostSnapshotAfterViewHydration(message);"));
     assert!(WEB_BRIDGE_SCRIPT.contains("remote-view-hydrated"));
     assert!(WEB_BRIDGE_SCRIPT.contains("BRIDGE_HYDRATION_SNAPSHOT_DELAY_MS"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("BRIDGE_SNAPSHOT_REQUEST_DEBOUNCE_MS"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("snapshotRequestInFlight"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("coalesceHostSnapshot"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("requestHostSnapshot(\"remote-view-hydrated\")"));
 }
 
 #[test]

@@ -142,7 +142,8 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	  const BRIDGE_REQUEST_TIMEOUT_MS = 30000;
 	  const BRIDGE_LONG_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 	  const BRIDGE_STREAM_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
-	  const BRIDGE_SNAPSHOT_REQUEST_COOLDOWN_MS = 1000;
+	  const BRIDGE_SNAPSHOT_REQUEST_COOLDOWN_MS = 10000;
+	  const BRIDGE_SNAPSHOT_REQUEST_DEBOUNCE_MS = 250;
 	  const BRIDGE_HYDRATION_SNAPSHOT_DELAY_MS = 100;
 	  const BRIDGE_PEER_HYDRATION_SNAPSHOT_FALLBACK_MS = 1500;
 	  const BRIDGE_THREAD_HYDRATION_METHODS = new Set([
@@ -190,6 +191,9 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	  let nextMessageId = 1;
 	  let lastNotificationSeq = 0;
 	  let lastSnapshotRequestAt = 0;
+	  let snapshotRequestInFlight = false;
+	  let pendingSnapshotRequestTimer = null;
+	  let pendingSnapshotRequestReason = "";
 	  const peerHydrationRequests = new Map();
 	  const bridgeClientId = `codex-web-bridge-frame-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	  const E2EE_AAD = new TextEncoder().encode("codexl-remote-e2ee-v1");
@@ -774,17 +778,68 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 
 	  function requestHostSnapshot(reason, options = {}) {
 	    const force = options.force === true;
-	    const now = Date.now();
-	    if (!force && now - lastSnapshotRequestAt < BRIDGE_SNAPSHOT_REQUEST_COOLDOWN_MS) {
+	    if (force) {
+	      clearPendingHostSnapshotRequest();
+	      sendHostSnapshotRequest(reason);
 	      return;
 	    }
-	    lastSnapshotRequestAt = now;
+
+	    const now = Date.now();
+	    if (snapshotRequestInFlight) {
+	      bridgeDebug("skipHostSnapshot", reason, "in-flight");
+	      return;
+	    }
+	    if (now - lastSnapshotRequestAt < BRIDGE_SNAPSHOT_REQUEST_COOLDOWN_MS) {
+	      bridgeDebug("skipHostSnapshot", reason, "cooldown");
+	      return;
+	    }
+
+	    pendingSnapshotRequestReason = reason;
+	    if (pendingSnapshotRequestTimer) {
+	      bridgeDebug("coalesceHostSnapshot", reason);
+	      return;
+	    }
+
+	    pendingSnapshotRequestTimer = window.setTimeout(() => {
+	      pendingSnapshotRequestTimer = null;
+	      const nextReason = pendingSnapshotRequestReason || reason;
+	      pendingSnapshotRequestReason = "";
+	      const nextNow = Date.now();
+	      if (snapshotRequestInFlight) {
+	        bridgeDebug("skipHostSnapshot", nextReason, "in-flight");
+	        return;
+	      }
+	      if (nextNow - lastSnapshotRequestAt < BRIDGE_SNAPSHOT_REQUEST_COOLDOWN_MS) {
+	        bridgeDebug("skipHostSnapshot", nextReason, "cooldown");
+	        return;
+	      }
+	      sendHostSnapshotRequest(nextReason);
+	    }, BRIDGE_SNAPSHOT_REQUEST_DEBOUNCE_MS);
+	  }
+
+	  function clearPendingHostSnapshotRequest() {
+	    if (pendingSnapshotRequestTimer) {
+	      window.clearTimeout(pendingSnapshotRequestTimer);
+	      pendingSnapshotRequestTimer = null;
+	    }
+	    pendingSnapshotRequestReason = "";
+	  }
+
+	  function sendHostSnapshotRequest(reason) {
+	    if (snapshotRequestInFlight) {
+	      bridgeDebug("skipHostSnapshot", reason, "in-flight");
+	      return;
+	    }
+	    snapshotRequestInFlight = true;
+	    lastSnapshotRequestAt = Date.now();
 	    void sendBridgeRequest({
 	      type: "codex-web-bridge-request-snapshot",
 	      clientId: bridgeClientId,
 	      reason,
 	    }).catch((error) => {
 	      console.warn("[codex-web] bridge snapshot request failed", error);
+	    }).finally(() => {
+	      snapshotRequestInFlight = false;
 	    });
 	  }
 
@@ -819,7 +874,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	      return;
 	    }
 	    window.setTimeout(
-	      () => requestHostSnapshot("remote-view-hydrated", { force: true }),
+	      () => requestHostSnapshot("remote-view-hydrated"),
 	      BRIDGE_HYDRATION_SNAPSHOT_DELAY_MS,
 	    );
 	  }

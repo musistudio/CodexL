@@ -365,6 +365,7 @@ pub async fn dispatch_web_bridge_message(
             .get("clientId")
             .and_then(Value::as_str)
             .unwrap_or("codex-web-bridge");
+        let started_at = Instant::now();
         let cdp_client = web_bridge_cdp_client(cdp_host, cdp_port).await?;
         let result = cdp_client
             .send(
@@ -376,7 +377,24 @@ pub async fn dispatch_web_bridge_message(
                 }),
             )
             .await?;
-        return web_bridge_runtime_value(&result);
+        let value = web_bridge_runtime_value(&result)?;
+        let message_count = value
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let response_bytes = serde_json::to_string(&value)
+            .map(|raw| raw.len())
+            .unwrap_or(0);
+        eprintln!(
+            "[codex-web] bridge snapshot response: reason={} clientId={} messages={} bytes={} elapsedMs={}",
+            reason,
+            client_id,
+            message_count,
+            response_bytes,
+            started_at.elapsed().as_millis()
+        );
+        return Ok(value);
     }
 
     if is_web_file_picker_message(&message) {
@@ -2045,6 +2063,12 @@ pub(super) fn web_bridge_notification_install_expression() -> &'static str {
         if (data.__codexWebBridgeNotificationForwarded) {
           return false;
         }
+        if (data.type === "fetch-response") {
+          return false;
+        }
+        if (data.type === "fetch" && !isFollowerHostResponseFetch(data)) {
+          return false;
+        }
         return true;
       };
       const ipcRequestBody = (data) => {
@@ -2340,6 +2364,7 @@ pub(super) fn web_bridge_snapshot_request_expression(reason: &str, client_id: &s
       const reason = __CODEX_WEB_BRIDGE_SNAPSHOT_REASON__;
       const clientId = __CODEX_WEB_BRIDGE_SNAPSHOT_CLIENT_ID__;
       const messages = [];
+      const snapshotIndexes = Object.create(null);
       const clone = (value) => {
         if (value === undefined) {
           return undefined;
@@ -2358,6 +2383,38 @@ pub(super) fn web_bridge_snapshot_request_expression(reason: &str, client_id: &s
         } catch {
           value.__codexWebBridgeNotificationForwarded = true;
         }
+      };
+      const snapshotKey = (message) => {
+        const params = message && message.params;
+        const change = params && params.change;
+        if (!params || !change || change.type !== "snapshot") {
+          return "";
+        }
+        const version = Number.isFinite(params.version)
+          ? params.version
+          : Number.isFinite(message.version)
+            ? message.version
+            : "";
+        return [
+          params.hostId || "",
+          params.conversationId || "",
+          version,
+          change.type || "",
+        ].join(":");
+      };
+      const pushSnapshotMessage = (message) => {
+        const key = snapshotKey(message);
+        if (!key) {
+          messages.push(message);
+          return;
+        }
+        const existingIndex = snapshotIndexes[key];
+        if (Number.isInteger(existingIndex)) {
+          messages[existingIndex] = message;
+          return;
+        }
+        snapshotIndexes[key] = messages.length;
+        messages.push(message);
       };
       const toIpcBroadcast = (detail) => {
         if (
@@ -2381,7 +2438,7 @@ pub(super) fn web_bridge_snapshot_request_expression(reason: &str, client_id: &s
       const onMessageFromView = (event) => {
         const broadcast = toIpcBroadcast(event?.detail);
         if (broadcast) {
-          messages.push(broadcast);
+          pushSnapshotMessage(broadcast);
         }
       };
       window.addEventListener("codex-message-from-view", onMessageFromView, true);
