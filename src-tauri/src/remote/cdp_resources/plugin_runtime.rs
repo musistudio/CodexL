@@ -14,7 +14,7 @@ const CODEXL_PLUGIN_BRIDGE_PATH: &str = "/plugin/_bridge";
 const CODEXL_PLUGIN_CDP_BINDING_NAME: &str = "__codexlPluginBridge";
 const CODEXL_PLUGIN_INJECT_TIMEOUT_MS: u64 = 20_000;
 const CODEXL_PLUGIN_INJECT_RETRY_MS: u64 = 150;
-const CODEXL_PLUGIN_RUNTIME_VERSION: &str = "0.1.18";
+const CODEXL_PLUGIN_RUNTIME_VERSION: &str = "0.1.19";
 const CODEXL_RENDERER_PLUGIN_ENTRY_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
 const CODEXL_CORE_PLUGIN_ID: &str = "codexl.core";
 #[cfg(test)]
@@ -1653,7 +1653,9 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       }
     };
     const onMessageFromView = (event) => {
-      handleRequest(event?.detail);
+      const message = event?.detail;
+      applyGatewayModelToOutgoingMessage(message);
+      handleRequest(message);
     };
     const onNativeFetchResponse = (event) => {
       const data = event?.data;
@@ -1718,6 +1720,13 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     return String(value?.model || value?.id || "").trim();
   }
 
+  function gatewayModelIdSet() {
+    if (!(runtime.gatewayModelIds instanceof Set)) {
+      runtime.gatewayModelIds = new Set();
+    }
+    return runtime.gatewayModelIds;
+  }
+
   function looksLikeGatewayModelList(models) {
     return models.some((model) => {
       const id = modelId(model);
@@ -1731,10 +1740,342 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     if (!models.length || !looksLikeGatewayModelList(models)) {
       return null;
     }
-    return {
+    const result = {
       defaultModel: models.find((model) => model.isDefault) || models[0] || null,
       models,
     };
+    rememberGatewayModelListResult(result);
+    return result;
+  }
+
+  function rememberGatewayModelListResult(result) {
+    const ids = gatewayModelIdSet();
+    ids.clear();
+    for (const model of result?.models || []) {
+      const id = modelId(model);
+      if (id) {
+        ids.add(id);
+      }
+    }
+    const defaultModel = modelId(result?.defaultModel);
+    if (defaultModel && ids.has(defaultModel)) {
+      runtime.gatewayDefaultModel = defaultModel;
+      rememberGatewaySelectedModel(defaultModel, "default-model-list");
+    }
+    refreshGatewaySelectedModelFromUi();
+  }
+
+  function gatewayModelSourcePriority(source) {
+    if (String(source || "").includes("ui")) {
+      return 80;
+    }
+    if (String(source || "").includes("request")) {
+      return 50;
+    }
+    if (String(source || "").includes("query")) {
+      return 40;
+    }
+    if (String(source || "").includes("default")) {
+      return 10;
+    }
+    return 20;
+  }
+
+  function isKnownGatewayModelId(value) {
+    const id = String(value || "").trim();
+    if (!id) {
+      return false;
+    }
+    const ids = runtime.gatewayModelIds;
+    return ids instanceof Set && ids.has(id);
+  }
+
+  function rememberGatewaySelectedModel(value, source) {
+    const id = typeof value === "string" ? value.trim() : modelId(value);
+    if (!isKnownGatewayModelId(id)) {
+      return false;
+    }
+    const priority = gatewayModelSourcePriority(source);
+    const currentPriority = Number(runtime.gatewaySelectedModelPriority || 0);
+    if (
+      !runtime.gatewaySelectedModel ||
+      id === runtime.gatewaySelectedModel ||
+      priority >= currentPriority
+    ) {
+      runtime.gatewaySelectedModel = id;
+      runtime.gatewaySelectedModelSource = source || "unknown";
+      runtime.gatewaySelectedModelPriority = priority;
+      return true;
+    }
+    return false;
+  }
+
+  function gatewayModelFromText(text) {
+    const value = String(text || "");
+    if (!value.trim()) {
+      return "";
+    }
+    const ids = runtime.gatewayModelIds instanceof Set ? Array.from(runtime.gatewayModelIds) : [];
+    ids.sort((left, right) => right.length - left.length);
+    return ids.find((id) => value.includes(id)) || "";
+  }
+
+  function gatewayModelFromElement(element) {
+    if (!element) {
+      return "";
+    }
+    return (
+      gatewayModelFromText(element.textContent) ||
+      gatewayModelFromText(element.getAttribute?.("aria-label")) ||
+      gatewayModelFromText(element.getAttribute?.("title"))
+    );
+  }
+
+  function refreshGatewaySelectedModelFromUi() {
+    if (!(runtime.gatewayModelIds instanceof Set) || runtime.gatewayModelIds.size === 0) {
+      return "";
+    }
+    const trigger = document.querySelector("[data-codex-intelligence-trigger]");
+    const triggerModel = gatewayModelFromElement(trigger);
+    if (triggerModel) {
+      rememberGatewaySelectedModel(triggerModel, "ui-trigger");
+      return triggerModel;
+    }
+    const selected = Array.from(
+      document.querySelectorAll(
+        '[aria-selected="true"],[aria-checked="true"],[data-state="checked"]'
+      )
+    );
+    for (const element of selected) {
+      const model = gatewayModelFromElement(element);
+      if (model) {
+        rememberGatewaySelectedModel(model, "ui-selected");
+        return model;
+      }
+    }
+    return "";
+  }
+
+  function gatewaySelectedModelFromValue(value, depth = 0, seen = new Set()) {
+    if (!value || depth > 6) {
+      return "";
+    }
+    if (typeof value === "string") {
+      return isKnownGatewayModelId(value) ? value.trim() : "";
+    }
+    if (typeof value !== "object" || seen.has(value)) {
+      return "";
+    }
+    seen.add(value);
+    const explicitKeys = [
+      "selectedModel",
+      "selected_model",
+      "currentModel",
+      "current_model",
+      "latestModel",
+      "latest_model",
+      "activeModel",
+      "active_model",
+    ];
+    for (const key of explicitKeys) {
+      const candidate = gatewaySelectedModelFromValue(value[key], depth + 1, seen);
+      if (candidate) {
+        return candidate;
+      }
+    }
+    const settingsModel = gatewaySelectedModelFromValue(
+      value.collaborationMode?.settings?.model ?? value.collaboration_mode?.settings?.model,
+      depth + 1,
+      seen
+    );
+    if (settingsModel) {
+      return settingsModel;
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (["models", "data", "items"].includes(key)) {
+        continue;
+      }
+      const candidate = gatewaySelectedModelFromValue(child, depth + 1, seen);
+      if (candidate) {
+        return candidate;
+      }
+    }
+    return "";
+  }
+
+  function refreshGatewaySelectedModelFromQueryClient(queryClient) {
+    if (!(runtime.gatewayModelIds instanceof Set) || runtime.gatewayModelIds.size === 0) {
+      return "";
+    }
+    try {
+      for (const query of queryClient?.getQueryCache?.().getAll?.() || []) {
+        const candidate =
+          gatewaySelectedModelFromValue(query.state?.data) ||
+          Array.from(query.observers || [])
+            .map((observer) => gatewaySelectedModelFromValue(observer.getCurrentResult?.().data))
+            .find(Boolean) ||
+          "";
+        if (candidate) {
+          rememberGatewaySelectedModel(candidate, "query-cache");
+          return candidate;
+        }
+      }
+    } catch {}
+    return "";
+  }
+
+  function refreshGatewaySelectedModelState() {
+    const queryClient = findComposerModelQueryClient();
+    refreshGatewaySelectedModelFromQueryClient(queryClient);
+    refreshGatewaySelectedModelFromUi();
+    return runtime.gatewaySelectedModel || runtime.gatewayDefaultModel || "";
+  }
+
+  function requestModelFromParams(params) {
+    if (!params || typeof params !== "object") {
+      return "";
+    }
+    const direct = typeof params.model === "string" ? params.model.trim() : "";
+    if (direct) {
+      return direct;
+    }
+    const collaborationModel =
+      typeof params.collaborationMode?.settings?.model === "string"
+        ? params.collaborationMode.settings.model.trim()
+        : "";
+    return collaborationModel;
+  }
+
+  function applyGatewayModelToParams(params, source) {
+    if (!params || typeof params !== "object") {
+      return false;
+    }
+    const existing = requestModelFromParams(params);
+    if (existing && isKnownGatewayModelId(existing)) {
+      rememberGatewaySelectedModel(existing, `${source}:request-existing`);
+    }
+    const selected = refreshGatewaySelectedModelState();
+    if (!selected || !isKnownGatewayModelId(selected)) {
+      return false;
+    }
+    if (existing && existing === selected) {
+      return false;
+    }
+    if (existing && !isKnownGatewayModelId(existing)) {
+      return false;
+    }
+    params.model = selected;
+    if (params.collaborationMode?.settings && typeof params.collaborationMode.settings === "object") {
+      params.collaborationMode.settings.model = selected;
+    }
+    if (!runtime.gatewayModelRequestInjectionLogged) {
+      runtime.gatewayModelRequestInjectionLogged = true;
+      log("info", "CodexL gateway model request sync installed");
+    }
+    return true;
+  }
+
+  function endpointFromCodexFetchMessage(message) {
+    return desktopApiFetchEndpoint(message);
+  }
+
+  function parseCodexFetchBody(message) {
+    const raw = message?.body;
+    if (typeof raw === "string") {
+      if (!raw.trim()) {
+        return { body: {}, stringBody: true, ok: true };
+      }
+      try {
+        return { body: JSON.parse(raw), stringBody: true, ok: true };
+      } catch {
+        return { body: null, stringBody: true, ok: false };
+      }
+    }
+    if (raw && typeof raw === "object") {
+      return { body: raw, stringBody: false, ok: true };
+    }
+    return { body: {}, stringBody: false, ok: true };
+  }
+
+  function writeCodexFetchBody(message, parsed) {
+    if (!parsed?.ok || !message) {
+      return;
+    }
+    message.body = parsed.stringBody ? JSON.stringify(parsed.body) : parsed.body;
+  }
+
+  function applyGatewayModelToFetchMessage(message) {
+    if (message?.type !== "fetch") {
+      return false;
+    }
+    const endpoint = endpointFromCodexFetchMessage(message);
+    if (!endpoint) {
+      return false;
+    }
+    const parsed = parseCodexFetchBody(message);
+    if (!parsed.ok || !parsed.body || typeof parsed.body !== "object") {
+      return false;
+    }
+    let changed = false;
+    if (
+      endpoint === "start-conversation" ||
+      endpoint === "start-thread-for-host" ||
+      endpoint === "maybe-resume-conversation"
+    ) {
+      changed = applyGatewayModelToParams(parsed.body.params || parsed.body, `fetch:${endpoint}`);
+    } else if (endpoint === "start-turn-for-host") {
+      const params =
+        parsed.body.params && typeof parsed.body.params === "object"
+          ? parsed.body.params
+          : (parsed.body.params = {});
+      changed = applyGatewayModelToParams(params, `fetch:${endpoint}`);
+    } else if (endpoint === "send-cli-request-for-host") {
+      const method = String(parsed.body.method || "").trim();
+      if (method === "thread/start" || method === "thread/resume" || method === "turn/start") {
+        const params =
+          parsed.body.params && typeof parsed.body.params === "object"
+            ? parsed.body.params
+            : (parsed.body.params = {});
+        changed = applyGatewayModelToParams(params, `fetch:${endpoint}:${method}`);
+      }
+    } else if (endpoint === "ipc-request") {
+      const method = String(parsed.body.method || "").trim();
+      if (method === "thread/start" || method === "thread/resume" || method === "turn/start") {
+        const params =
+          parsed.body.params && typeof parsed.body.params === "object"
+            ? parsed.body.params
+            : (parsed.body.params = {});
+        changed = applyGatewayModelToParams(params, `fetch:${endpoint}:${method}`);
+      }
+    }
+    if (changed) {
+      writeCodexFetchBody(message, parsed);
+    }
+    return changed;
+  }
+
+  function applyGatewayModelToMcpMessage(message) {
+    if (message?.type !== "mcp-request") {
+      return false;
+    }
+    const method = message.request?.method;
+    if (!["thread/start", "thread/resume", "turn/start"].includes(method)) {
+      return false;
+    }
+    const params =
+      message.request.params && typeof message.request.params === "object"
+        ? message.request.params
+        : (message.request.params = {});
+    return applyGatewayModelToParams(params, `mcp-request:${method}`);
+  }
+
+  function applyGatewayModelToOutgoingMessage(message) {
+    try {
+      return applyGatewayModelToMcpMessage(message) || applyGatewayModelToFetchMessage(message);
+    } catch (error) {
+      runtime.gatewayModelRequestSyncError = String(error);
+      return false;
+    }
   }
 
   function selectedModelsLength(value) {
@@ -1793,6 +2134,8 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
           } catch {}
         }
       }
+      refreshGatewaySelectedModelFromQueryClient(queryClient);
+      refreshGatewaySelectedModelFromUi();
     } catch (error) {
       runtime.gatewayModelQuerySelectorRepairError = String(error);
     }
@@ -2012,6 +2355,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
           return;
         }
         const patchedSendMessageFromView = async function codexlSendMessageFromView(message) {
+          applyGatewayModelToOutgoingMessage(message);
           if (isListModelsForHostDesktopApiRequest(message)) {
             try {
               if (await maybeHandleListModelsForHostDesktopApiRequest(message)) {
@@ -4987,6 +5331,8 @@ mod tests {
         assert!(script.contains("ide-context"));
         assert!(script.contains("installTranscribeFetchInterceptor"));
         assert!(script.contains("installDesktopApiHostModelListInterceptor"));
+        assert!(script.contains("applyGatewayModelToOutgoingMessage"));
+        assert!(script.contains("CodexL gateway model request sync installed"));
         assert!(script.contains("installGatewayModelQuerySelectorRepair"));
         assert!(script.contains("codex-message-from-view"));
         assert!(script.contains("installDesktopApiTranscribeInterceptor"));
