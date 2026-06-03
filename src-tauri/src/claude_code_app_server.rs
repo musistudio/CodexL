@@ -2,7 +2,6 @@ use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-#[cfg(unix)]
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]

@@ -1296,6 +1296,7 @@ pub fn run() {
     let gateway_state = state.clone();
     let auto_launch_state = state.clone();
     let shutdown_state = state.clone();
+    #[cfg(target_os = "macos")]
     let tray_state = state.clone();
     let shutdown_started_for_run = Arc::new(AtomicBool::new(false));
 
