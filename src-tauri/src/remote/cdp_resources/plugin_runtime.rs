@@ -1228,7 +1228,7 @@ fn safe_relative_path(value: &str) -> Option<PathBuf> {
 
 const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   const RUNTIME_VERSION = "__CODEXL_PLUGIN_RUNTIME_VERSION__";
-  const RUNTIME_BUILD = "mobile-sidebar-actions-1";
+  const RUNTIME_BUILD = "mobile-touch-actions-2";
   const BRIDGE_URL = "__CODEXL_PLUGIN_BRIDGE_URL__";
   const ROOT_ID = "codexl-plugin-runtime-root";
   const CORE_PLUGIN_ID = "codexl.core";
@@ -2936,7 +2936,12 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
         white-space: nowrap;
         z-index: 2147483647;
       }
-      @media (hover: none), (pointer: coarse) {
+      @media (hover: none), (pointer: coarse), (any-pointer: coarse) {
+        [data-testid="app-shell-floating-left-panel"],
+        div:has(> [data-testid="app-shell-floating-left-panel"]) {
+          display: none !important;
+          pointer-events: none !important;
+        }
         [data-app-action-sidebar-thread-row] [class*="group-hover:opacity-100"],
         [data-app-action-sidebar-thread-row] [class*="group-focus-within:opacity-100"],
         [data-app-action-sidebar-thread-row] [class*="group-hover:opacity-50"] {
@@ -2962,9 +2967,197 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
         [data-app-action-sidebar-thread-row] [class*="group-has-"][class*="min-w-20"] {
           min-width: 5rem !important;
         }
+        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:opacity-100"],
+        [role="button"]:has([data-thread-title-trigger]) [class*="group-focus-within:opacity-100"],
+        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:opacity-50"] {
+          opacity: 1 !important;
+        }
+        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:pointer-events-auto"],
+        [role="button"]:has([data-thread-title-trigger]) [class*="group-focus-within:pointer-events-auto"] {
+          pointer-events: auto !important;
+        }
+        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:opacity-0"],
+        [role="button"]:has([data-thread-title-trigger]) [class*="group-focus-within:opacity-0"] {
+          opacity: 0 !important;
+        }
+        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:min-w-5"],
+        [role="button"]:has([data-thread-title-trigger]) [class*="group-has-"][class*="min-w-5"] {
+          min-width: 1.25rem !important;
+        }
+        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:min-w-12"],
+        [role="button"]:has([data-thread-title-trigger]) [class*="group-has-"][class*="min-w-12"] {
+          min-width: 3rem !important;
+        }
+        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:min-w-20"],
+        [role="button"]:has([data-thread-title-trigger]) [class*="group-has-"][class*="min-w-20"] {
+          min-width: 5rem !important;
+        }
+        [role="button"]:has([data-thread-title-trigger]) button {
+          touch-action: manipulation;
+        }
       }
     `;
     (document.head || document.documentElement).appendChild(style);
+  }
+
+  function installMobileSidebarTriggerTouchGuard() {
+    if (runtime.mobileSidebarTriggerTouchGuardInstalled) {
+      return;
+    }
+    runtime.mobileSidebarTriggerTouchGuardInstalled = true;
+    const SIDEBAR_TOUCH_HOVER_SUPPRESSION_MS = 1800;
+    const coarsePointerQuery = (() => {
+      try {
+        return window.matchMedia?.("(hover: none), (pointer: coarse), (any-pointer: coarse)") || null;
+      } catch {
+        return null;
+      }
+    })();
+    const sidebarWordPattern = /(sidebar|side\s*bar|side\s*panel|\u8fb9\u680f|\u4fa7\u8fb9\u680f|\u5074\u908a\u6b04|\u30b5\u30a4\u30c9\u30d0\u30fc|\uc0ac\uc774\ub4dc\ubc14|barra lateral|seitenleiste|barra laterale)/i;
+    const sidebarActionPattern = /(show|hide|toggle|open|close|expand|collapse|\u663e\u793a|\u986f\u793a|\u9690\u85cf|\u96b1\u85cf|\u5207\u6362|\u5207\u63db|\u6253\u5f00|\u958b\u555f|\u5173\u95ed|\u95dc\u9589|\u5c55\u5f00|\u6536\u8d77)/i;
+    let lastSidebarTouchMs = 0;
+    const now = () => {
+      try {
+        return performance.now();
+      } catch {
+        return Date.now();
+      }
+    };
+    const isCoarsePointerEnvironment = () => {
+      try {
+        return navigator.maxTouchPoints > 0 || coarsePointerQuery?.matches === true;
+      } catch {
+        return false;
+      }
+    };
+    const isTouchLikePointerEvent = (event) => {
+      const pointerType = String(event?.pointerType || "");
+      return !pointerType || pointerType === "touch" || pointerType === "pen";
+    };
+    const eventClientX = (event) => {
+      const touch = event?.changedTouches?.[0] || event?.touches?.[0];
+      const value = touch ? touch.clientX : event?.clientX;
+      return Number.isFinite(value) ? value : null;
+    };
+    const sidebarEdgeHoverWidth = () => {
+      try {
+        const viewportWidth = Math.max(
+          document.documentElement?.clientWidth || 0,
+          window.innerWidth || 0
+        );
+        return Math.min(64, Math.max(24, viewportWidth * 0.08));
+      } catch {
+        return 32;
+      }
+    };
+    const isSidebarEdgeEvent = (event) => {
+      const x = eventClientX(event);
+      return x !== null && x <= sidebarEdgeHoverWidth();
+    };
+    const normalizeElement = (target) => {
+      const element = target?.nodeType === 1 ? target : target?.parentElement;
+      return element || null;
+    };
+    const findSidebarTriggerButton = (target) => {
+      const element = normalizeElement(target);
+      if (!element || typeof element.closest !== "function") {
+        return null;
+      }
+      const button = element.closest("button[aria-label],button[title]");
+      if (!button) {
+        return null;
+      }
+      if (button.querySelector('[data-testid="sidebar-unread-badge"]')) {
+        return button;
+      }
+      const label = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("title") || ""}`;
+      if (sidebarWordPattern.test(label) && sidebarActionPattern.test(label)) {
+        return button;
+      }
+      return null;
+    };
+    const findSidebarHoverSurface = (target) => {
+      const element = normalizeElement(target);
+      if (!element || typeof element.closest !== "function") {
+        return null;
+      }
+      return (
+        findSidebarTriggerButton(element) ||
+        element.closest(
+          '[data-testid="app-shell-floating-left-panel"],[data-app-shell-focus-area]'
+        )
+      );
+    };
+    const isSidebarTouchHoverCandidate = (event) => {
+      return Boolean(findSidebarHoverSurface(event.target)) || isSidebarEdgeEvent(event);
+    };
+    const stopHoverEvent = (event) => {
+      try {
+        event.stopImmediatePropagation?.();
+      } catch {}
+      try {
+        event.stopPropagation?.();
+      } catch {}
+    };
+    const rememberSidebarTouch = (event) => {
+      if (!isCoarsePointerEnvironment() || !isTouchLikePointerEvent(event)) {
+        return;
+      }
+      if (!isSidebarTouchHoverCandidate(event)) {
+        return;
+      }
+      try {
+        document.documentElement?.setAttribute("data-codexl-touch-device", "1");
+      } catch {}
+      lastSidebarTouchMs = now();
+    };
+    const suppressSidebarPointerHover = (event) => {
+      if (!isCoarsePointerEnvironment() || !isTouchLikePointerEvent(event)) {
+        return;
+      }
+      if (!isSidebarTouchHoverCandidate(event)) {
+        return;
+      }
+      stopHoverEvent(event);
+    };
+    const suppressCompatMouseHover = (event) => {
+      if (
+        !isCoarsePointerEnvironment() ||
+        now() - lastSidebarTouchMs > SIDEBAR_TOUCH_HOVER_SUPPRESSION_MS
+      ) {
+        return;
+      }
+      if (!isSidebarTouchHoverCandidate(event)) {
+        return;
+      }
+      stopHoverEvent(event);
+    };
+    const capturedTargets = [window, document];
+    for (const target of capturedTargets) {
+      target.addEventListener("pointerover", suppressSidebarPointerHover, true);
+      target.addEventListener("pointerenter", suppressSidebarPointerHover, true);
+      target.addEventListener("pointerdown", rememberSidebarTouch, true);
+      target.addEventListener("pointerup", rememberSidebarTouch, true);
+      target.addEventListener("touchstart", rememberSidebarTouch, true);
+      target.addEventListener("touchend", rememberSidebarTouch, true);
+      target.addEventListener("mouseover", suppressCompatMouseHover, true);
+      target.addEventListener("mouseenter", suppressCompatMouseHover, true);
+      target.addEventListener("mousemove", suppressCompatMouseHover, true);
+    }
+    runtime.cleanup.push(() => {
+      for (const target of capturedTargets) {
+        target.removeEventListener("pointerover", suppressSidebarPointerHover, true);
+        target.removeEventListener("pointerenter", suppressSidebarPointerHover, true);
+        target.removeEventListener("pointerdown", rememberSidebarTouch, true);
+        target.removeEventListener("pointerup", rememberSidebarTouch, true);
+        target.removeEventListener("touchstart", rememberSidebarTouch, true);
+        target.removeEventListener("touchend", rememberSidebarTouch, true);
+        target.removeEventListener("mouseover", suppressCompatMouseHover, true);
+        target.removeEventListener("mouseenter", suppressCompatMouseHover, true);
+        target.removeEventListener("mousemove", suppressCompatMouseHover, true);
+      }
+      runtime.mobileSidebarTriggerTouchGuardInstalled = false;
+    });
   }
 
   async function loadCoreSettings() {
@@ -5086,6 +5279,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       return;
     }
     installGlobalStyle();
+    installMobileSidebarTriggerTouchGuard();
     installCodexAppServerContextBridge();
     installCodexLSettingsInjector();
     installContextIndicator();
@@ -5302,6 +5496,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   installGatewayModelQuerySelectorRepair();
   installDesktopApiTranscribeInterceptor();
   installReactHook();
+  installMobileSidebarTriggerTouchGuard();
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", mount, { once: true });
   } else {
@@ -5376,10 +5571,26 @@ mod tests {
         assert!(script.contains("clearActiveContextUsage"));
         assert!(script.contains("clearActiveContextUsage(\"thread-start\")"));
         assert!(script.contains("const usage = runtime.contextUsageByThread.get(threadId) || null"));
-        assert!(script.contains("mobile-sidebar-actions-1"));
-        assert!(script.contains("@media (hover: none), (pointer: coarse)"));
+        assert!(script.contains("mobile-touch-actions-2"));
+        assert!(script.contains("installMobileSidebarTriggerTouchGuard"));
+        assert!(script.contains("installReactHook();\n  installMobileSidebarTriggerTouchGuard();"));
+        assert!(script.contains("button[aria-label],button[title]"));
+        assert!(script.contains("div:has(> [data-testid=\"app-shell-floating-left-panel\"])"));
+        assert!(script.contains("SIDEBAR_TOUCH_HOVER_SUPPRESSION_MS"));
+        assert!(script.contains("capturedTargets = [window, document]"));
+        assert!(script.contains("app-shell-floating-left-panel"));
+        assert!(script.contains("stopImmediatePropagation"));
+        assert!(script.contains("pointerover"));
+        assert!(script.contains("touchstart"));
+        assert!(script.contains("touchend"));
+        assert!(script.contains("mousemove"));
+        assert!(script.contains("@media (hover: none), (pointer: coarse), (any-pointer: coarse)"));
+        assert!(script.contains("navigator.maxTouchPoints"));
+        assert!(script.contains("data-codexl-touch-device"));
         assert!(script.contains("[data-app-action-sidebar-thread-row]"));
+        assert!(script.contains("[role=\"button\"]:has([data-thread-title-trigger])"));
         assert!(script.contains("[class*=\"group-hover:pointer-events-auto\"]"));
+        assert!(script.contains("touch-action: manipulation"));
         assert!(script.contains("if (!usage)"));
         assert!(!script.contains("new MutationObserver"));
         assert!(!script.contains("setInterval(refreshCodexLSettingsNav"));

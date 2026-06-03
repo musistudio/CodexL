@@ -1,5 +1,5 @@
-import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260601-control-refresh-token-v4";
-import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260601-control-refresh-token-v4";
+import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260603-readable-device-workspace-name-v2";
+import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260603-readable-device-workspace-name-v2";
 
 const MAX_SCREEN_ZOOM = 4;
 const MIN_SCREEN_ZOOM = 1;
@@ -40,7 +40,7 @@ const SIDEBAR_SWIPE_RIGHT_OPEN_REGION_RATIO = 0.22;
 const SIDEBAR_SWIPE_MIN_DISTANCE_PX = 72;
 const SIDEBAR_SWIPE_MAX_VERTICAL_PX = 52;
 const SIDEBAR_SWIPE_DIRECTION_RATIO = 1.35;
-const PWA_BUILD = "20260601-control-refresh-token-v4";
+const PWA_BUILD = "20260603-readable-device-workspace-name-v2";
 const WEB_BRIDGE_URL_PARAM = "codexBridgeUrl";
 const PARENT_BRIDGE_OPEN_MESSAGE = "codex-web-parent-bridge-open";
 const PARENT_BRIDGE_OPENED_MESSAGE = "codex-web-parent-bridge-opened";
@@ -261,11 +261,14 @@ async function connectionFromRemoteInfoCookie() {
       return null;
     }
     const recovered = {
+      deviceName: remoteInfoField(info, "deviceName", "device_name") || "",
+      name: remoteInfoField(info, "name", "itemName", "item_name") || "",
       remoteMode: remoteInfoField(info, "remoteMode", "remote_mode", "mode") || "",
       token: remoteInfoField(info, "token") || "",
       url: remoteInfoField(info, "url", "lanUrl", "lan_url") || location.href,
       webAssetBaseUrl: remoteInfoField(info, "webAssetBaseUrl", "web_asset_base_url") || "",
       webAssetVersion: remoteInfoField(info, "webAssetVersion", "web_asset_version") || "",
+      workspaceName: remoteInfoField(info, "workspaceName", "workspace_name") || "",
     };
     return buildInstanceFromConnection(recovered, {
       existing: { id: urlParams.get("id") || createInstanceId(), status: "Connecting" },
@@ -1671,10 +1674,11 @@ function upsertInstanceFromConnection(connection, { name = "", status = "" } = {
   const identity = instanceIdentity(candidate);
   const existing = instances.find((instance) => instanceIdentity(instance) === identity);
   if (existing) {
+    const suggestedName = suggestedInstanceName(connection);
     const updated = {
       ...existing,
       host: candidate.host,
-      name: normalizeInstanceName(name) || existing.name || candidate.name,
+      name: normalizeInstanceName(name) || suggestedName || existing.name || candidate.name,
       remoteMode: candidate.remoteMode,
       requirePassword: candidate.requirePassword,
       status: status || existing.status,
@@ -1766,7 +1770,11 @@ function buildInstanceFromConnection(connection, { existing = null, name = "", s
       connectionUrl.searchParams.get("mode") ||
       existing?.remoteMode,
   );
-  const displayName = normalizeInstanceName(name) || existing?.name || defaultInstanceName(connectionUrl);
+  const suggestedName = suggestedInstanceName(connection, connectionUrl);
+  if (suggestedName) {
+    connectionUrl.searchParams.set("name", suggestedName);
+  }
+  const displayName = normalizeInstanceName(name) || existing?.name || suggestedName || defaultInstanceName(connectionUrl);
   return {
     createdAt: existing?.createdAt || now,
     host: connectionUrl.host,
@@ -1906,6 +1914,56 @@ function createInstanceId() {
 
 function normalizeInstanceName(name) {
   return String(name || "").trim().replace(/\s+/g, " ");
+}
+
+function suggestedInstanceName(connection, parsedUrl) {
+  let connectionUrl = parsedUrl;
+  if (!connectionUrl) {
+    try {
+      connectionUrl = normalizeConnectionUrl(connection.url);
+    } catch {
+      connectionUrl = null;
+    }
+  }
+
+  const directName = normalizeInstanceName(
+    connection.name ||
+      connectionUrl?.searchParams.get("name") ||
+      connectionUrl?.searchParams.get("itemName") ||
+      connectionUrl?.searchParams.get("item_name") ||
+      "",
+  );
+  if (directName) {
+    return directName;
+  }
+
+  return mobileInstanceItemName(
+    connection.deviceName || connectionUrl?.searchParams.get("deviceName") || connectionUrl?.searchParams.get("device_name") || "",
+    connection.workspaceName ||
+      connectionUrl?.searchParams.get("workspaceName") ||
+      connectionUrl?.searchParams.get("workspace_name") ||
+      "",
+  );
+}
+
+function mobileInstanceItemName(deviceName, workspaceName) {
+  const device = mobileInstanceNameSegment(deviceName);
+  const workspace = mobileInstanceNameSegment(workspaceName);
+  return [device, workspace].filter(Boolean).join("-");
+}
+
+function mobileInstanceNameSegment(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\.local$/i, "")
+    .toLowerCase()
+    .replace(/[\/\\-]+/g, "-")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\s*-\s*/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .trim();
 }
 
 function defaultInstanceName(url) {
@@ -2147,13 +2205,16 @@ function connectionFromUrlParams(params) {
 
   return {
     cloudUser: params.get("cloudUser") || "",
+    deviceName: params.get("deviceName") || params.get("device_name") || "",
     jwt: params.get("jwt") || "",
     remoteMode: params.get("remoteMode") || params.get("mode") || "",
+    name: params.get("name") || params.get("itemName") || params.get("item_name") || "",
     requirePassword: booleanFlag(params.get("requirePassword")) || params.get("e2ee") === E2EE_VERSION,
     token: directToken,
     url: location.href,
     webAssetBaseUrl: params.get("webAssetBaseUrl") || params.get("web_asset_base_url") || "",
     webAssetVersion: params.get("webAssetVersion") || params.get("web_asset_version") || "",
+    workspaceName: params.get("workspaceName") || params.get("workspace_name") || "",
   };
 }
 
@@ -2173,6 +2234,12 @@ function parseConnection(raw) {
         }
         return {
           cloudUser: typeof parsed.cloudUser === "string" ? parsed.cloudUser : connection.cloudUser,
+          deviceName:
+            typeof parsed.deviceName === "string"
+              ? parsed.deviceName
+              : typeof parsed.device_name === "string"
+                ? parsed.device_name
+                : connection.deviceName,
           jwt: typeof parsed.jwt === "string" ? parsed.jwt : connection.jwt,
           remoteMode:
             typeof parsed.remoteMode === "string"
@@ -2184,6 +2251,14 @@ function parseConnection(raw) {
             parsed.requirePassword === true ||
             parsed.require_password === true ||
             connection.requirePassword,
+          name:
+            typeof parsed.name === "string"
+              ? parsed.name
+              : typeof parsed.itemName === "string"
+                ? parsed.itemName
+                : typeof parsed.item_name === "string"
+                  ? parsed.item_name
+                  : connection.name,
           token: typeof parsed.token === "string" ? parsed.token : connection.token,
           url: connection.url,
           webAssetBaseUrl:
@@ -2198,6 +2273,12 @@ function parseConnection(raw) {
               : typeof parsed.web_asset_version === "string"
                 ? parsed.web_asset_version
                 : connection.webAssetVersion,
+          workspaceName:
+            typeof parsed.workspaceName === "string"
+              ? parsed.workspaceName
+              : typeof parsed.workspace_name === "string"
+                ? parsed.workspace_name
+                : connection.workspaceName,
         };
       }
 
@@ -2212,6 +2293,35 @@ function parseConnection(raw) {
         }
         if (typeof parsed.jwt === "string") {
           url.searchParams.set("jwt", parsed.jwt);
+        }
+        const parsedName =
+          typeof parsed.name === "string"
+            ? parsed.name
+            : typeof parsed.itemName === "string"
+              ? parsed.itemName
+              : typeof parsed.item_name === "string"
+                ? parsed.item_name
+                : "";
+        if (parsedName) {
+          url.searchParams.set("name", parsedName);
+        }
+        const parsedDeviceName =
+          typeof parsed.deviceName === "string"
+            ? parsed.deviceName
+            : typeof parsed.device_name === "string"
+              ? parsed.device_name
+              : "";
+        if (parsedDeviceName) {
+          url.searchParams.set("deviceName", parsedDeviceName);
+        }
+        const parsedWorkspaceName =
+          typeof parsed.workspaceName === "string"
+            ? parsed.workspaceName
+            : typeof parsed.workspace_name === "string"
+              ? parsed.workspace_name
+              : "";
+        if (parsedWorkspaceName) {
+          url.searchParams.set("workspaceName", parsedWorkspaceName);
         }
         const parsedMode =
           typeof parsed.remoteMode === "string"
@@ -2245,13 +2355,16 @@ function parseConnection(raw) {
         }
         return {
           cloudUser: typeof parsed.cloudUser === "string" ? parsed.cloudUser : "",
+          deviceName: parsedDeviceName,
           jwt: typeof parsed.jwt === "string" ? parsed.jwt : "",
           remoteMode: parsedMode,
           requirePassword,
+          name: parsedName,
           token: typeof parsed.token === "string" ? parsed.token : "",
           url: url.toString(),
           webAssetBaseUrl: parsedWebAssetBaseUrl,
           webAssetVersion: parsedWebAssetVersion,
+          workspaceName: parsedWorkspaceName,
         };
       }
     }
@@ -2263,13 +2376,16 @@ function parseConnection(raw) {
     const url = normalizeConnectionUrl(value);
     return {
       cloudUser: url.searchParams.get("cloudUser") || "",
+      deviceName: url.searchParams.get("deviceName") || url.searchParams.get("device_name") || "",
       jwt: url.searchParams.get("jwt") || "",
       remoteMode: url.searchParams.get("remoteMode") || url.searchParams.get("mode") || "",
       requirePassword: booleanFlag(url.searchParams.get("requirePassword")) || url.searchParams.get("e2ee") === E2EE_VERSION,
+      name: url.searchParams.get("name") || url.searchParams.get("itemName") || url.searchParams.get("item_name") || "",
       token: url.searchParams.get("token") || "",
       url: url.toString(),
       webAssetBaseUrl: url.searchParams.get("webAssetBaseUrl") || url.searchParams.get("web_asset_base_url") || "",
       webAssetVersion: url.searchParams.get("webAssetVersion") || url.searchParams.get("web_asset_version") || "",
+      workspaceName: url.searchParams.get("workspaceName") || url.searchParams.get("workspace_name") || "",
     };
   } catch {
     return null;

@@ -132,8 +132,13 @@ fn injects_web_bridge_before_module_script() {
     let injected = inject_web_bridge_script(html, None);
 
     let bridge_index = injected.find(WEB_BRIDGE_SCRIPT_PATH).unwrap();
+    let touch_fix_index = injected.find("codexl-mobile-touch-fix").unwrap();
     let module_index = injected.find("type=\"module\"").unwrap();
+    assert!(touch_fix_index < module_index);
     assert!(bridge_index < module_index);
+    assert!(injected.contains("data-codexl-touch-device"));
+    assert!(injected.contains("navigator.maxTouchPoints"));
+    assert!(injected.contains("[data-thread-title-trigger]"));
     assert!(!injected.contains(WEB_PLUGIN_RUNTIME_SCRIPT_PATH));
 }
 
@@ -143,6 +148,7 @@ fn injects_web_bridge_only_once() {
     let injected = inject_web_bridge_script(html, None);
 
     assert_eq!(injected.matches(WEB_BRIDGE_SCRIPT_PATH).count(), 1);
+    assert_eq!(injected.matches("codexl-mobile-touch-fix").count(), 1);
     assert!(!injected.contains(WEB_PLUGIN_RUNTIME_SCRIPT_PATH));
 }
 
@@ -729,4 +735,28 @@ fn rewrites_css_absolute_urls_without_touching_protocol_relative_urls() {
     assert!(rewritten.contains("url(/web/assets/a.png)"));
     assert!(rewritten.contains("url(\"//cdn/a.png\")"));
     assert!(rewritten.contains("url('/web/fonts/a.woff2')"));
+}
+
+#[test]
+fn patches_app_shell_mobile_sidebar_hover_preview() {
+    let app_shell = concat!(
+        "app-shell-floating-left-panel",
+        "let a=t.watch(({get:a})=>{if(a(Ze)){n=!1,r=void 0,i=void 0,e(!1);return}",
+        "R=()=>{s.set(Ne,!0)},z=()=>{s.set(Ne,!1),s.set(Le,!1),s.set(Ae,!1)}",
+    );
+    let patched = patch_codex_app_web_javascript_resource(app_shell);
+
+    assert!(patched.contains("navigator.maxTouchPoints"));
+    assert!(patched.contains("any-pointer: coarse"));
+    assert!(patched.contains("pointerType===`touch`"));
+    assert!(patched.contains("pointerType===`pen`"));
+    assert!(!patched.contains("watch(({get:a})=>{if(a(Ze))"));
+    assert!(!patched.contains("R=()=>{s.set(Ne,!0)}"));
+}
+
+#[test]
+fn leaves_non_app_shell_javascript_unchanged() {
+    let script = "console.log('app-shell-free');";
+
+    assert_eq!(patch_codex_app_web_javascript_resource(script), script);
 }

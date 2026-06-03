@@ -1147,6 +1147,8 @@ impl RemoteRuntimeState {
     }
 
     fn remote_connection_info(&self, cloud_context: bool) -> Result<Value, String> {
+        let device_name = local_device_name();
+        let instance_name = mobile_instance_item_name(&device_name, &self.config.workspace_name);
         let raw_lan_url = remote_url(&self.config.host, self.config.port, &self.config.token);
         let lan_url = append_remote_connection_params(raw_lan_url.clone(), &self.config, false)?;
         let raw_url = if let Some(relay_url) = self.config.relay_url.as_deref() {
@@ -1202,6 +1204,11 @@ impl RemoteRuntimeState {
             "lanUrl": lan_url.clone(),
             "lan_url": lan_url,
             "token": self.config.token.clone(),
+            "name": instance_name.clone(),
+            "itemName": instance_name.clone(),
+            "item_name": instance_name,
+            "deviceName": device_name.clone(),
+            "device_name": device_name,
             "connectionMode": connection_mode,
             "connection_mode": connection_mode,
             "authMode": auth_mode,
@@ -2369,12 +2376,27 @@ fn append_remote_web_asset_params(
     Ok(url.to_string())
 }
 
+fn append_remote_instance_name_param(
+    remote_url: String,
+    config: &RemoteServerConfig,
+) -> Result<String, String> {
+    let item_name = mobile_instance_item_name(&local_device_name(), &config.workspace_name);
+    if item_name.is_empty() {
+        return Ok(remote_url);
+    }
+
+    let mut url = reqwest::Url::parse(&remote_url).map_err(|e| e.to_string())?;
+    url.query_pairs_mut().append_pair("name", &item_name);
+    Ok(url.to_string())
+}
+
 fn append_remote_connection_params(
     remote_url: String,
     config: &RemoteServerConfig,
     include_crypto_params: bool,
 ) -> Result<String, String> {
     let remote_url = append_remote_web_asset_params(remote_url, config)?;
+    let remote_url = append_remote_instance_name_param(remote_url, config)?;
     append_remote_crypto_params(
         remote_url,
         include_crypto_params && remote_requires_crypto(config),
@@ -6613,12 +6635,94 @@ fn fetch_response_error_status(request_id: &str, status: u16, error: &str) -> Va
 }
 
 fn local_device_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
+    static LOCAL_DEVICE_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LOCAL_DEVICE_NAME
+        .get_or_init(|| {
+            local_platform_device_name()
+                .or_else(|| {
+                    std::env::var("COMPUTERNAME")
+                        .or_else(|_| std::env::var("HOSTNAME"))
+                        .ok()
+                })
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "Desktop".to_string())
+        })
+        .clone()
+}
+
+#[cfg(target_os = "macos")]
+fn local_platform_device_name() -> Option<String> {
+    let output = std::process::Command::new("/usr/sbin/scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "Desktop".to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn local_platform_device_name() -> Option<String> {
+    None
+}
+
+fn mobile_instance_item_name(device_name: &str, workspace_name: &str) -> String {
+    let device = mobile_instance_name_segment(device_name);
+    let workspace = mobile_instance_name_segment(workspace_name);
+    match (device.is_empty(), workspace.is_empty()) {
+        (false, false) => format!("{device}-{workspace}"),
+        (false, true) => device,
+        (true, false) => workspace,
+        (true, true) => String::new(),
+    }
+}
+
+fn mobile_instance_name_segment(value: &str) -> String {
+    let mut trimmed = value.trim();
+    if trimmed.len() >= ".local".len()
+        && trimmed[trimmed.len() - ".local".len()..].eq_ignore_ascii_case(".local")
+    {
+        trimmed = &trimmed[..trimmed.len() - ".local".len()];
+    }
+
+    let mut segment = String::new();
+
+    for ch in trimmed.chars() {
+        if matches!(ch, '-' | '/' | '\\') {
+            push_mobile_name_hyphen(&mut segment);
+        } else if ch.is_control() || ch.is_whitespace() {
+            push_mobile_name_space(&mut segment);
+        } else {
+            for lower in ch.to_lowercase() {
+                segment.push(lower);
+            }
+        }
+    }
+
+    while matches!(segment.chars().last(), Some(' ' | '-')) {
+        segment.pop();
+    }
+    segment
+}
+
+fn push_mobile_name_space(segment: &mut String) {
+    if !segment.is_empty() && !matches!(segment.chars().last(), Some(' ' | '-')) {
+        segment.push(' ');
+    }
+}
+
+fn push_mobile_name_hyphen(segment: &mut String) {
+    while matches!(segment.chars().last(), Some(' ' | '-')) {
+        segment.pop();
+    }
+    if !segment.is_empty() {
+        segment.push('-');
+    }
 }
 
 enum BridgeEvent {
@@ -9550,6 +9654,30 @@ mod tests {
         assert_eq!(
             cwd,
             PathBuf::from("/tmp/home/Documents/Codex/1970-01-01/chat-0")
+        );
+    }
+
+    #[test]
+    fn mobile_instance_item_name_uses_device_and_workspace() {
+        assert_eq!(
+            mobile_instance_item_name("xxxxdeMacBook", "abc"),
+            "xxxxdemacbook-abc"
+        );
+        assert_eq!(
+            mobile_instance_item_name("Jin's MacBook Pro.local", "Client Workspace"),
+            "jin's macbook pro-client workspace"
+        );
+        assert_eq!(
+            mobile_instance_item_name("Name's MacBookxxx", "Workspace名"),
+            "name's macbookxxx-workspace名"
+        );
+    }
+
+    #[test]
+    fn mobile_instance_item_name_ignores_repeated_separators() {
+        assert_eq!(
+            mobile_instance_item_name("  Office  MacBook  ", " API / Worker "),
+            "office macbook-api-worker"
         );
     }
 

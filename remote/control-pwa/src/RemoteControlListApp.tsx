@@ -30,7 +30,7 @@ import { decodeCodexQrFromVideo } from "../qrDecoder.js";
 const INSTANCE_STORAGE_KEY = "codexl-remote.instances";
 const CONTROL_CONNECTION_STORAGE_PREFIX = "codexl-remote.control-connection.";
 const REMOTE_MODE_WEB = "web";
-const PWA_BUILD = "20260601-control-refresh-token-v4";
+const PWA_BUILD = "20260603-readable-device-workspace-name-v2";
 const SERVICE_WORKER_URL = `service-worker.js?v=${PWA_BUILD}`;
 const SPRING_TRANSITION = { damping: 30, mass: 0.72, stiffness: 430, type: "spring" } as const;
 const SOFT_SPRING_TRANSITION = { damping: 34, mass: 0.85, stiffness: 300, type: "spring" } as const;
@@ -39,13 +39,16 @@ const INSTANT_TRANSITION = { duration: 0 } as const;
 
 type Connection = {
   cloudUser?: string;
+  deviceName?: string;
   jwt?: string;
   mode?: string;
+  name?: string;
   remoteMode?: string;
   token?: string;
   url: string;
   webAssetBaseUrl?: string;
   webAssetVersion?: string;
+  workspaceName?: string;
 };
 
 type RemoteInstance = {
@@ -891,10 +894,11 @@ function upsertInstanceFromConnection(
   const identity = instanceIdentity(candidate);
   const existing = instances.find((instance) => instanceIdentity(instance) === identity);
   if (existing) {
+    const suggestedName = suggestedInstanceName(connection);
     const updated = {
       ...existing,
       host: candidate.host,
-      name: normalizeInstanceName(name) || existing.name || candidate.name,
+      name: normalizeInstanceName(name) || suggestedName || existing.name || candidate.name,
       remoteMode: candidate.remoteMode,
       status: status || existing.status,
       token: candidate.token,
@@ -952,7 +956,11 @@ function buildInstanceFromConnection(
       connectionUrl.searchParams.get("mode") ||
       existing?.remoteMode,
   );
-  const displayName = normalizeInstanceName(name) || existing?.name || defaultInstanceName(connectionUrl);
+  const suggestedName = suggestedInstanceName(connection, connectionUrl);
+  if (suggestedName) {
+    connectionUrl.searchParams.set("name", suggestedName);
+  }
+  const displayName = normalizeInstanceName(name) || existing?.name || suggestedName || defaultInstanceName(connectionUrl);
 
   return {
     createdAt: existing?.createdAt || now,
@@ -991,6 +999,56 @@ function createInstanceId() {
 
 function normalizeInstanceName(name: string | undefined) {
   return String(name || "").trim().replace(/\s+/g, " ");
+}
+
+function suggestedInstanceName(connection: Connection, parsedUrl?: URL) {
+  let connectionUrl = parsedUrl;
+  if (!connectionUrl) {
+    try {
+      connectionUrl = normalizeConnectionUrl(connection.url);
+    } catch {
+      connectionUrl = undefined;
+    }
+  }
+
+  const directName = normalizeInstanceName(
+    connection.name ||
+      connectionUrl?.searchParams.get("name") ||
+      connectionUrl?.searchParams.get("itemName") ||
+      connectionUrl?.searchParams.get("item_name") ||
+      "",
+  );
+  if (directName) {
+    return directName;
+  }
+
+  return mobileInstanceItemName(
+    connection.deviceName || connectionUrl?.searchParams.get("deviceName") || connectionUrl?.searchParams.get("device_name") || "",
+    connection.workspaceName ||
+      connectionUrl?.searchParams.get("workspaceName") ||
+      connectionUrl?.searchParams.get("workspace_name") ||
+      "",
+  );
+}
+
+function mobileInstanceItemName(deviceName: string | undefined, workspaceName: string | undefined) {
+  const device = mobileInstanceNameSegment(deviceName);
+  const workspace = mobileInstanceNameSegment(workspaceName);
+  return [device, workspace].filter(Boolean).join("-");
+}
+
+function mobileInstanceNameSegment(value: string | undefined) {
+  return String(value || "")
+    .trim()
+    .replace(/\.local$/i, "")
+    .toLowerCase()
+    .replace(/[\/\\-]+/g, "-")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\s*-\s*/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .trim();
 }
 
 function defaultInstanceName(url: URL) {
@@ -1056,12 +1114,15 @@ function connectionFromUrlParams(params: URLSearchParams): Connection | null {
 
   return {
     cloudUser: params.get("cloudUser") || "",
+    deviceName: params.get("deviceName") || params.get("device_name") || "",
     jwt: params.get("jwt") || "",
     remoteMode: params.get("remoteMode") || params.get("mode") || "",
+    name: params.get("name") || params.get("itemName") || params.get("item_name") || "",
     token: directToken,
     url: location.href,
     webAssetBaseUrl: params.get("webAssetBaseUrl") || params.get("web_asset_base_url") || "",
     webAssetVersion: params.get("webAssetVersion") || params.get("web_asset_version") || "",
+    workspaceName: params.get("workspaceName") || params.get("workspace_name") || "",
   };
 }
 
@@ -1086,12 +1147,15 @@ async function connectionFromRemoteInfoCookie(): Promise<Connection | null> {
     }
     return {
       cloudUser: remoteInfoField(info, "cloudUserId", "cloud_user_id") || "",
+      deviceName: remoteInfoField(info, "deviceName", "device_name") || "",
       jwt: "",
       remoteMode: remoteInfoField(info, "remoteMode", "remote_mode", "mode") || "",
+      name: remoteInfoField(info, "name", "itemName", "item_name") || "",
       token: remoteInfoField(info, "token") || "",
       url: remoteInfoField(info, "lanUrl", "lan_url", "url") || location.href,
       webAssetBaseUrl: remoteInfoField(info, "webAssetBaseUrl", "web_asset_base_url") || "",
       webAssetVersion: remoteInfoField(info, "webAssetVersion", "web_asset_version") || "",
+      workspaceName: remoteInfoField(info, "workspaceName", "workspace_name") || "",
     };
   } catch {
     return null;
@@ -1138,6 +1202,12 @@ function parseConnection(raw: string): Connection | null {
         }
         return {
           cloudUser: typeof parsed.cloudUser === "string" ? parsed.cloudUser : connection.cloudUser,
+          deviceName:
+            typeof parsed.deviceName === "string"
+              ? parsed.deviceName
+              : typeof parsed.device_name === "string"
+                ? parsed.device_name
+                : connection.deviceName,
           jwt: typeof parsed.jwt === "string" ? parsed.jwt : connection.jwt,
           remoteMode:
             typeof parsed.remoteMode === "string"
@@ -1145,6 +1215,14 @@ function parseConnection(raw: string): Connection | null {
               : typeof parsed.mode === "string"
                 ? parsed.mode
                 : connection.remoteMode,
+          name:
+            typeof parsed.name === "string"
+              ? parsed.name
+              : typeof parsed.itemName === "string"
+                ? parsed.itemName
+                : typeof parsed.item_name === "string"
+                  ? parsed.item_name
+                  : connection.name,
           token: typeof parsed.token === "string" ? parsed.token : connection.token,
           url: connection.url,
           webAssetBaseUrl:
@@ -1159,6 +1237,12 @@ function parseConnection(raw: string): Connection | null {
               : typeof parsed.web_asset_version === "string"
                 ? parsed.web_asset_version
                 : connection.webAssetVersion,
+          workspaceName:
+            typeof parsed.workspaceName === "string"
+              ? parsed.workspaceName
+              : typeof parsed.workspace_name === "string"
+                ? parsed.workspace_name
+                : connection.workspaceName,
         };
       }
 
@@ -1173,6 +1257,35 @@ function parseConnection(raw: string): Connection | null {
         }
         if (typeof parsed.jwt === "string") {
           url.searchParams.set("jwt", parsed.jwt);
+        }
+        const parsedName =
+          typeof parsed.name === "string"
+            ? parsed.name
+            : typeof parsed.itemName === "string"
+              ? parsed.itemName
+              : typeof parsed.item_name === "string"
+                ? parsed.item_name
+                : "";
+        if (parsedName) {
+          url.searchParams.set("name", parsedName);
+        }
+        const parsedDeviceName =
+          typeof parsed.deviceName === "string"
+            ? parsed.deviceName
+            : typeof parsed.device_name === "string"
+              ? parsed.device_name
+              : "";
+        if (parsedDeviceName) {
+          url.searchParams.set("deviceName", parsedDeviceName);
+        }
+        const parsedWorkspaceName =
+          typeof parsed.workspaceName === "string"
+            ? parsed.workspaceName
+            : typeof parsed.workspace_name === "string"
+              ? parsed.workspace_name
+              : "";
+        if (parsedWorkspaceName) {
+          url.searchParams.set("workspaceName", parsedWorkspaceName);
         }
         const parsedMode =
           typeof parsed.remoteMode === "string"
@@ -1201,12 +1314,15 @@ function parseConnection(raw: string): Connection | null {
         }
         return {
           cloudUser: typeof parsed.cloudUser === "string" ? parsed.cloudUser : "",
+          deviceName: parsedDeviceName,
           jwt: typeof parsed.jwt === "string" ? parsed.jwt : "",
           remoteMode: parsedMode,
+          name: parsedName,
           token: typeof parsed.token === "string" ? parsed.token : "",
           url: url.toString(),
           webAssetBaseUrl: parsedWebAssetBaseUrl,
           webAssetVersion: parsedWebAssetVersion,
+          workspaceName: parsedWorkspaceName,
         };
       }
     }
@@ -1218,12 +1334,15 @@ function parseConnection(raw: string): Connection | null {
     const url = normalizeConnectionUrl(value);
     return {
       cloudUser: url.searchParams.get("cloudUser") || "",
+      deviceName: url.searchParams.get("deviceName") || url.searchParams.get("device_name") || "",
       jwt: url.searchParams.get("jwt") || "",
       remoteMode: url.searchParams.get("remoteMode") || url.searchParams.get("mode") || "",
+      name: url.searchParams.get("name") || url.searchParams.get("itemName") || url.searchParams.get("item_name") || "",
       token: url.searchParams.get("token") || "",
       url: url.toString(),
       webAssetBaseUrl: url.searchParams.get("webAssetBaseUrl") || url.searchParams.get("web_asset_base_url") || "",
       webAssetVersion: url.searchParams.get("webAssetVersion") || url.searchParams.get("web_asset_version") || "",
+      workspaceName: url.searchParams.get("workspaceName") || url.searchParams.get("workspace_name") || "",
     };
   } catch {
     return null;
