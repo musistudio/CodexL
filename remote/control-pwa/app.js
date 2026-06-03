@@ -238,10 +238,7 @@ async function restoreControlConnectionFromCookie() {
     return;
   }
 
-  setStatus("Missing instance");
-  if (emptyState) {
-    emptyState.textContent = "Select an instance from the list.";
-  }
+  navigateToList();
 }
 
 async function connectionFromRemoteInfoCookie() {

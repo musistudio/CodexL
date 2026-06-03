@@ -49,7 +49,7 @@ mod crypto;
 mod input;
 mod util;
 
-use assets::static_response;
+use assets::{manifest_response, static_response};
 use crypto::RemoteCrypto;
 use input::*;
 use util::*;
@@ -134,6 +134,7 @@ pub struct RemoteControlInfo {
     pub web_asset_version: String,
     pub cdp_host: String,
     pub cdp_port: u16,
+    pub cdp_ready: bool,
     pub control_client_count: usize,
     pub frame_client_count: usize,
 }
@@ -149,6 +150,7 @@ impl RemoteControlHandle {
         let mut info = self.info.clone();
         info.running = !self.runtime.stopped.load(Ordering::Relaxed);
         info.relay_connected = self.runtime.relay_connected().await;
+        info.cdp_ready = self.runtime.cdp_ready().await;
         info.control_client_count = self.runtime.control_client_count().await;
         info.frame_client_count = self.runtime.frame_client_count().await;
         info
@@ -260,7 +262,15 @@ pub async fn start_remote_control(
         return Ok(info);
     }
 
-    let app_config = state.config.lock().await.clone();
+    let (app_config, token) = {
+        let mut app_config = state.config.lock().await;
+        let (token, token_created) =
+            app_config.remote_control_token_for_profile(&profile_name, make_token)?;
+        if token_created {
+            app_config.save()?;
+        }
+        (app_config.clone(), token)
+    };
     let profile = app_config.provider_profile(&profile_name);
     let use_cloud_relay = use_cloud_relay
         .or_else(|| {
@@ -345,7 +355,6 @@ pub async fn start_remote_control(
         .map(|profile| config::normalized_remote_frontend_mode(&profile.remote_frontend_mode))
         .unwrap_or_else(|| backend.mode().to_string());
 
-    let token = make_token();
     let relay_connection_id = relay_url.as_ref().map(|_| make_relay_connection_id());
     let public_token = relay_connection_id.clone().unwrap_or_else(|| token.clone());
     let remote_password = if require_e2ee {
@@ -455,6 +464,7 @@ pub async fn start_remote_control(
             web_asset_version: server_config.web_asset_version.clone(),
             cdp_host: server_config.cdp_host.clone(),
             cdp_port: server_config.cdp_port,
+            cdp_ready: false,
             control_client_count: 0,
             frame_client_count: 0,
         },
@@ -692,6 +702,9 @@ async fn route_remote_request(
             StatusCode::OK,
             runtime.remote_connection_info(request_is_cloud_remote_context(request))?,
         )),
+        (&Method::GET, "/manifest.webmanifest") => {
+            manifest_response(runtime.home_screen_manifest_start_url(request)?)
+        }
         (&Method::GET, "/api/targets") => {
             let targets = runtime.bridge_targets().await?;
             Ok(json_response(StatusCode::OK, json!({ "targets": targets })))
@@ -1109,6 +1122,12 @@ impl RemoteRuntimeState {
             )) {
                 response.headers_mut().append(SET_COOKIE, value);
             }
+            if let Ok(value) = HeaderValue::from_str(&format!(
+                "{}={}; Path=/manifest.webmanifest; HttpOnly; SameSite=Lax",
+                REMOTE_AUTH_COOKIE_NAME, self.config.token
+            )) {
+                response.headers_mut().append(SET_COOKIE, value);
+            }
         }
         response
     }
@@ -1117,6 +1136,13 @@ impl RemoteRuntimeState {
         match self.backend.cli_bridge() {
             Some(cli_bridge) => cli_bridge.status().await,
             None => self.bridge.status().await,
+        }
+    }
+
+    async fn cdp_ready(&self) -> bool {
+        match &self.backend {
+            RemoteBackend::Cli(cli_bridge) => cli_bridge.connected.load(Ordering::Relaxed),
+            RemoteBackend::App => self.bridge.ready().await,
         }
     }
 
@@ -1207,6 +1233,25 @@ impl RemoteRuntimeState {
             "workspacePath": self.config.workspace_path.clone(),
             "workspace_path": self.config.workspace_path.clone(),
         }))
+    }
+
+    fn home_screen_manifest_start_url(
+        &self,
+        request: &Request<Incoming>,
+    ) -> Result<Option<String>, String> {
+        if !self.authorized(request) {
+            return Ok(None);
+        }
+
+        let raw_lan_url = remote_url(&self.config.host, self.config.port, &self.config.token);
+        let lan_url = append_remote_connection_params(raw_lan_url, &self.config, false)?;
+        let mut start_url =
+            reqwest::Url::parse("http://codexl.invalid/").map_err(|e| e.to_string())?;
+        start_url
+            .query_pairs_mut()
+            .append_pair("url", &lan_url)
+            .append_pair("addOnly", "1");
+        Ok(start_url.query().map(|query| format!("./?{}", query)))
     }
 
     async fn bridge_targets(&self) -> Result<Vec<CdpTarget>, String> {
@@ -6789,6 +6834,10 @@ impl CdpBridge {
             "target": self.target.lock().await.clone(),
             "viewportOverrideSuspended": false,
         })
+    }
+
+    async fn ready(&self) -> bool {
+        self.connected.load(Ordering::Relaxed) && self.target.lock().await.is_some()
     }
 
     async fn set_screencast_enabled(&self, enabled: bool) -> Result<(), String> {

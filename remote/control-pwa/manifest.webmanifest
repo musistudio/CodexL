@@ -1,6 +1,6 @@
 {
-  "name": "CodexL Remote",
-  "short_name": "CodexL Remote",
+  "name": "CodexLR",
+  "short_name": "CodexLR",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

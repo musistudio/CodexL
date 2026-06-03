@@ -3,7 +3,7 @@ use bytes::Bytes;
 use http_body_util::Full;
 use hyper::header::CONTENT_TYPE;
 use hyper::{Response, StatusCode};
-use serde_json::json;
+use serde_json::{json, Value};
 
 const INDEX_HTML: &str = include_str!("../../../remote/control-pwa/index.html");
 const CONTROL_HTML: &str = include_str!("../../../remote/control-pwa/control.html");
@@ -84,6 +84,22 @@ pub(super) fn static_response(path: &str) -> Result<Response<HttpBody>, String> 
             json!({ "error": "not found" }),
         )),
     }
+}
+
+pub(super) fn manifest_response(start_url: Option<String>) -> Result<Response<HttpBody>, String> {
+    let mut manifest = serde_json::from_str::<Value>(MANIFEST).map_err(|e| e.to_string())?;
+    if let Some(start_url) = start_url.filter(|value| !value.trim().is_empty()) {
+        if let Value::Object(map) = &mut manifest {
+            map.insert("start_url".to_string(), Value::String(start_url));
+        }
+    }
+    let body = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Cache-Control", "no-store")
+        .header(CONTENT_TYPE, "application/manifest+json; charset=utf-8")
+        .body(Full::new(Bytes::from(body)))
+        .map_err(|e| e.to_string())
 }
 
 fn text_response(

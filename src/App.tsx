@@ -27,6 +27,7 @@ import {
   Eye,
   EyeOff,
   ExternalLink,
+  FileCog,
   FolderOpen,
   Globe,
   ImageIcon,
@@ -415,6 +416,7 @@ type AppConfig = {
   remote_transcribe_model: string;
   device_uuid: string;
   remote_cloud_auth: RemoteCloudAuthConfig;
+  remote_control_tokens?: Record<string, string>;
   language: Language;
   appearance: Appearance;
   codex_path: string;
@@ -486,6 +488,7 @@ type RemoteControlInfo = {
   web_asset_version: string;
   cdp_host: string;
   cdp_port: number;
+  cdp_ready: boolean;
   control_client_count: number;
   frame_client_count: number;
 };
@@ -2422,6 +2425,9 @@ function App() {
   const showRemoteQr = useCallback(
     (profile: ProviderProfile, remote: RemoteControlInfo) => {
       try {
+        if (!remoteControlReadyForQr(remote)) {
+          return;
+        }
         const url = remote.lan_url || remote.url;
         const qrUrl = compactRemoteQrUrl(url);
         setRemoteQr({
@@ -2921,7 +2927,7 @@ function ProfileCard({
   const remote = status?.remote_control || null;
   const isRunning = Boolean(status?.running || remote?.running);
   const isRemoteRunning = Boolean(remote?.running);
-  const showRemoteActions = isRunning && Boolean(remote?.url);
+  const showRemoteActions = isRunning && remoteControlReadyForQr(remote);
   const codexProfileName =
     profile.provider_config_format === "top_level"
       ? profile.provider_name || profile.name
@@ -3618,7 +3624,7 @@ function AppSettingsDialog({
             />
             <SettingsNavButton
               active={activeSection === "profiles"}
-              icon={<CircleUserRound className="h-4 w-4" />}
+              icon={<FileCog className="h-4 w-4" />}
               label={strings.profiles}
               onClick={() => setActiveSection("profiles")}
             />
@@ -4064,7 +4070,7 @@ function ProfileSettingsPanel({
       ) : null}
 
       <div className="flex items-center justify-between gap-3">
-        <SectionTitle icon={<CircleUserRound className="h-4 w-4" />} title={strings.profiles} />
+        <SectionTitle icon={<FileCog className="h-4 w-4" />} title={strings.profiles} />
         <Button
           type="button"
           variant="outline"
@@ -8017,10 +8023,6 @@ function RemoteQrDialog({
             <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs font-mono break-all">
               {remoteQr.url}
             </div>
-            <div className="text-[11px] font-semibold uppercase text-muted-foreground">{strings.token}</div>
-            <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs font-mono break-all">
-              {remoteQr.remote.token}
-            </div>
           </div>
           <div className="grid grid-cols-2 gap-2">
             <Button
@@ -8490,6 +8492,13 @@ function normalizeRemoteFrontendMode(value: unknown): RemoteFrontendMode {
 
 function remoteFrontendModeUsesCli(mode: RemoteFrontendMode | string) {
   return normalizeRemoteFrontendMode(mode) === "cli";
+}
+
+function remoteControlReadyForQr(remote: RemoteControlInfo | null) {
+  if (!remote?.running || !remote.url) {
+    return false;
+  }
+  return remote.cdp_ready === true;
 }
 
 function compactRemoteQrUrl(value: string) {

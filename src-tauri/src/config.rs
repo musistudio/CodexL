@@ -1,6 +1,6 @@
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -549,6 +549,8 @@ pub struct AppConfig {
     pub remote_transcribe_model: String,
     pub device_uuid: String,
     pub remote_cloud_auth: RemoteCloudAuthConfig,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub remote_control_tokens: BTreeMap<String, String>,
     pub language: String,
     pub appearance: String,
     pub codex_path: String,
@@ -587,6 +589,7 @@ impl Default for AppConfig {
             ),
             device_uuid: env_string("CODEXL_DEVICE_UUID", ""),
             remote_cloud_auth: RemoteCloudAuthConfig::from_env(),
+            remote_control_tokens: BTreeMap::new(),
             language: env_string("CODEXL_LANGUAGE", "en"),
             appearance: env_string("CODEXL_APPEARANCE", "system"),
             codex_path: std::env::var("CODEXL_CODEX_PATH").unwrap_or_default(),
@@ -728,6 +731,7 @@ impl AppConfig {
                 self.active_provider = provider_profile_key(profile);
             }
         }
+        self.normalize_remote_control_tokens();
 
         let mut bot_configs = normalize_saved_bot_configs(std::mem::take(&mut self.bot_configs));
         for profile in &self.provider_profiles {
@@ -937,6 +941,69 @@ impl AppConfig {
         profile.remote_e2ee_password = next_password;
         self.normalize();
         self.save()
+    }
+
+    pub fn remote_control_token_for_profile<F>(
+        &mut self,
+        profile_selector: &str,
+        generate_token: F,
+    ) -> Result<(String, bool), String>
+    where
+        F: FnOnce() -> String,
+    {
+        let token_key = self
+            .provider_profile(profile_selector)
+            .as_ref()
+            .map(provider_profile_key)
+            .unwrap_or_else(|| profile_selector.trim().to_string());
+        if token_key.is_empty() {
+            return Err("Remote control profile is missing.".to_string());
+        }
+
+        if let Some(existing) = self
+            .remote_control_tokens
+            .get(&token_key)
+            .map(|token| token.trim())
+            .filter(|token| is_remote_control_token(token))
+        {
+            return Ok((existing.to_string(), false));
+        }
+
+        let token = generate_token().trim().to_string();
+        if !is_remote_control_token(&token) {
+            return Err("Generated remote control token is invalid.".to_string());
+        }
+        self.remote_control_tokens.insert(token_key, token.clone());
+        Ok((token, true))
+    }
+
+    fn normalize_remote_control_tokens(&mut self) {
+        let previous = std::mem::take(&mut self.remote_control_tokens);
+        if previous.is_empty() {
+            return;
+        }
+
+        let mut next = BTreeMap::new();
+        let mut live_keys = BTreeSet::new();
+        for profile in &self.provider_profiles {
+            let key = provider_profile_key(profile);
+            live_keys.insert(key.clone());
+            for candidate in [key.as_str(), profile.id.trim(), profile.name.trim()] {
+                if candidate.is_empty() {
+                    continue;
+                }
+                if let Some(token) = previous
+                    .get(candidate)
+                    .map(|token| token.trim())
+                    .filter(|token| is_remote_control_token(token))
+                {
+                    next.insert(key.clone(), token.to_string());
+                    break;
+                }
+            }
+        }
+        next.retain(|key, _| live_keys.contains(key));
+        self.remote_control_tokens = next;
     }
 
     fn provider_profile_index(&self, selector: &str) -> Option<usize> {
@@ -3410,6 +3477,10 @@ fn ensure_provider_profile_identity(profile: &mut ProviderProfile) {
     }
 }
 
+fn is_remote_control_token(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
 pub fn normalized_remote_frontend_mode(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         REMOTE_FRONTEND_MODE_CLI => REMOTE_FRONTEND_MODE_CLI.to_string(),
@@ -4307,6 +4378,54 @@ model_provider = "old-provider"
         assert_ne!(duplicates[0].id, duplicates[1].id);
         assert!(config.provider_profile(&duplicates[0].id).is_some());
         assert!(config.provider_profile(&duplicates[1].id).is_some());
+    }
+
+    #[test]
+    fn remote_control_token_stays_bound_to_provider_profile_id() {
+        let profile_id = "11111111-1111-4111-8111-111111111111";
+        let mut config = AppConfig {
+            provider_profiles: vec![ProviderProfile {
+                id: profile_id.to_string(),
+                name: "workspace".to_string(),
+                provider_name: String::new(),
+                model: String::new(),
+                ..ProviderProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+        config.normalize();
+
+        let (first, first_created) = config
+            .remote_control_token_for_profile("workspace", || "a".repeat(64))
+            .expect("first token");
+        let (second, second_created) = config
+            .remote_control_token_for_profile("workspace", || "b".repeat(64))
+            .expect("second token");
+
+        assert!(first_created);
+        assert!(!second_created);
+        assert_eq!(first, second);
+
+        let profile_index = config
+            .provider_profiles
+            .iter()
+            .position(|profile| profile.id == profile_id)
+            .expect("profile index");
+        config.provider_profiles[profile_index].name = "renamed-workspace".to_string();
+        config.normalize();
+        let (renamed, renamed_created) = config
+            .remote_control_token_for_profile("renamed-workspace", || "c".repeat(64))
+            .expect("renamed token");
+
+        assert!(!renamed_created);
+        assert_eq!(first, renamed);
+        assert_eq!(
+            config
+                .remote_control_tokens
+                .get(profile_id)
+                .map(String::as_str),
+            Some(first.as_str())
+        );
     }
 
     #[test]

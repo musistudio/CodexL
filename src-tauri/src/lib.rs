@@ -539,6 +539,15 @@ async fn update_config(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    {
+        let current_config = state.config.lock().await;
+        for (key, token) in &current_config.remote_control_tokens {
+            new_config
+                .remote_control_tokens
+                .entry(key.clone())
+                .or_insert_with(|| token.clone());
+        }
+    }
     new_config.normalize();
     ensure_extensions_runtime_for_config(&new_config).await?;
     new_config.save()?;

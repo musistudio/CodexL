@@ -208,27 +208,57 @@ export function RemoteControlListApp() {
   }
 
   useEffect(() => {
-    registerServiceWorker();
-    const resetResult = resetTransientInstanceStatuses(readStoredInstances());
-    if (resetResult.changed) {
-      saveStoredInstances(resetResult.instances);
-    }
+    let cancelled = false;
 
-    const initialConnection = connectionFromUrlParams(new URLSearchParams(location.search));
-    if (initialConnection) {
-      const result = upsertInstanceFromConnection(resetResult.instances, initialConnection, { status: "Not connected" });
-      if (result.instance) {
-        persistInstances(result.instances);
-        navigateToControl(result.instance);
+    const initialize = async () => {
+      registerServiceWorker();
+      const resetResult = resetTransientInstanceStatuses(readStoredInstances());
+      if (resetResult.changed) {
+        saveStoredInstances(resetResult.instances);
+      }
+
+      const urlParams = new URLSearchParams(location.search);
+      const initialConnection = connectionFromUrlParams(urlParams);
+      if (initialConnection) {
+        const result = upsertInstanceFromConnection(resetResult.instances, initialConnection, {
+          status: "Not connected",
+        });
+        if (result.instance) {
+          persistInstances(result.instances);
+          if (shouldAddOnlyFromUrlParams(urlParams)) {
+            replaceListUrlWithoutConnectionParams();
+            return;
+          }
+          navigateToControl(result.instance);
+          return;
+        }
+      }
+
+      const restoredConnection = await connectionFromRemoteInfoCookie();
+      if (cancelled) {
         return;
       }
-    }
+      if (restoredConnection) {
+        const result = upsertInstanceFromConnection(resetResult.instances, restoredConnection, {
+          status: "Not connected",
+        });
+        if (result.instance) {
+          persistInstances(result.instances);
+          return;
+        }
+      }
 
-    setInstances(resetResult.instances);
-    if (resetResult.instances.length === 0) {
-      setAddLocked(true);
-      setAddOpen(true);
-    }
+      setInstances(resetResult.instances);
+      if (resetResult.instances.length === 0) {
+        setAddLocked(true);
+        setAddOpen(true);
+      }
+    };
+
+    void initialize();
+    return () => {
+      cancelled = true;
+    };
   }, [persistInstances]);
 
   useEffect(() => () => stopQrScan(), []);
@@ -553,7 +583,7 @@ export function RemoteControlListApp() {
         <DialogContent>
           <MotionDialogPanel reduceMotion={reduceMotion}>
             <DialogHeader>
-              <p className="text-xs font-bold text-primary">CodexL Remote</p>
+              <p className="text-xs font-bold text-primary">CodexLR</p>
               <DialogTitle>Edit instance</DialogTitle>
             </DialogHeader>
 
@@ -606,7 +636,7 @@ export function RemoteControlListApp() {
         <DialogContent className="max-w-sm" showCloseButton={false}>
           <MotionDialogPanel reduceMotion={reduceMotion}>
             <DialogHeader>
-              <p className="text-xs font-bold text-primary">CodexL Remote</p>
+              <p className="text-xs font-bold text-primary">CodexLR</p>
               <DialogTitle>Delete instance</DialogTitle>
               <DialogDescription>
                 Delete "{deleteInstance?.name || "Untitled instance"}"? This instance will be removed from the list.
@@ -1033,6 +1063,63 @@ function connectionFromUrlParams(params: URLSearchParams): Connection | null {
     webAssetBaseUrl: params.get("webAssetBaseUrl") || params.get("web_asset_base_url") || "",
     webAssetVersion: params.get("webAssetVersion") || params.get("web_asset_version") || "",
   };
+}
+
+async function connectionFromRemoteInfoCookie(): Promise<Connection | null> {
+  try {
+    const infoUrl = new URL(`${websocketBasePath(location.pathname)}/api/remote-info`, location.origin);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 1800);
+    const response = await fetch(infoUrl, {
+      cache: "no-store",
+      credentials: "same-origin",
+      signal: controller.signal,
+    }).finally(() => {
+      window.clearTimeout(timeout);
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const info = (await response.json()) as Record<string, unknown>;
+    if (!info || typeof info !== "object") {
+      return null;
+    }
+    return {
+      cloudUser: remoteInfoField(info, "cloudUserId", "cloud_user_id") || "",
+      jwt: "",
+      remoteMode: remoteInfoField(info, "remoteMode", "remote_mode", "mode") || "",
+      token: remoteInfoField(info, "token") || "",
+      url: remoteInfoField(info, "lanUrl", "lan_url", "url") || location.href,
+      webAssetBaseUrl: remoteInfoField(info, "webAssetBaseUrl", "web_asset_base_url") || "",
+      webAssetVersion: remoteInfoField(info, "webAssetVersion", "web_asset_version") || "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function remoteInfoField(info: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    const value = info[key];
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function shouldAddOnlyFromUrlParams(params: URLSearchParams) {
+  const value = params.get("addOnly") || params.get("add_only") || "";
+  return value === "1" || value.toLowerCase() === "true";
+}
+
+function replaceListUrlWithoutConnectionParams() {
+  try {
+    const url = new URL("index.html", location.href);
+    history.replaceState(null, "", url.toString());
+  } catch {
+    // The connection is already stored; keeping the original URL is still usable.
+  }
 }
 
 function parseConnection(raw: string): Connection | null {

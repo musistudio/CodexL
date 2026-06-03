@@ -27,7 +27,7 @@ const pwaDir = path.join(rootDir, "remote", "control-pwa");
 const pwaIcon = path.join(pwaDir, "icon.png");
 const pwaIconAssets = [
   { name: "favicon-32x32.png", size: 32 },
-  { name: "apple-touch-icon.png", size: 180 },
+  { name: "apple-touch-icon.png", size: 180, opaque: true },
   { name: "icon-192.png", size: 192 },
   { name: "icon-512.png", size: 512 },
   { name: "icon-maskable-512.png", size: 512 },
@@ -123,12 +123,22 @@ function syncPwaIcons(file) {
 
   const rows = unfilterScanlines(zlib.inflateSync(png.imageData), png.width, png.height, 4);
   for (const asset of pwaIconAssets) {
-    writeRgbaPng(
-      path.join(pwaDir, asset.name),
-      asset.size,
-      asset.size,
-      resizeRgbaRows(rows, png.width, png.height, asset.size),
-    );
+    const source = asset.opaque ? cropVisibleRgbaRows(rows, png.width, png.height) : {
+      height: png.height,
+      rows,
+      width: png.width,
+    };
+    const resizedRows = resizeRgbaRows(source.rows, source.width, source.height, asset.size);
+    if (asset.opaque) {
+      writeRgbPng(
+        path.join(pwaDir, asset.name),
+        asset.size,
+        asset.size,
+        opaqueRgbRowsWithSymbol(resizedRows, asset.size, asset.size),
+      );
+    } else {
+      writeRgbaPng(path.join(pwaDir, asset.name), asset.size, asset.size, resizedRows);
+    }
   }
 }
 
@@ -319,6 +329,179 @@ function writeRgbaPng(file, width, height, rows) {
   ];
 
   writeFileSync(file, Buffer.concat([PNG_SIGNATURE, ...outputChunks]));
+}
+
+function cropVisibleRgbaRows(rows, width, height) {
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y += 1) {
+    const row = rows[y];
+    for (let x = 0; x < width; x += 1) {
+      if (row[x * 4 + 3] <= 8) {
+        continue;
+      }
+
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+  }
+
+  if (maxX < minX || maxY < minY) {
+    return { height, rows, width };
+  }
+
+  const croppedWidth = maxX - minX + 1;
+  const croppedHeight = maxY - minY + 1;
+  const croppedRows = [];
+  for (let y = minY; y <= maxY; y += 1) {
+    croppedRows.push(Buffer.from(rows[y].subarray(minX * 4, (maxX + 1) * 4)));
+  }
+
+  return {
+    height: croppedHeight,
+    rows: croppedRows,
+    width: croppedWidth,
+  };
+}
+
+function writeRgbPng(file, width, height, rows) {
+  const scanlines = rows.map((row) => Buffer.concat([Buffer.from([0]), row]));
+  const outputChunks = [
+    chunk(
+      "IHDR",
+      Buffer.concat([uint32(width), uint32(height), Buffer.from([8, 2, 0, 0, 0])]),
+    ),
+    chunk("IDAT", zlib.deflateSync(Buffer.concat(scanlines), { level: 9 })),
+    chunk("IEND", Buffer.alloc(0)),
+  ];
+
+  writeFileSync(file, Buffer.concat([PNG_SIGNATURE, ...outputChunks]));
+}
+
+function opaqueRgbRowsWithSymbol(rows, width, height) {
+  const top = [169, 139, 255];
+  const center = [82, 101, 248];
+  const bottom = [18, 86, 245];
+  const outputRows = [];
+
+  for (let y = 0; y < height; y += 1) {
+    const row = rows[y];
+    const output = Buffer.alloc(width * 3);
+    for (let x = 0; x < width; x += 1) {
+      const sourceOffset = x * 4;
+      const targetOffset = x * 3;
+      const alpha = whiteSymbolAlpha(row, sourceOffset, x, y, width, height);
+      const background = iconBackgroundColor(x, y, width, height, top, center, bottom);
+      const iconColor = [
+        255 * alpha + background[0] * (1 - alpha),
+        255 * alpha + background[1] * (1 - alpha),
+        255 * alpha + background[2] * (1 - alpha),
+      ];
+      const maskAlpha = iosIconMaskAlpha(x, y, width, height);
+      output[targetOffset] = clampByte(iconColor[0] * maskAlpha + 16 * (1 - maskAlpha));
+      output[targetOffset + 1] = clampByte(iconColor[1] * maskAlpha + 17 * (1 - maskAlpha));
+      output[targetOffset + 2] = clampByte(iconColor[2] * maskAlpha + 20 * (1 - maskAlpha));
+    }
+    outputRows.push(output);
+  }
+
+  return outputRows;
+}
+
+function whiteSymbolAlpha(row, offset, x, y, width, height) {
+  if (x < width * 0.1 || x > width * 0.9 || y < height * 0.24 || y > height * 0.76) {
+    return 0;
+  }
+
+  const sourceAlpha = row[offset + 3] / 255;
+  if (sourceAlpha <= 0) {
+    return 0;
+  }
+
+  const red = row[offset];
+  const green = row[offset + 1];
+  const blue = row[offset + 2];
+  const min = Math.min(red, green, blue);
+  const max = Math.max(red, green, blue);
+  const brightness = clampUnit((min - 178) / 77);
+  const neutrality = clampUnit((96 - (max - min)) / 96);
+
+  return clampUnit(sourceAlpha * brightness * neutrality);
+}
+
+function iconBackgroundColor(x, y, width, height, top, center, bottom) {
+  const vertical = height <= 1 ? 0 : y / (height - 1);
+  const horizontal = width <= 1 ? 0 : x / (width - 1);
+  const base = vertical < 0.5
+    ? mixColor(top, center, vertical * 2)
+    : mixColor(center, bottom, (vertical - 0.5) * 2);
+  const highlight = (1 - vertical) * (1 - Math.abs(horizontal - 0.36) * 1.25);
+  const depth = vertical * (0.72 + horizontal * 0.28);
+  return [
+    clampByte(base[0] + highlight * 18 - depth * 8),
+    clampByte(base[1] + highlight * 14 - depth * 10),
+    clampByte(base[2] + highlight * 20 + depth * 16),
+  ];
+}
+
+function iosIconMaskAlpha(x, y, width, height) {
+  const radius = Math.min(width, height) * 0.2237;
+  const px = x + 0.5;
+  const py = y + 0.5;
+  const left = radius;
+  const right = width - radius;
+  const top = radius;
+  const bottom = height - radius;
+  const cornerX = px < left ? left : px > right ? right : px;
+  const cornerY = py < top ? top : py > bottom ? bottom : py;
+  const distance = Math.hypot(px - cornerX, py - cornerY);
+
+  return clampUnit(radius + 0.5 - distance);
+}
+
+function averageVisibleColor(rows, width, startY, endY) {
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+  let total = 0;
+
+  for (let y = startY; y < endY && y < rows.length; y += 1) {
+    const row = rows[y];
+    for (let x = 0; x < width; x += 1) {
+      const offset = x * 4;
+      const alpha = row[offset + 3] / 255;
+      if (alpha <= 0.2) {
+        continue;
+      }
+      red += row[offset] * alpha;
+      green += row[offset + 1] * alpha;
+      blue += row[offset + 2] * alpha;
+      total += alpha;
+    }
+  }
+
+  if (total === 0) {
+    return [88, 107, 244];
+  }
+
+  return [red / total, green / total, blue / total];
+}
+
+function mixColor(from, to, amount) {
+  return [
+    from[0] + (to[0] - from[0]) * amount,
+    from[1] + (to[1] - from[1]) * amount,
+    from[2] + (to[2] - from[2]) * amount,
+  ];
+}
+
+function clampUnit(value) {
+  return Math.max(0, Math.min(1, value));
 }
 
 function readPng(file) {

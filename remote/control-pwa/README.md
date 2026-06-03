@@ -1,4 +1,4 @@
-# CodexL Remote PWA
+# CodexLR PWA
 
 Standalone mobile controller for CodexL remote instances.
 
@@ -10,13 +10,19 @@ http://192.168.1.10:3147/?token=...
 ```
 
 Opening the same URL directly skips the scanner and starts the controller.
+When installed to the iOS Home Screen from an authorized LAN URL, the local
+server gives iOS a list-page start URL with the current connection embedded.
+The list opens first and automatically adds that LAN instance without starting
+the controller.
 
 ## Remote authentication
 
-Each LAN remote-control server start creates a fresh 256-bit random access
-token. Clients can present it as the `token` query parameter, a `Bearer` token
-for HTTP API requests, or the short-lived HttpOnly `codexl_remote_token` cookie
-set after an explicitly authenticated `/web` request.
+Each provider profile keeps a persistent 256-bit random LAN remote-control
+access token. The token is created the first time that profile starts remote
+control and is reused across later remote-control restarts. Clients can present
+it as the `token` query parameter, a `Bearer` token for HTTP API requests, or
+the short-lived HttpOnly `codexl_remote_token` cookie set after an explicitly
+authenticated `/web` request.
 
 The control page defaults to `Web` mode and hides the old Screen selector. Web
 mode embeds the mirrored Codex frontend from `/web/` and forwards host messages
