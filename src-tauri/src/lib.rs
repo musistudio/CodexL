@@ -584,6 +584,7 @@ async fn update_remote_cloud_auth(
         config.clone()
     };
 
+    remote::update_remote_cloud_auth_config(state.inner(), &next_config).await;
     refresh_macos_tray_menu(&app, state.inner(), &next_config).await;
     Ok(next_config)
 }

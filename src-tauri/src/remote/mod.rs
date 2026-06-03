@@ -503,6 +503,27 @@ pub(crate) async fn update_remote_transcribe_api_config(state: &AppState, config
     }
 }
 
+pub(crate) async fn update_remote_cloud_auth_config(state: &AppState, config: &AppConfig) {
+    let mut cloud_auth = config.remote_cloud_auth.clone();
+    cloud_auth.normalize();
+    let cloud_auth = if cloud_auth.is_logged_in() {
+        Some(cloud_auth)
+    } else {
+        None
+    };
+    let runtimes: Vec<Arc<RemoteRuntimeState>> = {
+        let controls = state.remote_controls.lock().await;
+        controls
+            .values()
+            .filter(|handle| handle.info.relay_url.is_some())
+            .map(|handle| handle.runtime.clone())
+            .collect()
+    };
+    for runtime in runtimes {
+        runtime.set_cloud_auth(cloud_auth.clone()).await;
+    }
+}
+
 pub async fn remote_control_status_map(state: &AppState) -> HashMap<String, RemoteControlInfo> {
     let controls = state.remote_controls.lock().await;
     let mut statuses = HashMap::new();
@@ -967,6 +988,7 @@ struct RemoteRuntimeState {
     relay_web_bridge_notification_pumps: Mutex<HashSet<String>>,
     relay_web_bridge_tasks: Arc<Semaphore>,
     stopped: AtomicBool,
+    cloud_auth: Mutex<Option<RemoteCloudAuthConfig>>,
     transcribe_api: Mutex<TranscribeApiConfig>,
 }
 
@@ -983,6 +1005,7 @@ impl RemoteRuntimeState {
     ) -> Arc<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let bridge = Arc::new(CdpBridge::new(config.clone(), event_tx));
+        let initial_cloud_auth = config.cloud_auth.clone();
         let runtime = Arc::new(Self {
             backend,
             bridge,
@@ -999,6 +1022,7 @@ impl RemoteRuntimeState {
             relay_web_bridge_notification_pumps: Mutex::new(HashSet::new()),
             relay_web_bridge_tasks: Arc::new(Semaphore::new(RELAY_WEB_BRIDGE_TASK_LIMIT)),
             stopped: AtomicBool::new(false),
+            cloud_auth: Mutex::new(initial_cloud_auth),
             transcribe_api: Mutex::new(transcribe_api),
         });
         let event_runtime = runtime.clone();
@@ -1045,6 +1069,17 @@ impl RemoteRuntimeState {
         if let Some(cli_bridge) = self.backend.cli_bridge() {
             cli_bridge.set_transcribe_api(transcribe_api).await;
         }
+    }
+
+    async fn set_cloud_auth(&self, cloud_auth: Option<RemoteCloudAuthConfig>) {
+        *self.cloud_auth.lock().await = cloud_auth;
+        if self.config.relay_url.is_some() {
+            self.clear_relay_state().await;
+        }
+    }
+
+    async fn current_cloud_auth(&self) -> Option<RemoteCloudAuthConfig> {
+        self.cloud_auth.lock().await.clone()
     }
 
     fn authorized(&self, request: &Request<Incoming>) -> bool {
@@ -1701,14 +1736,18 @@ impl RemoteRuntimeState {
             .relay_url
             .as_deref()
             .ok_or_else(|| "missing remote relay URL".to_string())?;
+        let cloud_auth = self.current_cloud_auth().await;
+        if self.config.cloud_auth.is_some() && cloud_auth.is_none() {
+            return Err("cloud remote identity is signed out".to_string());
+        }
         let ws_url = relay_host_ws_url(
             relay_url,
             &self.config.token,
-            self.config.cloud_auth.is_some(),
+            cloud_auth.is_some(),
         )?;
         let ws_url = append_relay_metadata_to_ws_url(ws_url, &self.config)?;
         let mut request = ws_url.into_client_request().map_err(|e| e.to_string())?;
-        if let Some(auth) = self.config.cloud_auth.as_ref() {
+        if let Some(auth) = cloud_auth.as_ref() {
             let headers = request.headers_mut();
             let authorization = HeaderValue::from_str(&format!("Bearer {}", auth.access_token))
                 .map_err(|e| e.to_string())?;
