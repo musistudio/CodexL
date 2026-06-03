@@ -67,6 +67,7 @@ const FRAME_META_INTERVAL_MS: u64 = 250;
 const CLI_APP_SERVER_REQUEST_TIMEOUT_MS: u64 = 5 * 60_000;
 const CLI_APP_SERVER_FETCH_TIMEOUT_MS: u64 = 30_000;
 const CLI_READ_FILE_BINARY_MAX_BYTES: u64 = 20 * 1024 * 1024;
+const CLI_READ_FILE_TEXT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const CLI_APP_SERVER_RESUME_TURNS_LIMIT: u64 = 5;
 const CLI_APP_SERVER_REQUEST_ID_PREFIX: &str = "codexl-remote-cli-";
 const CLI_APP_SERVER_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -1740,11 +1741,7 @@ impl RemoteRuntimeState {
         if self.config.cloud_auth.is_some() && cloud_auth.is_none() {
             return Err("cloud remote identity is signed out".to_string());
         }
-        let ws_url = relay_host_ws_url(
-            relay_url,
-            &self.config.token,
-            cloud_auth.is_some(),
-        )?;
+        let ws_url = relay_host_ws_url(relay_url, &self.config.token, cloud_auth.is_some())?;
         let ws_url = append_relay_metadata_to_ws_url(ws_url, &self.config)?;
         let mut request = ws_url.into_client_request().map_err(|e| e.to_string())?;
         if let Some(auth) = cloud_auth.as_ref() {
@@ -2694,7 +2691,7 @@ impl CliAppBridge {
             child: Mutex::new(Some(child)),
             codex_home,
             connected: AtomicBool::new(true),
-            global_state: Mutex::new(HashMap::new()),
+            global_state: Mutex::new(default_cli_global_state()),
             initialize_result: Mutex::new(None),
             next_notification_seq: AtomicU64::new(1),
             next_request_id: AtomicU64::new(1),
@@ -3402,17 +3399,68 @@ impl CliAppBridge {
                     Vec::new(),
                 ))
             }
+            "read-file" => Ok((cli_read_file_response(&params)?, Vec::new())),
             "read-file-binary" => Ok((cli_read_file_binary_response(&params)?, Vec::new())),
+            "read-file-metadata" => Ok((cli_read_file_metadata_response(&params)?, Vec::new())),
+            "upload-local-file-attachments-for-host" => Ok((
+                cli_upload_local_file_attachments_response(&params),
+                Vec::new(),
+            )),
+            "steer-turn-for-host" => Err(cli_steer_turn_inactive_error(&params)),
+            "interrupt-conversation" => {
+                let response = self
+                    .request_cli_method_response(
+                        "turn/interrupt",
+                        cli_turn_interrupt_params(&params)?,
+                        CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+                    )
+                    .await?;
+                Ok((json_response_result(response)?, Vec::new()))
+            }
+            "set-thread-title" => {
+                let response = self
+                    .request_cli_method_response(
+                        "thread/name/set",
+                        cli_thread_name_set_params(&params)?,
+                        CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+                    )
+                    .await?;
+                Ok((json_response_result(response)?, Vec::new()))
+            }
+            "set-thread-goal" => {
+                let response = self
+                    .request_cli_method_response(
+                        "thread/goal/set",
+                        cli_thread_goal_set_params(&params)?,
+                        CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+                    )
+                    .await?;
+                Ok((json_response_result(response)?, Vec::new()))
+            }
+            "set-thread-goal-status" => self.set_cli_thread_goal_status(params).await,
+            "clear-thread-goal" => {
+                let response = self
+                    .request_cli_method_response(
+                        "thread/goal/clear",
+                        cli_thread_id_params(&params)?,
+                        CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+                    )
+                    .await?;
+                Ok((json_response_result(response)?, Vec::new()))
+            }
+            "clear-thread-goal-resume-confirmation"
+            | "ensure-conversation-history-loaded"
+            | "hydrate-pinned-threads"
+            | "set-thread-memory-mode-for-host" => Ok((json!({}), Vec::new())),
             "start-turn-for-host" => {
-                let conversation_id = params
-                    .get("conversationId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "start-turn-for-host missing conversationId".to_string())?;
-                let turn_params = cli_turn_start_params(
-                    conversation_id,
-                    params.get("params").cloned().unwrap_or_else(|| json!({})),
-                    None,
-                );
+                let endpoint_params = cli_thread_action_endpoint_params(&params);
+                let conversation_id =
+                    cli_conversation_id_from_params_for(endpoint_params, "start-turn-for-host")?;
+                let turn_input_params = endpoint_params
+                    .get("params")
+                    .cloned()
+                    .unwrap_or_else(|| endpoint_params.clone());
+                let turn_params = cli_turn_start_params(&conversation_id, turn_input_params, None);
                 let response = self
                     .request_cli_method_response(
                         "turn/start",
@@ -3429,6 +3477,38 @@ impl CliAppBridge {
                 endpoint
             )),
         }
+    }
+
+    async fn set_cli_thread_goal_status(
+        &self,
+        params: Value,
+    ) -> Result<(Value, Vec<Value>), String> {
+        let endpoint_params = codex_fetch_endpoint_params(&params);
+        let thread_id = cli_conversation_id_from_params(endpoint_params)?;
+        let status = endpoint_params
+            .get("status")
+            .cloned()
+            .ok_or_else(|| "set-thread-goal-status missing status".to_string())?;
+        let current_response = self
+            .request_cli_method_response(
+                "thread/goal/get",
+                json!({ "threadId": thread_id }),
+                CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+            )
+            .await?;
+        let current_goal = json_response_result(current_response)?
+            .get("goal")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let goal_params = cli_thread_goal_status_set_params(endpoint_params, current_goal, status)?;
+        let response = self
+            .request_cli_method_response(
+                "thread/goal/set",
+                goal_params,
+                CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+            )
+            .await?;
+        Ok((json_response_result(response)?, Vec::new()))
     }
 
     async fn start_cli_conversation(&self, params: Value) -> Result<(Value, Vec<Value>), String> {
@@ -4703,6 +4783,14 @@ fn codex_fetch_endpoint_params(value: &Value) -> &Value {
         .unwrap_or(value)
 }
 
+fn cli_thread_action_endpoint_params(value: &Value) -> &Value {
+    if value.get("conversationId").is_some() || value.get("threadId").is_some() {
+        value
+    } else {
+        codex_fetch_endpoint_params(value)
+    }
+}
+
 fn cli_read_file_binary_response(params: &Value) -> Result<Value, String> {
     let endpoint_params = codex_fetch_endpoint_params(params);
     let path = endpoint_params
@@ -4729,6 +4817,63 @@ fn cli_read_file_binary_response(params: &Value) -> Result<Value, String> {
     Ok(json!({ "contentsBase64": BASE64_STANDARD.encode(&bytes) }))
 }
 
+fn cli_read_file_response(params: &Value) -> Result<Value, String> {
+    let path = cli_file_path_from_params(params, "read-file")?;
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("cannot open file {}: {}", path.display(), err))?;
+    if !metadata.is_file() {
+        return Err(format!("not a file: {}", path.display()));
+    }
+    if metadata.len() > CLI_READ_FILE_TEXT_MAX_BYTES {
+        return Err(format!(
+            "file too large for text preview: {} bytes (limit {} bytes)",
+            metadata.len(),
+            CLI_READ_FILE_TEXT_MAX_BYTES
+        ));
+    }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|err| format!("cannot read text file {}: {}", path.display(), err))?;
+    Ok(json!({ "contents": contents }))
+}
+
+fn cli_read_file_metadata_response(params: &Value) -> Result<Value, String> {
+    let path = cli_file_path_from_params(params, "read-file-metadata")?;
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("cannot stat file {}: {}", path.display(), err))?;
+    Ok(json!({
+        "isFile": metadata.is_file(),
+        "mtimeMs": file_modified_millis(&metadata),
+        "sizeBytes": metadata.is_file().then_some(metadata.len()),
+    }))
+}
+
+fn cli_file_path_from_params<'a>(params: &'a Value, endpoint: &str) -> Result<&'a Path, String> {
+    let endpoint_params = codex_fetch_endpoint_params(params);
+    let path = endpoint_params
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| format!("{endpoint} missing path"))?;
+    Ok(Path::new(path))
+}
+
+fn file_modified_millis(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+}
+
+fn cli_upload_local_file_attachments_response(params: &Value) -> Value {
+    let endpoint_params = codex_fetch_endpoint_params(params);
+    endpoint_params
+        .get("attachments")
+        .cloned()
+        .unwrap_or_else(|| json!([]))
+}
+
 fn cli_workspace_root_options_response(store: &HashMap<String, Value>) -> Value {
     json!({
         "roots": cli_workspace_roots(store),
@@ -4738,6 +4883,28 @@ fn cli_workspace_root_options_response(store: &HashMap<String, Value>) -> Value 
 
 fn cli_active_workspace_roots_response(store: &HashMap<String, Value>) -> Value {
     json!({ "roots": cli_active_workspace_roots(store) })
+}
+
+fn default_cli_global_state() -> HashMap<String, Value> {
+    let mut store = HashMap::new();
+    let Some(root) = default_cli_workspace_root() else {
+        return store;
+    };
+    cli_store_string_vec(
+        &mut store,
+        CLI_WORKSPACE_ROOT_OPTIONS_KEY,
+        vec![root.clone()],
+    );
+    cli_store_string_vec(&mut store, CLI_ACTIVE_WORKSPACE_ROOTS_KEY, vec![root]);
+    store
+}
+
+fn default_cli_workspace_root() -> Option<String> {
+    let path = std::env::current_dir().ok()?;
+    if path.parent().is_none() || !std::fs::metadata(&path).ok()?.is_dir() {
+        return None;
+    }
+    Some(path.to_string_lossy().to_string())
 }
 
 fn cli_add_workspace_root_endpoint_response(
@@ -5073,9 +5240,7 @@ fn cli_frontend_compat_endpoint_response(
             "arch": std::env::consts::ARCH,
         })),
         "paths-exist" => Some(cli_paths_exist_response(params)),
-        "projectless-workspace-root" => Some(json!({
-            "workspaceRoot": Value::Null,
-        })),
+        "projectless-workspace-root" => Some(cli_projectless_workspace_root_response()),
         "set-configuration" => Some(json!({
             "value": params.get("value").cloned().unwrap_or(Value::Null),
         })),
@@ -5678,6 +5843,15 @@ fn create_cli_projectless_thread_cwd(
     Ok(projectless_thread_cwd_response(&cwd, &workspace_root))
 }
 
+fn cli_projectless_workspace_root_response() -> Value {
+    let workspace_root = home_directory_opt()
+        .map(|home| home.join("Documents").join("Codex"))
+        .map(|path| path.to_string_lossy().to_string())
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    json!({ "workspaceRoot": workspace_root })
+}
+
 fn projectless_thread_cwd_response(cwd: &Path, workspace_root: &Path) -> Value {
     let cwd = cwd.to_string_lossy().to_string();
     let workspace_root = workspace_root.to_string_lossy().to_string();
@@ -5989,11 +6163,122 @@ fn cli_start_conversation_has_first_turn(params: &Value) -> bool {
 }
 
 fn cli_conversation_id_from_params(params: &Value) -> Result<String, String> {
-    let params = codex_fetch_endpoint_params(params);
+    cli_conversation_id_from_params_for(params, "maybe-resume-conversation")
+}
+
+fn cli_conversation_id_from_params_for(params: &Value, endpoint: &str) -> Result<String, String> {
     ["conversationId", "threadId"]
         .iter()
         .find_map(|key| non_empty_json_string(params.get(*key)))
-        .ok_or_else(|| "maybe-resume-conversation missing conversationId".to_string())
+        .or_else(|| {
+            let nested = codex_fetch_endpoint_params(params);
+            if std::ptr::eq(nested, params) {
+                None
+            } else {
+                ["conversationId", "threadId"]
+                    .iter()
+                    .find_map(|key| non_empty_json_string(nested.get(*key)))
+            }
+        })
+        .ok_or_else(|| format!("{endpoint} missing conversationId"))
+}
+
+fn cli_thread_id_params(params: &Value) -> Result<Value, String> {
+    let thread_id = cli_conversation_id_from_params_for(params, "thread endpoint")?;
+    Ok(json!({ "threadId": thread_id }))
+}
+
+fn cli_turn_interrupt_params(params: &Value) -> Result<Value, String> {
+    let endpoint_params = codex_fetch_endpoint_params(params);
+    let thread_id = cli_conversation_id_from_params_for(endpoint_params, "interrupt-conversation")?;
+    let mut output = Map::new();
+    output.insert("threadId".to_string(), json!(thread_id));
+    if let Some(turn_id) = endpoint_params
+        .get("turnId")
+        .filter(|value| !value.is_null())
+    {
+        output.insert("turnId".to_string(), turn_id.clone());
+    }
+    Ok(Value::Object(output))
+}
+
+fn cli_thread_name_set_params(params: &Value) -> Result<Value, String> {
+    let endpoint_params = codex_fetch_endpoint_params(params);
+    let thread_id = cli_conversation_id_from_params_for(endpoint_params, "set-thread-title")?;
+    let mut output = Map::new();
+    output.insert("threadId".to_string(), json!(thread_id));
+    if let Some(name) = endpoint_params
+        .get("title")
+        .or_else(|| endpoint_params.get("name"))
+        .filter(|value| !value.is_null())
+    {
+        output.insert("name".to_string(), name.clone());
+    }
+    Ok(Value::Object(output))
+}
+
+fn cli_thread_goal_set_params(params: &Value) -> Result<Value, String> {
+    let endpoint_params = codex_fetch_endpoint_params(params);
+    let thread_id = cli_conversation_id_from_params_for(endpoint_params, "set-thread-goal")?;
+    let mut output = Map::new();
+    output.insert("threadId".to_string(), json!(thread_id));
+    if let Some(goal) = endpoint_params.get("goal").filter(|value| !value.is_null()) {
+        output.insert("goal".to_string(), goal.clone());
+    } else {
+        for key in [
+            "objective",
+            "status",
+            "tokenBudget",
+            "token_budget",
+            "summary",
+            "createdAt",
+            "updatedAt",
+        ] {
+            if let Some(value) = endpoint_params.get(key).filter(|value| !value.is_null()) {
+                output.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    Ok(Value::Object(output))
+}
+
+fn cli_thread_goal_status_set_params(
+    params: &Value,
+    current_goal: Value,
+    status: Value,
+) -> Result<Value, String> {
+    let thread_id = cli_conversation_id_from_params_for(params, "set-thread-goal-status")?;
+    let mut goal = current_goal.as_object().cloned().unwrap_or_default();
+    goal.insert("status".to_string(), status);
+    for key in [
+        "objective",
+        "tokenBudget",
+        "token_budget",
+        "summary",
+        "createdAt",
+        "updatedAt",
+    ] {
+        if let Some(value) = params.get(key).filter(|value| !value.is_null()) {
+            goal.insert(key.to_string(), value.clone());
+        }
+    }
+    Ok(json!({
+        "threadId": thread_id,
+        "goal": Value::Object(goal),
+    }))
+}
+
+fn cli_steer_turn_inactive_error(params: &Value) -> String {
+    let thread_id =
+        cli_conversation_id_from_params_for(params, "steer-turn-for-host").unwrap_or_default();
+    if thread_id.is_empty() {
+        "SteerTurnInactiveError: cannot steer inactive local turn".to_string()
+    } else {
+        format!(
+            "SteerTurnInactiveError: cannot steer inactive local turn for conversation {}",
+            thread_id
+        )
+    }
 }
 
 fn cli_maybe_resume_params(
@@ -6094,7 +6379,8 @@ fn cli_conversation_snapshot_message(
     );
     let created_at = json_seconds_to_millis(thread.get("createdAt")).unwrap_or_else(now_millis);
     let updated_at = json_seconds_to_millis(thread.get("updatedAt")).unwrap_or(created_at);
-    let title = non_empty_json_string(thread.get("name"))
+    let title = non_empty_json_string(thread.get("title"))
+        .or_else(|| non_empty_json_string(thread.get("name")))
         .or_else(|| non_empty_json_string(thread.get("preview")))
         .map(Value::String)
         .unwrap_or(Value::Null);
@@ -7864,6 +8150,25 @@ fn is_websocket_upgrade(request: &Request<Incoming>) -> bool {
 mod tests {
     use super::*;
 
+    static CURRENT_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct CurrentDirGuard(PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    fn restore_env(name: &str, value: Option<OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
+
     fn test_remote_server_config() -> RemoteServerConfig {
         RemoteServerConfig {
             host: "127.0.0.1".to_string(),
@@ -8461,6 +8766,44 @@ mod tests {
     }
 
     #[test]
+    fn cli_thread_action_endpoint_params_preserves_top_level_conversation_id() {
+        let body = json!({
+            "conversationId": "thread-1",
+            "params": {
+                "input": [{ "type": "text", "text": "hello" }]
+            }
+        });
+        let params = cli_thread_action_endpoint_params(&body);
+
+        assert_eq!(
+            params.get("conversationId").and_then(Value::as_str),
+            Some("thread-1")
+        );
+        assert_eq!(
+            params
+                .get("params")
+                .and_then(|value| value.get("input"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn cli_conversation_id_from_params_checks_nested_action_body() {
+        let body = json!({
+            "params": {
+                "conversationId": "thread-2"
+            }
+        });
+
+        assert_eq!(
+            cli_conversation_id_from_params_for(&body, "test").as_deref(),
+            Ok("thread-2")
+        );
+    }
+
+    #[test]
     fn cli_read_file_binary_response_returns_base64_contents() {
         let root = std::env::temp_dir().join(format!(
             "codexl-cli-read-file-{}-{}",
@@ -8482,6 +8825,130 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_read_file_response_returns_text_contents() {
+        let root = std::env::temp_dir().join(format!(
+            "codexl-cli-read-text-file-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let file = root.join("note.txt");
+        std::fs::write(&file, "hello codex").expect("write temp file");
+
+        let response = cli_read_file_response(&json!({
+            "params": { "path": file.to_string_lossy() }
+        }))
+        .expect("read text response");
+
+        assert_eq!(
+            response.get("contents").and_then(Value::as_str),
+            Some("hello codex")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_read_file_metadata_response_returns_frontend_shape() {
+        let root = std::env::temp_dir().join(format!(
+            "codexl-cli-read-file-metadata-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let file = root.join("note.txt");
+        std::fs::write(&file, "hello").expect("write temp file");
+
+        let response = cli_read_file_metadata_response(&json!({
+            "params": { "path": file.to_string_lossy() }
+        }))
+        .expect("read metadata response");
+
+        assert_eq!(response.get("isFile").and_then(Value::as_bool), Some(true));
+        assert_eq!(response.get("sizeBytes").and_then(Value::as_u64), Some(5));
+        assert!(response.get("mtimeMs").and_then(Value::as_u64).is_some());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_upload_local_file_attachments_response_returns_attachments() {
+        let response = cli_upload_local_file_attachments_response(&json!({
+            "params": {
+                "attachments": [
+                    { "id": "attachment-1", "path": "/tmp/a.txt" }
+                ]
+            }
+        }));
+
+        assert_eq!(
+            response
+                .as_array()
+                .and_then(|attachments| attachments.first())
+                .and_then(|attachment| attachment.get("id"))
+                .and_then(Value::as_str),
+            Some("attachment-1")
+        );
+    }
+
+    #[test]
+    fn cli_steer_turn_error_uses_frontend_fallback_name() {
+        let error = cli_steer_turn_inactive_error(&json!({
+            "conversationId": "thread-1"
+        }));
+
+        assert!(error.contains("SteerTurnInactiveError"));
+        assert!(error.contains("thread-1"));
+    }
+
+    #[test]
+    fn cli_thread_name_set_params_maps_title_to_name() {
+        let params = cli_thread_name_set_params(&json!({
+            "conversationId": "thread-1",
+            "title": "Custom title"
+        }))
+        .expect("thread name params");
+
+        assert_eq!(
+            params.get("threadId").and_then(Value::as_str),
+            Some("thread-1")
+        );
+        assert_eq!(
+            params.get("name").and_then(Value::as_str),
+            Some("Custom title")
+        );
+    }
+
+    #[test]
+    fn cli_thread_goal_status_set_params_merges_existing_goal() {
+        let params = cli_thread_goal_status_set_params(
+            &json!({
+                "conversationId": "thread-1",
+                "summary": "done"
+            }),
+            json!({
+                "objective": "ship it",
+                "status": "in_progress"
+            }),
+            json!("complete"),
+        )
+        .expect("goal status params");
+
+        assert_eq!(
+            params.pointer("/goal/objective").and_then(Value::as_str),
+            Some("ship it")
+        );
+        assert_eq!(
+            params.pointer("/goal/status").and_then(Value::as_str),
+            Some("complete")
+        );
+        assert_eq!(
+            params.pointer("/goal/summary").and_then(Value::as_str),
+            Some("done")
+        );
     }
 
     #[test]
@@ -8524,6 +8991,45 @@ mod tests {
         assert!(messages.iter().any(|message| {
             message.get("type").and_then(Value::as_str) == Some("workspace-root-option-added")
         }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_default_global_state_uses_current_dir_workspace_root() {
+        let _dir_lock = CURRENT_DIR_TEST_LOCK.lock().expect("current dir lock");
+        let old_dir = std::env::current_dir().expect("current dir");
+        let _guard = CurrentDirGuard(old_dir);
+        let root = std::env::temp_dir().join(format!(
+            "codexl-cli-default-workspace-root-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        std::env::set_current_dir(&root).expect("set current dir");
+        let expected = std::env::current_dir()
+            .expect("current temp dir")
+            .to_string_lossy()
+            .into_owned();
+
+        let store = default_cli_global_state();
+
+        assert_eq!(
+            cli_workspace_root_options_response(&store)
+                .get("roots")
+                .and_then(Value::as_array)
+                .and_then(|roots| roots.first())
+                .and_then(Value::as_str),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            cli_active_workspace_roots_response(&store)
+                .get("roots")
+                .and_then(Value::as_array)
+                .and_then(|roots| roots.first())
+                .and_then(Value::as_str),
+            Some(expected.as_str())
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -9400,7 +9906,8 @@ mod tests {
             &json!({
                 "thread": {
                     "id": "thread-1",
-                    "name": "Test thread",
+                    "name": "11111111-1111-4111-8111-111111111111",
+                    "title": "Test thread",
                     "createdAt": 1,
                     "updatedAt": 2,
                     "path": "/Users/alice/.codex/sessions/thread.jsonl",
@@ -9437,6 +9944,10 @@ mod tests {
             .pointer("/params/change/conversationState")
             .expect("conversation state");
         assert_eq!(state.get("id").and_then(Value::as_str), Some("thread-1"));
+        assert_eq!(
+            state.get("title").and_then(Value::as_str),
+            Some("Test thread")
+        );
         assert_eq!(
             state.get("resumeState").and_then(Value::as_str),
             Some("resumed")
@@ -9679,6 +10190,34 @@ mod tests {
             response.get("outputDirectory").and_then(Value::as_str),
             Some("/Users/alice/Documents/Codex/1970-01-01/hello-0")
         );
+    }
+
+    #[test]
+    fn projectless_workspace_root_response_uses_codex_documents_root() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env lock");
+        let old_home = std::env::var_os("HOME");
+        let root = std::env::temp_dir().join(format!(
+            "codexl-cli-projectless-root-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp home");
+        std::env::set_var("HOME", &root);
+
+        let response = cli_projectless_workspace_root_response();
+        let expected = root
+            .join("Documents")
+            .join("Codex")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            response.get("workspaceRoot").and_then(Value::as_str),
+            Some(expected.as_str())
+        );
+
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

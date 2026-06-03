@@ -2312,31 +2312,11 @@ function App() {
   const launchProfile = useCallback(
     async (profile: ProviderProfile, options: Partial<RemoteLaunchOptions> = {}) => {
       const key = profileKey(profile);
-      const usesCliMode = remoteFrontendModeUsesCli(profile.remote_frontend_mode);
-      const startRemote = options.startRemote === true || usesCliMode;
+      const startRemote = options.startRemote === true;
       const startCloud = startRemote && options.startCloud === true;
       const requireE2ee = startCloud;
 
       try {
-        if (usesCliMode) {
-          await invoke<RemoteControlInfo>("start_remote_control", {
-            profileName: key,
-            remotePassword: null,
-            useCloudRelay: startCloud,
-            requireE2ee,
-          });
-          setConfig((current) =>
-            current
-              ? {
-                  ...current,
-                  active_provider: key,
-                }
-              : current,
-          );
-          await refreshStatus();
-          return;
-        }
-
         const info = await invoke<LaunchInfo>("launch_codex", {
           cdpPort: config?.cdp_port || null,
           codexPath: config?.codex_path || null,
@@ -2672,14 +2652,13 @@ function App() {
             {filteredProfiles.map((profile) => {
               const key = profileKey(profile);
               const status = instanceStatuses.get(key) || instanceStatuses.get(profile.name) || null;
-              const usesCliMode = remoteFrontendModeUsesCli(profile.remote_frontend_mode);
               return (
                 <ProfileCard
                   key={key}
                   profile={profile}
                   status={status}
                   remoteLaunchOptions={{
-                    startRemote: usesCliMode || profile.start_remote_on_launch,
+                    startRemote: profile.start_remote_on_launch,
                     startCloud: profile.start_remote_cloud_on_launch,
                   }}
                   onToggleProfile={toggleProfile}
@@ -8626,7 +8605,8 @@ function normalizeRemoteFrontendMode(value: unknown): RemoteFrontendMode {
 }
 
 function remoteFrontendModeUsesCli(mode: RemoteFrontendMode | string) {
-  return normalizeRemoteFrontendMode(mode) === "cli";
+  const normalized = normalizeRemoteFrontendMode(mode);
+  return normalized === "cli" || normalized === "claude-code";
 }
 
 function remoteControlReadyForQr(remote: RemoteControlInfo | null) {

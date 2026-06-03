@@ -480,26 +480,6 @@ async fn launch_codex(
     codex_home: Option<String>,
     profile_name: Option<String>,
 ) -> Result<server::LaunchInfo, String> {
-    let requested_profile_name = {
-        let config = state.config.lock().await;
-        profile_name
-            .clone()
-            .unwrap_or_else(|| config.active_provider.clone())
-    };
-    let uses_cli_mode = {
-        let config = state.config.lock().await;
-        config
-            .provider_profile(&requested_profile_name)
-            .map(|profile| config::remote_frontend_mode_uses_cli(&profile.remote_frontend_mode))
-            .unwrap_or(false)
-    };
-    if uses_cli_mode {
-        return Err(
-            "CLI mode workspaces do not launch Codex App. Start remote control instead."
-                .to_string(),
-        );
-    }
-
     let info = server::launch_codex_instance(
         state.inner(),
         server::LaunchRequest {
@@ -1360,44 +1340,40 @@ pub fn run() {
                         let profile_name = config.active_provider.clone();
                         let start_remote = config
                             .provider_profile(&profile_name)
-                            .map(|profile| {
-                                profile.start_remote_on_launch
-                                    || config::remote_frontend_mode_uses_cli(
-                                        &profile.remote_frontend_mode,
-                                    )
-                            })
+                            .map(|profile| profile.start_remote_on_launch)
                             .unwrap_or(false);
                         (config.auto_launch, profile_name, start_remote)
                     };
                     if should_launch {
-                        let result = if start_remote {
-                            let use_cloud_relay = {
-                                let config = auto_launch_state.config.lock().await;
-                                config
-                                    .provider_profile(&profile_name)
-                                    .map(|profile| profile.start_remote_cloud_on_launch)
-                            };
-                            let use_cloud_relay = use_cloud_relay.unwrap_or(false);
-                            remote::start_remote_control(
-                                &auto_launch_state,
-                                profile_name,
-                                None,
-                                Some(use_cloud_relay),
-                                Some(use_cloud_relay),
-                            )
-                            .await
-                            .map(|_| ())
-                        } else {
+                        let result = async {
                             server::launch_codex_instance(
                                 &auto_launch_state,
                                 server::LaunchRequest {
-                                    profile_name: Some(profile_name),
+                                    profile_name: Some(profile_name.clone()),
                                     ..server::LaunchRequest::default()
                                 },
                             )
-                            .await
-                            .map(|_| ())
+                            .await?;
+                            if start_remote {
+                                let use_cloud_relay = {
+                                    let config = auto_launch_state.config.lock().await;
+                                    config
+                                        .provider_profile(&profile_name)
+                                        .map(|profile| profile.start_remote_cloud_on_launch)
+                                };
+                                let use_cloud_relay = use_cloud_relay.unwrap_or(false);
+                                remote::start_remote_control(
+                                    &auto_launch_state,
+                                    profile_name,
+                                    None,
+                                    Some(use_cloud_relay),
+                                    Some(use_cloud_relay),
+                                )
+                                .await?;
+                            }
+                            Ok::<(), String>(())
                         };
+                        let result = result.await;
 
                         match result {
                             Ok(()) => {

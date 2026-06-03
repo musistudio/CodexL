@@ -3490,7 +3490,10 @@ pub fn normalized_remote_frontend_mode(value: &str) -> String {
 }
 
 pub fn remote_frontend_mode_uses_cli(value: &str) -> bool {
-    normalized_remote_frontend_mode(value) == REMOTE_FRONTEND_MODE_CLI
+    matches!(
+        normalized_remote_frontend_mode(value).as_str(),
+        REMOTE_FRONTEND_MODE_CLI | REMOTE_FRONTEND_MODE_CLAUDE_CODE
+    )
 }
 
 pub fn normalized_remote_web_asset_registry_url(value: &str) -> String {
@@ -3801,6 +3804,15 @@ mod tests {
             .expect("system time before epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("codexl-{}-{}-{}", name, std::process::id(), nanos))
+    }
+
+    #[test]
+    fn claude_code_remote_frontend_mode_uses_cli_backend() {
+        assert!(remote_frontend_mode_uses_cli(REMOTE_FRONTEND_MODE_CLI));
+        assert!(remote_frontend_mode_uses_cli(
+            REMOTE_FRONTEND_MODE_CLAUDE_CODE
+        ));
+        assert!(!remote_frontend_mode_uses_cli(REMOTE_FRONTEND_MODE_APP));
     }
 
     #[test]

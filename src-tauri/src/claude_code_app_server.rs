@@ -4,12 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -29,6 +29,7 @@ const TURN_IDLE_TIMEOUT_MS_ENV: &str = "CODEXL_CLAUDE_CODE_TURN_IDLE_TIMEOUT_MS"
 const PERMISSION_APPROVAL_TIMEOUT_MS_ENV: &str =
     "CODEXL_CLAUDE_CODE_PERMISSION_APPROVAL_TIMEOUT_MS";
 const CODEX_APP_SERVER_PROXY_ENV: &str = "CODEXL_CLAUDE_CODE_PROXY_CODEX_APP_SERVER";
+const SCAN_ALL_CODEX_HOMES_ENV: &str = "CODEXL_CLAUDE_CODE_SCAN_ALL_CODEX_HOMES";
 const APP_SERVER_LOG_PATH_ENV: &str = "CODEXL_CLAUDE_CODE_APP_SERVER_LOG";
 const CONTEXT_WINDOW_ENV: &str = "CODEXL_CLAUDE_CODE_CONTEXT_WINDOW";
 const CLAUDE_PATH_ENV: &str = "CLAUDE_PATH";
@@ -53,7 +54,16 @@ const DEFAULT_TURN_IDLE_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 const DEFAULT_PERMISSION_APPROVAL_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const MIN_NATIVE_CLAUDE_BYTES: u64 = 5 * 1024 * 1024;
 const CLAUDE_THREAD_NAMES_FILE: &str = "codex-app-thread-names.json";
+const CLAUDE_THREAD_GOALS_FILE: &str = "codex-app-thread-goals.json";
+const CLAUDE_THREAD_ARCHIVED_FILE: &str = "codex-app-thread-archived.json";
 const CLAUDE_TITLE_MATCH_MAX_DELTA_SECONDS: u64 = 6 * 60 * 60;
+const CLAUDE_THREAD_LIST_CACHE_TTL_MS: i64 = 5_000;
+const CLAUDE_THREAD_LIST_MIN_SCAN_LIMIT: usize = 120;
+const CLAUDE_THREAD_LIST_MAX_SCAN_LIMIT: usize = 500;
+const CLAUDE_THREAD_LIST_LIMIT_MULTIPLIER: usize = 12;
+const CLAUDE_THREAD_LIST_MAX_LINES_PER_TRANSCRIPT: usize = 96;
+const CLAUDE_THREAD_LIST_TAIL_BYTES: u64 = 256 * 1024;
+const CLAUDE_PROJECT_DIR_MAX_LEN: usize = 200;
 const CLAUDE_RESULT_EXIT_GRACE_MS: u64 = 500;
 const CLAUDE_THREAD_STREAM_STATE_HEARTBEAT_MS: u64 = 1_000;
 const CLAUDE_CHILD_ENV_REMOVALS: &[&str] = &[
@@ -187,6 +197,7 @@ function isBlockedComputerUseEnvKey(key) {
     "CODEXL_CLAUDE_CODE_PERMISSION_MODE",
     "CODEXL_CLAUDE_CODE_PERMISSION_PROMPT_TOOL",
     "CODEXL_CLAUDE_CODE_PROXY_CODEX_APP_SERVER",
+    "CODEXL_CLAUDE_CODE_SCAN_ALL_CODEX_HOMES",
     "CODEXL_COMPUTER_USE_NODE_RELAY_NODE",
     "CODEXL_COMPUTER_USE_TOOL_CALL_TIMEOUT_MS",
     "DISABLE_AUTOUPDATER",
@@ -937,6 +948,35 @@ const CLAUDE_STREAM_JSON_ARGS: &[&str] = &[
 type SharedOutput<W> = Arc<Mutex<W>>;
 type SharedState = Arc<Mutex<ClaudeAppServerState>>;
 
+static CLAUDE_CODE_LOG_LOCK: Mutex<()> = Mutex::new(());
+static CLAUDE_THREAD_LIST_CACHE: OnceLock<Mutex<Option<ClaudeThreadListCacheEntry>>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct ClaudeThreadListSnapshot {
+    threads: BTreeMap<String, ClaudeThread>,
+    generated_titles: Vec<ClaudeGeneratedTitle>,
+    inline_titles: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeThreadListCacheEntry {
+    projects_dir: Option<PathBuf>,
+    workspace_name: Option<String>,
+    scan_limit: Option<usize>,
+    loaded_at_ms: i64,
+    snapshot: ClaudeThreadListSnapshot,
+}
+
+#[derive(Debug, Clone)]
+enum ClaudeThreadListTranscriptEntry {
+    Thread {
+        thread: ClaudeThread,
+        inline_title: Option<String>,
+    },
+    GeneratedTitle(ClaudeGeneratedTitle),
+}
+
 #[derive(Debug, Clone)]
 struct RunOptions {
     workspace_name: Option<String>,
@@ -946,6 +986,7 @@ struct RunOptions {
 struct ClaudeAppServerState {
     active_processes: BTreeMap<(String, String), u32>,
     app_responses: BTreeMap<String, Value>,
+    config_values: Map<String, Value>,
     interrupted_turns: BTreeSet<(String, String)>,
     threads: BTreeMap<String, ClaudeThread>,
     workspace_name: Option<String>,
@@ -959,7 +1000,19 @@ struct ClaudeThread {
     path: Option<String>,
     preview: String,
     cwd: String,
+    git_info: Value,
+    workspace_kind: String,
+    workspace_roots: Vec<String>,
+    workspace_browser_root: Option<String>,
+    projectless_output_directory: Option<String>,
+    base_instructions: Option<String>,
+    developer_instructions: Option<String>,
+    personality: Value,
+    persist_extended_history: Value,
     model: String,
+    reasoning_effort: Value,
+    service_tier: Value,
+    collaboration_mode: Value,
     created_at: i64,
     updated_at: i64,
     archived: bool,
@@ -967,6 +1020,7 @@ struct ClaudeThread {
     approval_policy: String,
     approvals_reviewer: String,
     turns: Vec<ClaudeTurn>,
+    goal: Option<Value>,
     latest_token_usage_info: Option<Value>,
 }
 
@@ -977,6 +1031,26 @@ struct ClaudeGeneratedTitle {
     cwd: String,
     created_at: i64,
     updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClaudeResumeTranscriptMetadata {
+    session_id: Option<String>,
+    cwd: Option<String>,
+    first_prompt: Option<String>,
+    last_prompt: Option<String>,
+    agent_name: Option<String>,
+    custom_title: Option<String>,
+    ai_title: Option<String>,
+    summary: Option<String>,
+    saw_message: bool,
+    saw_sidechain_message: bool,
+    saw_non_sidechain_message: bool,
+    head_is_sidechain: bool,
+    team_name: Option<String>,
+    session_kind: Option<String>,
+    entrypoint: Option<String>,
+    is_loop_session: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -992,6 +1066,9 @@ struct ClaudeTurn {
     duration_ms: Option<i64>,
     approval_policy: String,
     approvals_reviewer: String,
+    reasoning_effort: Value,
+    service_tier: Value,
+    collaboration_mode: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1000,6 +1077,28 @@ enum TurnStatus {
     Completed,
     Interrupted,
     Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ThreadMetadataTextUpdate {
+    Set(String),
+    Clear,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadWorkspaceMetadata {
+    kind: String,
+    roots: Vec<String>,
+    browser_root: Option<String>,
+    projectless_output_directory: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadInstructionMetadata {
+    base: Option<String>,
+    developer: Option<String>,
+    personality: Value,
+    persist_extended_history: Value,
 }
 
 #[derive(Debug)]
@@ -1011,6 +1110,8 @@ struct TurnWork {
     claude_session_id: String,
     cwd: String,
     prompt: String,
+    input: Vec<Value>,
+    instruction_context: Option<String>,
     resume_existing: bool,
     permission_mode: Option<String>,
 }
@@ -1043,6 +1144,7 @@ struct ClaudeStreamState {
     latest_model: Option<String>,
     agent_item_started: bool,
     reasoning_item_started: bool,
+    reasoning_item_completed: bool,
     reasoning_text: String,
     saw_tool_call: bool,
     seen_tool_ids: BTreeSet<String>,
@@ -1051,6 +1153,27 @@ struct ClaudeStreamState {
     tool_calls: BTreeMap<String, ClaudeToolCallState>,
     completed_tool_ids: BTreeSet<String>,
     completed_tool_items: Vec<Value>,
+    subagent_streams: BTreeMap<String, ClaudeSubagentStreamState>,
+}
+
+#[derive(Debug, Default)]
+struct ClaudeSubagentStreamState {
+    emitted_text: String,
+    pending_agent_text: String,
+    reasoning_text: String,
+    saw_tool_call: bool,
+    tool_block_by_index: BTreeMap<i64, String>,
+    tool_input_deltas: BTreeMap<String, String>,
+    tool_order: Vec<String>,
+    tool_calls: BTreeMap<String, ClaudeToolCallState>,
+    completed_tools: BTreeMap<String, ClaudeSubagentToolCompletion>,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeSubagentToolCompletion {
+    success: bool,
+    result: Option<String>,
+    completed_at_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1066,7 +1189,210 @@ struct ClaudeToolCallState {
 enum ClaudeToolItemKind {
     CommandExecution,
     CollabAgentToolCall,
+    FileChange,
     McpToolCall,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptToolUse {
+    id: String,
+    name: String,
+    input: Value,
+    started_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptToolResult {
+    tool_id: String,
+    result: String,
+    failed: bool,
+    completed_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptToolCall {
+    state: ClaudeToolCallState,
+    result: Option<String>,
+    failed: bool,
+    completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptTurnBuilder {
+    input: Vec<Value>,
+    started_at: i64,
+    turn_suffix: Option<String>,
+    completed_at: Option<i64>,
+    failed: bool,
+    error: Option<String>,
+    agent_text: String,
+    reasoning_text: String,
+    tool_order: Vec<String>,
+    tool_calls: BTreeMap<String, TranscriptToolCall>,
+}
+
+impl TranscriptTurnBuilder {
+    fn new(input: Vec<Value>, started_at: i64) -> Self {
+        Self {
+            input,
+            started_at,
+            turn_suffix: None,
+            completed_at: None,
+            failed: false,
+            error: None,
+            agent_text: String::new(),
+            reasoning_text: String::new(),
+            tool_order: Vec::new(),
+            tool_calls: BTreeMap::new(),
+        }
+    }
+
+    fn record_assistant_message(
+        &mut self,
+        text: Option<String>,
+        reasoning: Option<String>,
+        tool_uses: Vec<TranscriptToolUse>,
+        completed_at: i64,
+        turn_suffix: Option<String>,
+        failed: bool,
+        error: Option<String>,
+    ) {
+        if let Some(turn_suffix) = turn_suffix {
+            self.turn_suffix = Some(turn_suffix);
+        }
+        self.completed_at = Some(
+            self.completed_at
+                .map_or(completed_at, |value| value.max(completed_at)),
+        );
+        if failed {
+            self.failed = true;
+            self.error = error.or_else(|| Some("Claude Code turn failed".to_string()));
+        }
+        for tool_use in tool_uses {
+            self.record_tool_use(tool_use);
+        }
+        if let Some(reasoning) = reasoning {
+            if !self.reasoning_text.is_empty() {
+                self.reasoning_text.push_str("\n\n");
+            }
+            self.reasoning_text.push_str(&reasoning);
+        }
+        if let Some(text) = text {
+            if !self.agent_text.is_empty() {
+                self.agent_text.push_str("\n\n");
+            }
+            self.agent_text.push_str(&text);
+        }
+    }
+
+    fn record_tool_use(&mut self, tool_use: TranscriptToolUse) {
+        if !self.tool_calls.contains_key(&tool_use.id) {
+            self.tool_order.push(tool_use.id.clone());
+        }
+        let entry = self
+            .tool_calls
+            .entry(tool_use.id)
+            .or_insert_with(|| TranscriptToolCall {
+                state: ClaudeToolCallState {
+                    name: tool_use.name.clone(),
+                    arguments: json!({}),
+                    started_at_ms: seconds_to_millis(tool_use.started_at),
+                    started_emitted: true,
+                    kind: claude_tool_item_kind(&tool_use.name),
+                },
+                result: None,
+                failed: false,
+                completed_at: None,
+            });
+        entry.state.name = tool_use.name;
+        entry.state.arguments = tool_use.input;
+        entry.state.started_at_ms = seconds_to_millis(tool_use.started_at);
+        entry.state.kind = claude_tool_item_kind(&entry.state.name);
+    }
+
+    fn record_tool_result(&mut self, result: TranscriptToolResult) {
+        if !self.tool_calls.contains_key(&result.tool_id) {
+            self.tool_order.push(result.tool_id.clone());
+        }
+        self.completed_at = Some(
+            self.completed_at
+                .map_or(result.completed_at, |value| value.max(result.completed_at)),
+        );
+        let entry = self
+            .tool_calls
+            .entry(result.tool_id)
+            .or_insert_with(|| TranscriptToolCall {
+                state: ClaudeToolCallState {
+                    name: "tool".to_string(),
+                    arguments: json!({}),
+                    started_at_ms: seconds_to_millis(result.completed_at),
+                    started_emitted: true,
+                    kind: ClaudeToolItemKind::McpToolCall,
+                },
+                result: None,
+                failed: false,
+                completed_at: None,
+            });
+        entry.result = Some(result.result);
+        entry.failed |= result.failed;
+        entry.completed_at = Some(result.completed_at);
+    }
+
+    fn into_turn(self, thread_id: &str, cwd: &str, index: usize) -> Option<ClaudeTurn> {
+        if self.agent_text.trim().is_empty() && self.tool_calls.is_empty() && !self.failed {
+            return None;
+        }
+        let completed_at = self.completed_at.unwrap_or(self.started_at);
+        let turn_suffix = self.turn_suffix.unwrap_or_else(|| index.to_string());
+        let turn_id = format!("turn-{turn_suffix}");
+        let mut tool_items = Vec::new();
+        if !self.reasoning_text.trim().is_empty() {
+            tool_items.push(reasoning_item_json(&turn_id, self.reasoning_text.trim()));
+        }
+        tool_items.extend(
+            self.tool_order
+                .iter()
+                .filter_map(|tool_id| self.tool_calls.get(tool_id).map(|call| (tool_id, call)))
+                .map(|(tool_id, call)| {
+                    let duration_ms = call
+                        .completed_at
+                        .map(|completed_at| {
+                            (seconds_to_millis(completed_at) - call.state.started_at_ms).max(0)
+                        })
+                        .map(|duration_ms| json!(duration_ms))
+                        .unwrap_or(Value::Null);
+                    tool_call_item(
+                        thread_id,
+                        cwd,
+                        tool_id,
+                        &call.state,
+                        if call.failed { "failed" } else { "completed" },
+                        call.result.as_deref(),
+                        duration_ms,
+                    )
+                }),
+        );
+        Some(ClaudeTurn {
+            id: turn_id,
+            input: self.input,
+            tool_items,
+            agent_text: self.agent_text.trim().to_string(),
+            status: if self.failed {
+                TurnStatus::Failed
+            } else {
+                TurnStatus::Completed
+            },
+            error: self.error,
+            started_at: self.started_at,
+            completed_at: Some(completed_at),
+            duration_ms: Some((completed_at - self.started_at).max(0) * 1000),
+            approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
+            approvals_reviewer: DEFAULT_APPROVALS_REVIEWER.to_string(),
+            reasoning_effort: Value::Null,
+            service_tier: Value::Null,
+            collaboration_mode: Value::Null,
+        })
+    }
 }
 
 pub fn run_stdio_app_server(args: Vec<OsString>) -> Result<i32, String> {
@@ -1094,6 +1420,7 @@ where
     let state = Arc::new(Mutex::new(ClaudeAppServerState {
         active_processes: BTreeMap::new(),
         app_responses: BTreeMap::new(),
+        config_values: Map::new(),
         interrupted_turns: BTreeSet::new(),
         threads: BTreeMap::new(),
         workspace_name: options.workspace_name,
@@ -1154,6 +1481,7 @@ fn claude_code_log_event(event: &str, fields: Value) {
     let Some(path) = claude_code_app_server_log_path() else {
         return;
     };
+    let _log_lock = CLAUDE_CODE_LOG_LOCK.lock().ok();
     let mut object = serde_json::Map::new();
     object.insert("tsMs".to_string(), json!(now_millis()));
     object.insert("event".to_string(), json!(event));
@@ -2002,7 +2330,7 @@ where
             };
             write_response(&output, id, response)?;
         }
-        "thread/list" => {
+        "thread/list" | "thread/search" => {
             let response = {
                 let state = lock_state(&state)?;
                 state.thread_list(&params)
@@ -2024,7 +2352,7 @@ where
             };
             write_response(&output, id, response)?;
         }
-        "thread/turns/list" => {
+        "thread/turns/list" | "turn/list" => {
             let response = {
                 let state = lock_state(&state)?;
                 state.thread_turns_list(&params)?
@@ -2032,11 +2360,11 @@ where
             write_response(&output, id, response)?;
         }
         "thread/turns/items/list" => {
-            write_response(
-                &output,
-                id,
-                json!({ "data": [], "nextCursor": Value::Null }),
-            )?;
+            let response = {
+                let state = lock_state(&state)?;
+                state.thread_turns_items_list(&params)?
+            };
+            write_response(&output, id, response)?;
         }
         "thread/archive" => {
             let notification = {
@@ -2072,11 +2400,41 @@ where
             }
         }
         "thread/metadata/update" => {
-            let response = {
-                let state = lock_state(&state)?;
-                state.thread_read(&params)?
+            let (response, notification) = {
+                let mut state = lock_state(&state)?;
+                state.thread_metadata_update(&params)?
             };
             write_response(&output, id, response)?;
+            if let Some(notification) = notification {
+                write_notification(&output, notification)?;
+            }
+        }
+        "thread/goal/get" => {
+            let response = {
+                let state = lock_state(&state)?;
+                state.thread_goal_get(&params)?
+            };
+            write_response(&output, id, response)?;
+        }
+        "thread/goal/set" => {
+            let (response, notification) = {
+                let mut state = lock_state(&state)?;
+                state.thread_goal_set(&params)?
+            };
+            write_response(&output, id, response)?;
+            if let Some(notification) = notification {
+                write_notification(&output, notification)?;
+            }
+        }
+        "thread/goal/clear" => {
+            let (response, notification) = {
+                let mut state = lock_state(&state)?;
+                state.thread_goal_clear(&params)?
+            };
+            write_response(&output, id, response)?;
+            if let Some(notification) = notification {
+                write_notification(&output, notification)?;
+            }
         }
         "turn/start" => {
             let (response, notifications, work, stale_processes) = {
@@ -2138,11 +2496,7 @@ where
             }
         }
         "model/list" => {
-            write_response(
-                &output,
-                id,
-                json!({ "data": [], "nextCursor": Value::Null }),
-            )?;
+            write_response(&output, id, claude_code_model_list_response(&params))?;
         }
         "modelProvider/capabilities/read" => {
             write_response(
@@ -2193,10 +2547,21 @@ where
             write_response(&output, id, json!({ "data": [] }))?;
         }
         "collaborationMode/list" => {
-            write_response(&output, id, json!({ "data": [] }))?;
+            write_response(&output, id, claude_code_collaboration_mode_list_response())?;
         }
         "config/read" => {
-            write_response(&output, id, config_read_response(&params))?;
+            let response = {
+                let state = lock_state(&state)?;
+                state.config_read(&params)
+            };
+            write_response(&output, id, response)?;
+        }
+        "config/value/write" | "config/batchWrite" => {
+            let response = {
+                let mut state = lock_state(&state)?;
+                state.config_write(method, &params)
+            };
+            write_response(&output, id, response)?;
         }
         "configRequirements/read" => {
             write_response(&output, id, json!({ "requirements": Value::Null }))?;
@@ -2268,19 +2633,26 @@ fn is_claude_code_owned_method(method: &str) -> bool {
             | "thread/resume"
             | "thread/read"
             | "thread/list"
+            | "thread/search"
             | "thread/loaded/list"
             | "thread/turns/list"
+            | "turn/list"
             | "thread/turns/items/list"
             | "thread/archive"
             | "thread/unarchive"
             | "thread/unsubscribe"
             | "thread/name/set"
             | "thread/metadata/update"
+            | "thread/goal/get"
+            | "thread/goal/set"
+            | "thread/goal/clear"
             | "turn/start"
             | "turn/interrupt"
             | "account/read"
             | "getAuthStatus"
             | "config/read"
+            | "config/value/write"
+            | "config/batchWrite"
     )
 }
 
@@ -2289,17 +2661,37 @@ fn standalone_codex_app_result(method: &str, params: &Value) -> Option<Value> {
         return Some(json!({}));
     }
 
+    if !codex_cli_app_server_proxy_for_fast_methods_enabled() {
+        if let Some(result) = fast_standalone_codex_app_result(method, params) {
+            return Some(result);
+        }
+    }
+
     if should_proxy_codex_app_method(method) {
         if let Some(result) = codex_cli_app_server_method_result(method, params) {
             return Some(normalize_proxied_codex_app_result(method, params, result));
         }
     }
 
+    if let Some(result) = fast_standalone_codex_app_result(method, params) {
+        return Some(result);
+    }
+
+    match method {
+        "plugin/read" => Some(standalone_plugin_read_result(params)),
+        "plugin/install" => Some(standalone_plugin_install_result(params)),
+        _ => None,
+    }
+}
+
+fn fast_standalone_codex_app_result(method: &str, params: &Value) -> Option<Value> {
     match method {
         "config/mcpServer/reload"
         | "memory/reset"
         | "experimentalFeature/enablement/set"
-        | "marketplace/add" => Some(json!({})),
+        | "marketplace/add"
+        | "marketplace/remove"
+        | "marketplace/upgrade" => Some(json!({})),
         "externalAgentConfig/detect" => Some(json!({ "items": [] })),
         "externalAgentConfig/import" => Some(json!({})),
         "config/value/write" | "config/batchWrite" => Some(config_write_response(params)),
@@ -2314,7 +2706,7 @@ fn standalone_codex_app_result(method: &str, params: &Value) -> Option<Value> {
             "nextCursor": Value::Null,
         })),
         "hooks/list" => Some(json!({ "data": standalone_hooks_list(params) })),
-        "collaborationMode/list" => Some(json!({ "data": [] })),
+        "collaborationMode/list" => Some(claude_code_collaboration_mode_list_response()),
         "modelProvider/capabilities/read" => Some(json!({
             "namespaceTools": false,
             "imageGeneration": false,
@@ -2328,11 +2720,15 @@ fn standalone_codex_app_result(method: &str, params: &Value) -> Option<Value> {
             "nextCursor": Value::Null,
         })),
         "plugin/list" => Some(standalone_plugin_list_result()),
-        "plugin/read" => Some(standalone_plugin_read_result(params)),
-        "plugin/install" => Some(standalone_plugin_install_result(params)),
-        method if method.starts_with("plugin/") || method.starts_with("marketplace/") => {
+        "plugin/uninstall" | "plugin/remove" | "plugin/delete" | "plugin/enable"
+        | "plugin/disable" => Some(json!({})),
+        method
+            if method.starts_with("plugin/")
+                && !matches!(method, "plugin/read" | "plugin/install") =>
+        {
             Some(json!({}))
         }
+        method if method.starts_with("marketplace/") => Some(json!({})),
         "app/list" => Some(json!({
             "data": standalone_app_list(),
             "nextCursor": Value::Null,
@@ -2341,12 +2737,107 @@ fn standalone_codex_app_result(method: &str, params: &Value) -> Option<Value> {
             "data": standalone_mcp_server_status_list(),
             "nextCursor": Value::Null,
         })),
-        "model/list" | "permissionProfile/list" | "experimentalFeature/list" => Some(json!({
+        "model/list" => Some(claude_code_model_list_response(params)),
+        "permissionProfile/list" | "experimentalFeature/list" => Some(json!({
             "data": [],
             "nextCursor": Value::Null,
         })),
         _ => None,
     }
+}
+
+fn claude_code_collaboration_mode_list_response() -> Value {
+    json!({
+        "data": [
+            {
+                "mode": "plan",
+                "model": DEFAULT_MODEL,
+                "reasoning_effort": Value::Null,
+            },
+            {
+                "mode": "default",
+                "model": DEFAULT_MODEL,
+                "reasoning_effort": Value::Null,
+            },
+        ],
+    })
+}
+
+fn claude_code_model_list_response(params: &Value) -> Value {
+    let models = claude_code_model_list();
+    let offset = params
+        .get("cursor")
+        .and_then(Value::as_str)
+        .and_then(|cursor| cursor.parse::<usize>().ok())
+        .unwrap_or(0);
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|limit| limit as usize)
+        .filter(|limit| *limit > 0)
+        .unwrap_or(models.len());
+    let end = offset.saturating_add(limit).min(models.len());
+    let data = if offset < models.len() {
+        models[offset..end].to_vec()
+    } else {
+        Vec::new()
+    };
+    let next_cursor = if end < models.len() {
+        Value::String(end.to_string())
+    } else {
+        Value::Null
+    };
+    json!({
+        "data": data,
+        "nextCursor": next_cursor,
+    })
+}
+
+fn claude_code_model_list() -> Vec<Value> {
+    let selected = model_from_params(&Value::Null);
+    let mut ids = Vec::new();
+    push_unique_model_id(&mut ids, &selected);
+    for model in [DEFAULT_MODEL, "sonnet", "opus", "haiku"] {
+        push_unique_model_id(&mut ids, model);
+    }
+    ids.into_iter()
+        .map(|model| claude_code_model_item(&model, &selected))
+        .collect()
+}
+
+fn push_unique_model_id(models: &mut Vec<String>, model: &str) {
+    let model = model.trim();
+    if !model.is_empty() && !models.iter().any(|item| item == model) {
+        models.push(model.to_string());
+    }
+}
+
+fn claude_code_model_item(model: &str, selected: &str) -> Value {
+    let display_name = if model == DEFAULT_MODEL {
+        "Claude Code".to_string()
+    } else {
+        format!("Claude Code ({model})")
+    };
+    json!({
+        "id": model,
+        "model": model,
+        "modelProvider": PROVIDER_NAME,
+        "displayName": display_name,
+        "description": "Claude Code model alias",
+        "hidden": false,
+        "isDefault": model == selected,
+        "contextWindow": claude_context_window_for_model(model),
+        "inputModalities": ["text", "image"],
+        "supportedReasoningEfforts": [],
+        "defaultReasoningEffort": Value::Null,
+        "supportsPersonality": false,
+        "additionalSpeedTiers": [],
+        "serviceTiers": [],
+        "defaultServiceTier": Value::Null,
+        "upgrade": Value::Null,
+        "upgradeInfo": Value::Null,
+        "availabilityNux": Value::Null,
+    })
 }
 
 fn config_write_response(params: &Value) -> Value {
@@ -2943,6 +3434,16 @@ fn codex_cli_app_server_proxy_enabled() -> bool {
             !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
         })
         .unwrap_or(true)
+}
+
+fn codex_cli_app_server_proxy_for_fast_methods_enabled() -> bool {
+    std::env::var(CODEX_APP_SERVER_PROXY_ENV)
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
 }
 
 fn codex_cli_app_server_codex_home(method: &str) -> String {
@@ -4558,26 +5059,45 @@ fn codex_home_candidates() -> Vec<PathBuf> {
         &mut seen,
         PathBuf::from(crate::config::normalize_home_path(&config.codex_home)),
     );
-    for profile in config.codex_home_profiles {
+    if let Some(active_home) = config.active_codex_home() {
         push_unique_path(
             &mut homes,
             &mut seen,
-            PathBuf::from(crate::config::normalize_home_path(&profile.path)),
+            PathBuf::from(crate::config::normalize_home_path(active_home)),
         );
     }
-    for profile in config.provider_profiles {
-        push_unique_path(
-            &mut homes,
-            &mut seen,
-            PathBuf::from(crate::config::normalize_home_path(&profile.codex_home)),
-        );
-        push_unique_path(
-            &mut homes,
-            &mut seen,
-            crate::config::generated_codex_home(&profile),
-        );
+    if scan_all_codex_homes_enabled() {
+        for profile in config.codex_home_profiles {
+            push_unique_path(
+                &mut homes,
+                &mut seen,
+                PathBuf::from(crate::config::normalize_home_path(&profile.path)),
+            );
+        }
+        for profile in config.provider_profiles {
+            push_unique_path(
+                &mut homes,
+                &mut seen,
+                PathBuf::from(crate::config::normalize_home_path(&profile.codex_home)),
+            );
+            push_unique_path(
+                &mut homes,
+                &mut seen,
+                crate::config::generated_codex_home(&profile),
+            );
+        }
     }
     homes
+}
+
+fn scan_all_codex_homes_enabled() -> bool {
+    std::env::var(SCAN_ALL_CODEX_HOMES_ENV)
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "off" | "no" | "")
+        })
+        .unwrap_or(false)
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, seen: &mut BTreeSet<String>, path: PathBuf) {
@@ -4690,11 +5210,18 @@ impl ClaudeAppServerState {
     fn start_thread(&mut self, params: &Value) -> (Value, Value) {
         let id = new_uuid_v4();
         let cwd = normalize_cwd(params.get("cwd").and_then(Value::as_str));
+        let workspace_metadata = thread_workspace_metadata_from_params(params, &cwd);
+        let instruction_metadata = thread_instruction_metadata_from_params(params);
         let model = model_from_params(params);
+        let reasoning_effort = reasoning_effort_from_params(params, None);
+        let service_tier = service_tier_from_params(params, None);
+        let collaboration_mode =
+            collaboration_mode_from_params(params, &model, &reasoning_effort, None);
         let approval_policy = approval_policy_from_params(params, None);
         let approvals_reviewer = approvals_reviewer_from_params(params, None);
         let now = now_seconds();
         let name = self.workspace_name.clone();
+        let git_info = git_info_from_params(params).unwrap_or_else(|| git_info_for_cwd(&cwd));
         let thread = ClaudeThread {
             id: id.clone(),
             session_id: id.clone(),
@@ -4702,7 +5229,19 @@ impl ClaudeAppServerState {
             path: None,
             preview: String::new(),
             cwd,
+            git_info,
+            workspace_kind: workspace_metadata.kind,
+            workspace_roots: workspace_metadata.roots,
+            workspace_browser_root: workspace_metadata.browser_root,
+            projectless_output_directory: workspace_metadata.projectless_output_directory,
+            base_instructions: instruction_metadata.base,
+            developer_instructions: instruction_metadata.developer,
+            personality: instruction_metadata.personality,
+            persist_extended_history: instruction_metadata.persist_extended_history,
             model,
+            reasoning_effort,
+            service_tier,
+            collaboration_mode,
             created_at: now,
             updated_at: now,
             archived: false,
@@ -4710,6 +5249,7 @@ impl ClaudeAppServerState {
             approval_policy,
             approvals_reviewer,
             turns: Vec::new(),
+            goal: None,
             latest_token_usage_info: None,
         };
         let response = thread_runtime_response(&thread, false);
@@ -4729,6 +5269,18 @@ impl ClaudeAppServerState {
             .unwrap_or_else(new_uuid_v4);
         let lookup_thread_id = strip_local_thread_prefix(&thread_id);
         if !self.threads.contains_key(&thread_id) && !self.threads.contains_key(lookup_thread_id) {
+            if let Some(thread) = self.virtual_subagent_thread_for_request(lookup_thread_id) {
+                let include_turns = !params
+                    .get("excludeTurns")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let response = thread_runtime_response(&thread, include_turns);
+                let notification = json!({
+                    "method": "thread/started",
+                    "params": { "thread": thread.to_json(false) },
+                });
+                return Ok((response, notification));
+            }
             let thread = load_claude_thread_from_params(params, self.workspace_name.clone())
                 .or_else(|| load_claude_thread_by_id(lookup_thread_id, self.workspace_name.clone()))
                 .ok_or_else(|| format!("thread not found: {}", thread_id))?;
@@ -4756,6 +5308,16 @@ impl ClaudeAppServerState {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let mut response_thread = thread.clone();
+        apply_thread_workspace_metadata_from_params(&mut response_thread, params);
+        apply_thread_runtime_metadata_from_params(&mut response_thread, params);
+        apply_thread_instruction_metadata_from_params(&mut response_thread, params);
+        apply_thread_git_info_from_params(&mut response_thread, params);
+        if let Some(thread) = self.threads.get_mut(&response_thread.id) {
+            apply_thread_workspace_metadata_from_params(thread, params);
+            apply_thread_runtime_metadata_from_params(thread, params);
+            apply_thread_instruction_metadata_from_params(thread, params);
+            apply_thread_git_info_from_params(thread, params);
+        }
         let inline_titles = load_claude_inline_thread_titles();
         apply_inline_claude_thread_title(
             &mut response_thread,
@@ -4806,6 +5368,9 @@ impl ClaudeAppServerState {
             );
             return Ok(json!({ "thread": thread.to_json(include_turns) }));
         }
+        if let Some(thread) = self.virtual_subagent_thread_for_request(lookup_thread_id) {
+            return Ok(json!({ "thread": thread.to_json(include_turns) }));
+        }
         let mut thread = load_claude_thread_by_id(lookup_thread_id, self.workspace_name.clone())
             .ok_or_else(|| format!("thread not found: {}", thread_id))?;
         let generated_titles = self.generated_titles();
@@ -4822,10 +5387,15 @@ impl ClaudeAppServerState {
             .get("archived")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let mut threads = load_claude_threads(self.workspace_name.clone());
-        let mut generated_titles = load_claude_generated_titles();
-        let inline_titles = load_claude_inline_thread_titles();
-        for thread in self.threads.values() {
+        let snapshot = load_claude_thread_list_snapshot(params, self.workspace_name.clone());
+        let mut threads = snapshot.threads;
+        let mut generated_titles = snapshot.generated_titles;
+        let inline_titles = snapshot.inline_titles;
+        for thread in self
+            .threads
+            .values()
+            .filter(|thread| !is_claude_subagent_thread_id(&thread.id))
+        {
             if let Some(generated_title) = claude_generated_title_from_thread(thread) {
                 generated_titles.push(generated_title);
                 continue;
@@ -4877,21 +5447,9 @@ impl ClaudeAppServerState {
     }
 
     fn thread_turns_list(&self, params: &Value) -> Result<Value, String> {
-        let thread_id = required_param(params, "threadId")?;
-        let lookup_thread_id = strip_local_thread_prefix(thread_id);
-        let loaded_thread;
-        let thread = if let Some(thread) = self
-            .threads
-            .get(thread_id)
-            .or_else(|| self.threads.get(lookup_thread_id))
-        {
-            thread
-        } else {
-            loaded_thread = load_claude_thread_by_id(lookup_thread_id, self.workspace_name.clone())
-                .ok_or_else(|| format!("thread not found: {}", thread_id))?;
-            &loaded_thread
-        };
-        if is_claude_title_generation_thread(thread) {
+        let thread_id = required_thread_id_param(params)?;
+        let thread = self.thread_for_request(thread_id)?;
+        if is_claude_title_generation_thread(&thread) {
             return Err(format!("thread not found: {}", thread_id));
         }
         let mut turns = thread.turns.clone();
@@ -4911,9 +5469,139 @@ impl ClaudeAppServerState {
         }))
     }
 
+    fn thread_turns_items_list(&self, params: &Value) -> Result<Value, String> {
+        let thread_id = required_thread_id_param(params)?;
+        let thread = self.thread_for_request(thread_id)?;
+        if is_claude_title_generation_thread(&thread) {
+            return Err(format!("thread not found: {}", thread_id));
+        }
+
+        let requested_turn_id = params.get("turnId").and_then(Value::as_str);
+        let mut turns = thread
+            .turns
+            .iter()
+            .filter(|turn| requested_turn_id.map_or(true, |turn_id| turn.id == turn_id))
+            .collect::<Vec<_>>();
+        if !matches!(
+            params.get("sortDirection").and_then(Value::as_str),
+            Some("asc")
+        ) {
+            turns.reverse();
+        }
+        let mut items = turns
+            .into_iter()
+            .flat_map(|turn| match turn.items_json() {
+                Value::Array(items) => items,
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        if let Some(limit) = params.get("limit").and_then(Value::as_u64) {
+            items.truncate(limit as usize);
+        }
+        Ok(json!({
+            "data": items,
+            "nextCursor": Value::Null,
+            "backwardsCursor": Value::Null,
+        }))
+    }
+
+    fn thread_goal_get(&self, params: &Value) -> Result<Value, String> {
+        let thread_id = required_param(params, "threadId")?;
+        let goal = self
+            .threads
+            .get(thread_id)
+            .or_else(|| self.threads.get(strip_local_thread_prefix(thread_id)))
+            .and_then(|thread| thread.goal.clone())
+            .or_else(|| persisted_claude_thread_goal(thread_id))
+            .unwrap_or(Value::Null);
+        Ok(json!({ "goal": goal }))
+    }
+
+    fn thread_goal_set(&mut self, params: &Value) -> Result<(Value, Option<Value>), String> {
+        let thread_id = required_param(params, "threadId")?;
+        let goal = thread_goal_from_params(params);
+        persist_claude_thread_goal(thread_id, Some(&goal));
+        let notification =
+            self.set_loaded_thread_goal(thread_id, (!goal.is_null()).then(|| goal.clone()));
+        Ok((json!({ "goal": goal }), notification))
+    }
+
+    fn thread_goal_clear(&mut self, params: &Value) -> Result<(Value, Option<Value>), String> {
+        let thread_id = required_param(params, "threadId")?;
+        persist_claude_thread_goal(thread_id, None);
+        let notification = self.set_loaded_thread_goal(thread_id, None);
+        Ok((json!({ "goal": Value::Null }), notification))
+    }
+
+    fn config_read(&self, params: &Value) -> Value {
+        config_read_response(params, &self.config_values)
+    }
+
+    fn config_write(&mut self, method: &str, params: &Value) -> Value {
+        apply_config_write_params(method, params, &mut self.config_values);
+        config_write_response(params)
+    }
+
+    fn thread_for_request(&self, thread_id: &str) -> Result<ClaudeThread, String> {
+        let lookup_thread_id = strip_local_thread_prefix(thread_id);
+        self.threads
+            .get(thread_id)
+            .or_else(|| self.threads.get(lookup_thread_id))
+            .cloned()
+            .or_else(|| load_claude_thread_by_id(lookup_thread_id, self.workspace_name.clone()))
+            .or_else(|| self.virtual_subagent_thread_for_request(lookup_thread_id))
+            .ok_or_else(|| format!("thread not found: {}", thread_id))
+    }
+
+    fn virtual_subagent_thread_for_request(&self, thread_id: &str) -> Option<ClaudeThread> {
+        let thread_id = strip_local_thread_prefix(thread_id);
+        if !is_claude_subagent_thread_id(thread_id) {
+            return None;
+        }
+        for parent_thread in self.threads.values() {
+            for turn in &parent_thread.turns {
+                for item in &turn.tool_items {
+                    if item.get("type").and_then(Value::as_str) != Some("collabAgentToolCall") {
+                        continue;
+                    }
+                    if collab_agent_item_references_thread(item, thread_id) {
+                        return Some(virtual_subagent_thread_from_item(
+                            thread_id,
+                            parent_thread,
+                            turn,
+                            item,
+                        ));
+                    }
+                }
+            }
+        }
+        Some(fallback_virtual_subagent_thread(
+            thread_id,
+            self.workspace_name.as_deref(),
+        ))
+    }
+
+    fn set_loaded_thread_goal(&mut self, thread_id: &str, goal: Option<Value>) -> Option<Value> {
+        let lookup_thread_id = strip_local_thread_prefix(thread_id);
+        let thread = if let Some(thread) = self.threads.get_mut(thread_id) {
+            thread
+        } else {
+            self.threads.get_mut(lookup_thread_id)?
+        };
+        thread.goal = goal;
+        thread.updated_at = now_seconds();
+        Some(claude_thread_stream_state_changed_notification(thread))
+    }
+
     fn set_archived(&mut self, params: &Value, archived: bool) -> Option<Value> {
         let thread_id = params.get("threadId").and_then(Value::as_str)?;
-        let thread = self.threads.get_mut(thread_id)?;
+        persist_claude_thread_archived(thread_id, archived);
+        let lookup_thread_id = strip_local_thread_prefix(thread_id);
+        let thread = if let Some(thread) = self.threads.get_mut(thread_id) {
+            thread
+        } else {
+            self.threads.get_mut(lookup_thread_id)?
+        };
         thread.archived = archived;
         thread.updated_at = now_seconds();
         Some(json!({
@@ -4946,6 +5634,215 @@ impl ClaudeAppServerState {
         }))
     }
 
+    fn thread_metadata_update(&mut self, params: &Value) -> Result<(Value, Option<Value>), String> {
+        let thread_id = required_param(params, "threadId")?;
+        let lookup_thread_id = strip_local_thread_prefix(thread_id);
+        if !self.threads.contains_key(thread_id) && !self.threads.contains_key(lookup_thread_id) {
+            let thread = load_claude_thread_by_id(lookup_thread_id, self.workspace_name.clone())
+                .ok_or_else(|| format!("thread not found: {}", thread_id))?;
+            self.threads.insert(thread.id.clone(), thread);
+        }
+
+        let thread = if let Some(thread) = self.threads.get_mut(thread_id) {
+            thread
+        } else {
+            self.threads
+                .get_mut(lookup_thread_id)
+                .ok_or_else(|| format!("thread not loaded: {}", thread_id))?
+        };
+        if is_claude_title_generation_thread(thread) {
+            return Err(format!("thread not found: {}", thread_id));
+        }
+
+        let mut changed = false;
+        if let Some(name) = thread_metadata_text_update(params, &["name", "title"]) {
+            let thread_name_id = thread.id.clone();
+            match name {
+                ThreadMetadataTextUpdate::Set(name) => {
+                    if thread.name.as_deref() != Some(name.as_str()) {
+                        thread.name = Some(name.clone());
+                        changed = true;
+                    }
+                    persist_claude_thread_name(&thread_name_id, Some(&name));
+                }
+                ThreadMetadataTextUpdate::Clear => {
+                    if thread.name.is_some() {
+                        thread.name = None;
+                        changed = true;
+                    }
+                    persist_claude_thread_name(&thread_name_id, None);
+                }
+            }
+        }
+        if let Some(cwd) = thread_metadata_string(params, &["cwd"]) {
+            let cwd = normalize_cwd(Some(&cwd));
+            if thread.cwd != cwd {
+                update_thread_cwd(thread, cwd);
+                changed = true;
+            }
+        }
+        if let Some(git_info) = git_info_update_from_params(params) {
+            if thread.git_info != git_info {
+                thread.git_info = git_info;
+                changed = true;
+            }
+        }
+        if let Some(workspace_kind) =
+            thread_metadata_string(params, &["workspaceKind", "workspace_kind"])
+        {
+            if thread.workspace_kind != workspace_kind {
+                thread.workspace_kind = workspace_kind;
+                changed = true;
+            }
+        }
+        if let Some(workspace_roots) =
+            thread_metadata_string_array(params, &["workspaceRoots", "workspace_roots"])
+        {
+            let workspace_roots = normalize_workspace_roots(workspace_roots, &thread.cwd);
+            if thread.workspace_roots != workspace_roots {
+                thread.workspace_roots = workspace_roots;
+                changed = true;
+            }
+        }
+        if let Some(browser_root) = thread_metadata_optional_string_update(
+            params,
+            &[
+                "workspaceBrowserRoot",
+                "workspace_browser_root",
+                "workspaceRoot",
+                "workspace_root",
+            ],
+        ) {
+            if thread.workspace_browser_root != browser_root {
+                thread.workspace_browser_root = browser_root;
+                changed = true;
+            }
+        }
+        if let Some(output_directory) = thread_metadata_optional_string_update(
+            params,
+            &[
+                "projectlessOutputDirectory",
+                "projectless_output_directory",
+                "outputDirectory",
+                "output_directory",
+            ],
+        ) {
+            if thread.projectless_output_directory != output_directory {
+                thread.projectless_output_directory = output_directory;
+                changed = true;
+            }
+        }
+        if let Some(model) = thread_metadata_string(params, &["model"]) {
+            if thread.model != model {
+                thread.model = model;
+                changed = true;
+            }
+        }
+        if let Some(reasoning_effort) = thread_runtime_metadata_value(
+            params,
+            &["reasoningEffort", "reasoning_effort", "effort"],
+        ) {
+            if thread.reasoning_effort != reasoning_effort {
+                thread.reasoning_effort = reasoning_effort;
+                changed = true;
+            }
+        }
+        if let Some(service_tier) =
+            thread_runtime_metadata_value(params, &["serviceTier", "service_tier"])
+        {
+            if thread.service_tier != service_tier {
+                thread.service_tier = service_tier;
+                changed = true;
+            }
+        }
+        if let Some(collaboration_mode) = thread_metadata_value(params, &["collaborationMode"])
+            .filter(|value| !value.is_null())
+            .cloned()
+        {
+            if thread.collaboration_mode != collaboration_mode {
+                thread.collaboration_mode = normalized_collaboration_mode(
+                    collaboration_mode,
+                    &thread.model,
+                    &thread.reasoning_effort,
+                );
+                changed = true;
+            }
+        }
+        if let Some(base_instructions) = thread_metadata_optional_string_update(
+            params,
+            &["baseInstructions", "base_instructions"],
+        ) {
+            if thread.base_instructions != base_instructions {
+                thread.base_instructions = base_instructions;
+                changed = true;
+            }
+        }
+        if let Some(developer_instructions) =
+            optional_combined_developer_instructions_from_params(params)
+        {
+            if thread.developer_instructions != developer_instructions {
+                thread.developer_instructions = developer_instructions;
+                changed = true;
+            }
+        }
+        if let Some(personality) = thread_runtime_metadata_value(params, &["personality"]) {
+            if thread.personality != personality {
+                thread.personality = personality;
+                changed = true;
+            }
+        }
+        if let Some(persist_extended_history) = thread_runtime_metadata_value(
+            params,
+            &["persistExtendedHistory", "persist_extended_history"],
+        ) {
+            if thread.persist_extended_history != persist_extended_history {
+                thread.persist_extended_history = persist_extended_history;
+                changed = true;
+            }
+        }
+        if let Some(preview) = thread_metadata_string(params, &["preview"]) {
+            if thread.preview != preview {
+                thread.preview = preview;
+                changed = true;
+            }
+        }
+        if let Some(approval_policy) =
+            thread_metadata_string(params, &["approvalPolicy", "approval_policy"])
+        {
+            if thread.approval_policy != approval_policy {
+                thread.approval_policy = approval_policy;
+                changed = true;
+            }
+        }
+        if let Some(approvals_reviewer) =
+            thread_metadata_string(params, &["approvalsReviewer", "approvals_reviewer"])
+        {
+            if thread.approvals_reviewer != approvals_reviewer {
+                thread.approvals_reviewer = approvals_reviewer;
+                changed = true;
+            }
+        }
+        if let Some(archived) = thread_metadata_bool(params, &["archived"]) {
+            let thread_archive_id = thread.id.clone();
+            if thread.archived != archived {
+                thread.archived = archived;
+                changed = true;
+            }
+            persist_claude_thread_archived(&thread_archive_id, archived);
+        }
+        if changed {
+            thread.updated_at = now_seconds();
+        }
+
+        let include_turns = params
+            .get("includeTurns")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let response = json!({ "thread": thread.to_json(include_turns) });
+        let notification = changed.then(|| claude_thread_stream_state_changed_notification(thread));
+        Ok((response, notification))
+    }
+
     fn start_turn(
         &mut self,
         params: &Value,
@@ -4957,22 +5854,36 @@ impl ClaudeAppServerState {
                 .get_mut(&thread_id)
                 .ok_or_else(|| format!("thread not found: {}", thread_id))?;
             if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
-                thread.cwd = normalize_cwd(Some(cwd));
+                update_thread_cwd(thread, normalize_cwd(Some(cwd)));
             }
+            apply_thread_workspace_metadata_from_params(thread, params);
+            apply_thread_instruction_metadata_from_params(thread, params);
+            apply_thread_git_info_from_params(thread, params);
             if let Some(model) = params.get("model").and_then(Value::as_str) {
                 thread.model = model.to_string();
             }
+            thread.reasoning_effort =
+                reasoning_effort_from_params(params, Some(&thread.reasoning_effort));
+            thread.service_tier = service_tier_from_params(params, Some(&thread.service_tier));
+            thread.collaboration_mode = collaboration_mode_from_params(
+                params,
+                &thread.model,
+                &thread.reasoning_effort,
+                Some(&thread.collaboration_mode),
+            );
             thread.approval_policy =
                 approval_policy_from_params(params, Some(&thread.approval_policy));
             thread.approvals_reviewer =
                 approvals_reviewer_from_params(params, Some(&thread.approvals_reviewer));
         }
-        let input = params
+        let mut input = params
             .get("input")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        append_turn_attachments_to_input(&mut input, params);
         let prompt = prompt_from_input(&input);
+        let work_input = input.clone();
         let is_title_generation = is_claude_title_generation_prompt(&prompt);
         let now = now_seconds();
         let stale_processes = if is_title_generation {
@@ -5021,12 +5932,16 @@ impl ClaudeAppServerState {
             duration_ms: None,
             approval_policy: thread.approval_policy.clone(),
             approvals_reviewer: thread.approvals_reviewer.clone(),
+            reasoning_effort: thread.reasoning_effort.clone(),
+            service_tier: thread.service_tier.clone(),
+            collaboration_mode: thread.collaboration_mode.clone(),
         };
         let turn_id = turn.id.clone();
         let user_item = turn.user_item_json();
         let agent_item_id = agent_item_id_for_turn(&turn_id);
         let cli_item_id = cli_item_id_for_turn(&turn_id);
         let response_turn = turn.to_json(false);
+        let instruction_context = claude_thread_instruction_context(thread);
         thread.updated_at = now;
         thread.turns.push(turn);
         let work = TurnWork {
@@ -5037,6 +5952,8 @@ impl ClaudeAppServerState {
             claude_session_id: thread.claude_session_id.clone(),
             cwd: thread.cwd.clone(),
             prompt,
+            input: work_input,
+            instruction_context,
             resume_existing,
             permission_mode: claude_permission_mode_for_approvals_reviewer(
                 &thread.approvals_reviewer,
@@ -5177,6 +6094,33 @@ impl ClaudeAppServerState {
         generated_titles
     }
 
+    fn sync_subagent_threads_for_parent_turn(
+        &mut self,
+        parent_thread: &ClaudeThread,
+        parent_turn: &ClaudeTurn,
+    ) -> Vec<ClaudeThread> {
+        let subagent_threads = parent_turn
+            .tool_items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("collabAgentToolCall"))
+            .flat_map(|item| {
+                collab_agent_item_receiver_thread_ids(item)
+                    .into_iter()
+                    .map(move |thread_id| (thread_id, item))
+            })
+            .map(|(thread_id, item)| {
+                let generated =
+                    virtual_subagent_thread_from_item(&thread_id, parent_thread, parent_turn, item);
+                merge_completed_subagent_thread(self.threads.remove(&generated.id), generated, item)
+            })
+            .collect::<Vec<_>>();
+
+        for thread in &subagent_threads {
+            self.threads.insert(thread.id.clone(), thread.clone());
+        }
+        subagent_threads
+    }
+
     fn finish_turn(
         &mut self,
         thread_id: &str,
@@ -5186,48 +6130,81 @@ impl ClaudeAppServerState {
     ) -> Option<FinishTurnNotifications> {
         let key = (thread_id.to_string(), turn_id.to_string());
         self.active_processes.remove(&key);
-        let (item, turn_json, generated_title, thread_stream_state, is_title_generation) = {
+        let (
+            item,
+            turn_json,
+            generated_title,
+            thread_stream_state,
+            is_title_generation,
+            parent_thread_snapshot,
+            parent_turn_snapshot,
+        ) = {
             let thread = self.threads.get_mut(thread_id)?;
-            let turn = thread.turns.iter_mut().find(|turn| turn.id == turn_id)?;
-            let interrupted =
-                self.interrupted_turns.remove(&key) || turn.status == TurnStatus::Interrupted;
-            turn.tool_items = result.tool_items;
+            let Some(turn_index) = thread.turns.iter().position(|turn| turn.id == turn_id) else {
+                return None;
+            };
             let agent_item_streamed = result.agent_item_streamed;
             if let Some(latest_token_usage_info) = result.latest_token_usage_info {
                 thread.latest_token_usage_info = Some(latest_token_usage_info);
             }
-            turn.agent_text = result.text;
-            turn.duration_ms = Some(result.duration_ms);
-            turn.completed_at = Some(now_seconds());
-            if interrupted {
-                turn.status = TurnStatus::Interrupted;
-                turn.error = None;
-            } else if let Some(error) = result.error {
-                turn.status = TurnStatus::Failed;
-                turn.error = Some(error);
-            } else {
-                turn.status = TurnStatus::Completed;
-                turn.error = None;
-            }
-            thread.updated_at = turn.completed_at.unwrap_or_else(now_seconds);
-            let item = (!agent_item_streamed && !turn.agent_text.is_empty())
-                .then(|| turn.agent_item_json());
-            let turn_json = turn.to_json(false);
+            let (item, turn_json, turn_snapshot, completed_at) = {
+                let turn = &mut thread.turns[turn_index];
+                let interrupted =
+                    self.interrupted_turns.remove(&key) || turn.status == TurnStatus::Interrupted;
+                turn.tool_items = result.tool_items;
+                turn.agent_text = result.text;
+                turn.duration_ms = Some(result.duration_ms);
+                turn.completed_at = Some(now_seconds());
+                if interrupted {
+                    turn.status = TurnStatus::Interrupted;
+                    turn.error = None;
+                } else if let Some(error) = result.error {
+                    turn.status = TurnStatus::Failed;
+                    turn.error = Some(error);
+                } else {
+                    turn.status = TurnStatus::Completed;
+                    turn.error = None;
+                }
+                let item = (!agent_item_streamed && !turn.agent_text.is_empty())
+                    .then(|| turn.agent_item_json());
+                (
+                    item,
+                    turn.to_json(false),
+                    turn.clone(),
+                    turn.completed_at.unwrap_or_else(now_seconds),
+                )
+            };
+            thread.updated_at = completed_at;
             let generated_title = generated_title_hint
                 .filter(|generated_title| generated_title.title.is_some())
                 .or_else(|| claude_generated_title_from_thread(thread));
             let is_title_generation = generated_title.is_some();
             let thread_stream_state = (!is_title_generation)
                 .then(|| claude_thread_stream_state_changed_notification(thread));
+            let parent_thread_snapshot = (!is_title_generation).then(|| thread.clone());
+            let parent_turn_snapshot = (!is_title_generation).then_some(turn_snapshot);
             (
                 item,
                 turn_json,
                 generated_title,
                 thread_stream_state,
                 is_title_generation,
+                parent_thread_snapshot,
+                parent_turn_snapshot,
             )
         };
-        let mut extra_notifications = Vec::new();
+        let subagent_thread_snapshots = if let (Some(parent_thread), Some(parent_turn)) = (
+            parent_thread_snapshot.as_ref(),
+            parent_turn_snapshot.as_ref(),
+        ) {
+            self.sync_subagent_threads_for_parent_turn(parent_thread, parent_turn)
+        } else {
+            Vec::new()
+        };
+        let mut extra_notifications = subagent_thread_snapshots
+            .iter()
+            .map(claude_thread_stream_state_changed_notification)
+            .collect::<Vec<_>>();
         if let Some(generated_title) = generated_title {
             claude_code_log_event(
                 "title_generation_resolved",
@@ -5319,6 +6296,730 @@ struct FinishTurnNotifications {
     extra_notifications: Vec<Value>,
 }
 
+fn is_claude_subagent_thread_id(thread_id: &str) -> bool {
+    let thread_id = strip_local_thread_prefix(thread_id);
+    thread_id.starts_with("claude-subagent-") || thread_id.starts_with("claude-subagent_")
+}
+
+fn collab_agent_item_references_thread(item: &Value, thread_id: &str) -> bool {
+    let thread_id = strip_local_thread_prefix(thread_id);
+    collab_agent_item_receiver_thread_ids(item)
+        .iter()
+        .map(|candidate| strip_local_thread_prefix(candidate))
+        .any(|candidate| candidate == thread_id)
+        || item
+            .get("receiverThreads")
+            .and_then(Value::as_array)
+            .is_some_and(|threads| {
+                threads.iter().any(|thread| {
+                    thread
+                        .get("threadId")
+                        .and_then(Value::as_str)
+                        .map(strip_local_thread_prefix)
+                        == Some(thread_id)
+                })
+            })
+        || item
+            .get("agentsStates")
+            .and_then(Value::as_object)
+            .is_some_and(|states| {
+                states
+                    .keys()
+                    .map(|key| strip_local_thread_prefix(key))
+                    .any(|candidate| candidate == thread_id)
+            })
+}
+
+fn collab_agent_item_receiver_thread_ids(item: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut seen = BTreeSet::new();
+    if let Some(values) = item.get("receiverThreadIds").and_then(Value::as_array) {
+        for value in values {
+            push_unique_thread_id(&mut ids, &mut seen, value.as_str());
+        }
+    }
+    if let Some(receiver_threads) = item.get("receiverThreads").and_then(Value::as_array) {
+        for receiver_thread in receiver_threads {
+            push_unique_thread_id(
+                &mut ids,
+                &mut seen,
+                receiver_thread.get("threadId").and_then(Value::as_str),
+            );
+        }
+    }
+    if let Some(states) = item.get("agentsStates").and_then(Value::as_object) {
+        for key in states.keys() {
+            push_unique_thread_id(&mut ids, &mut seen, Some(key));
+        }
+    }
+    ids
+}
+
+fn collab_agent_item_parent_tool_id(item: &Value) -> Option<String> {
+    item.get("id")
+        .and_then(Value::as_str)
+        .and_then(|id| id.strip_prefix("claude-tool-"))
+        .and_then(non_empty_string)
+        .or_else(|| {
+            collab_agent_item_receiver_thread_ids(item)
+                .into_iter()
+                .find_map(|thread_id| {
+                    let thread_id = strip_local_thread_prefix(&thread_id);
+                    thread_id
+                        .strip_prefix("claude-subagent-")
+                        .or_else(|| thread_id.strip_prefix("claude-subagent_"))
+                        .and_then(non_empty_string)
+                })
+        })
+}
+
+fn virtual_subagent_thread_from_item(
+    thread_id: &str,
+    parent_thread: &ClaudeThread,
+    parent_turn: &ClaudeTurn,
+    item: &Value,
+) -> ClaudeThread {
+    let fallback =
+        virtual_subagent_thread_from_item_summary(thread_id, parent_thread, parent_turn, item);
+    load_virtual_subagent_thread_from_parent_transcript(
+        thread_id,
+        parent_thread,
+        parent_turn,
+        item,
+        &fallback,
+    )
+    .unwrap_or(fallback)
+}
+
+fn merge_completed_subagent_thread(
+    existing: Option<ClaudeThread>,
+    generated: ClaudeThread,
+    item: &Value,
+) -> ClaudeThread {
+    let Some(mut existing) = existing else {
+        return generated;
+    };
+    if existing.turns.is_empty() || subagent_thread_has_richer_history(&generated, &existing) {
+        return generated;
+    }
+
+    if !generated.preview.trim().is_empty() {
+        existing.preview = generated.preview.clone();
+    }
+    existing.cwd = generated.cwd.clone();
+    existing.git_info = generated.git_info.clone();
+    existing.workspace_kind = generated.workspace_kind.clone();
+    existing.workspace_roots = generated.workspace_roots.clone();
+    existing.workspace_browser_root = generated.workspace_browser_root.clone();
+    existing.projectless_output_directory = generated.projectless_output_directory.clone();
+    existing.model = generated.model.clone();
+    existing.reasoning_effort = generated.reasoning_effort.clone();
+    existing.service_tier = generated.service_tier.clone();
+    existing.collaboration_mode = generated.collaboration_mode.clone();
+    existing.approval_policy = generated.approval_policy.clone();
+    existing.approvals_reviewer = generated.approvals_reviewer.clone();
+    existing.updated_at = existing.updated_at.max(generated.updated_at);
+    apply_collab_agent_item_status_to_subagent_turns(item, &mut existing.turns);
+    apply_collab_agent_item_result_to_subagent_turns(item, &mut existing.turns);
+    existing
+}
+
+fn subagent_thread_has_richer_history(candidate: &ClaudeThread, existing: &ClaudeThread) -> bool {
+    let candidate_score = subagent_thread_history_score(candidate);
+    let existing_score = subagent_thread_history_score(existing);
+    candidate_score > existing_score
+}
+
+fn subagent_thread_history_score(thread: &ClaudeThread) -> usize {
+    thread.turns.len().saturating_mul(10)
+        + thread
+            .turns
+            .iter()
+            .map(|turn| {
+                turn.tool_items.len().saturating_mul(3)
+                    + usize::from(!turn.agent_text.trim().is_empty())
+                    + usize::from(!turn.input.is_empty())
+            })
+            .sum::<usize>()
+}
+
+fn virtual_subagent_thread_from_item_summary(
+    thread_id: &str,
+    parent_thread: &ClaudeThread,
+    parent_turn: &ClaudeTurn,
+    item: &Value,
+) -> ClaudeThread {
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("inProgress");
+    let turn_status = collab_agent_item_turn_status(status);
+    let prompt = item
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    let result = item
+        .get("result")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    let mut preview = prompt.trim().chars().take(160).collect::<String>();
+    if preview.is_empty() {
+        preview = result.trim().chars().take(160).collect();
+    }
+    let error = (turn_status == TurnStatus::Failed).then(|| {
+        item.pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                if result.trim().is_empty() {
+                    "Claude Code subagent failed"
+                } else {
+                    result.trim()
+                }
+            })
+            .to_string()
+    });
+    let completed_at = matches!(turn_status, TurnStatus::Completed | TurnStatus::Failed)
+        .then(|| parent_turn.completed_at.unwrap_or_else(now_seconds));
+    let input = if prompt.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({
+            "type": "text",
+            "text": prompt,
+            "text_elements": [],
+        })]
+    };
+    let turn = ClaudeTurn {
+        id: format!("turn-{}", sanitize_item_id(thread_id)),
+        input,
+        agent_text: result,
+        tool_items: Vec::new(),
+        status: turn_status,
+        error,
+        started_at: parent_turn.started_at,
+        completed_at,
+        duration_ms: completed_at.map(|completed_at| {
+            seconds_to_millis(completed_at.saturating_sub(parent_turn.started_at))
+        }),
+        approval_policy: parent_turn.approval_policy.clone(),
+        approvals_reviewer: parent_turn.approvals_reviewer.clone(),
+        reasoning_effort: item
+            .get("reasoningEffort")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .unwrap_or_else(|| parent_turn.reasoning_effort.clone()),
+        service_tier: parent_turn.service_tier.clone(),
+        collaboration_mode: parent_turn.collaboration_mode.clone(),
+    };
+    let mut thread = fallback_virtual_subagent_thread(thread_id, parent_thread.name.as_deref());
+    thread.preview = preview;
+    thread.cwd = parent_thread.cwd.clone();
+    thread.git_info = parent_thread.git_info.clone();
+    thread.workspace_kind = parent_thread.workspace_kind.clone();
+    thread.workspace_roots = parent_thread.workspace_roots.clone();
+    thread.workspace_browser_root = parent_thread.workspace_browser_root.clone();
+    thread.projectless_output_directory = parent_thread.projectless_output_directory.clone();
+    thread.model = item
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| parent_thread.model.clone());
+    thread.reasoning_effort = item
+        .get("reasoningEffort")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| parent_thread.reasoning_effort.clone());
+    thread.service_tier = parent_thread.service_tier.clone();
+    thread.collaboration_mode = parent_thread.collaboration_mode.clone();
+    thread.created_at = parent_turn.started_at;
+    thread.updated_at = parent_turn.completed_at.unwrap_or(parent_thread.updated_at);
+    thread.approval_policy = parent_turn.approval_policy.clone();
+    thread.approvals_reviewer = parent_turn.approvals_reviewer.clone();
+    thread.turns = vec![turn];
+    thread
+}
+
+fn load_virtual_subagent_thread_from_parent_transcript(
+    thread_id: &str,
+    parent_thread: &ClaudeThread,
+    parent_turn: &ClaudeTurn,
+    item: &Value,
+    fallback: &ClaudeThread,
+) -> Option<ClaudeThread> {
+    let transcript_path = parent_thread
+        .path
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            claude_transcript_path_for_session(&parent_thread.cwd, &parent_thread.claude_session_id)
+        })?;
+    let transcript = std::fs::read_to_string(transcript_path).ok()?;
+    let entries = transcript
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    let tool_ids = collab_agent_tool_id_candidates(thread_id, item);
+    if tool_ids.is_empty() {
+        return None;
+    }
+    let sidechain_entries = subagent_sidechain_entries_for_tool(&entries, &tool_ids);
+    if sidechain_entries.is_empty() {
+        return None;
+    }
+    virtual_subagent_thread_from_sidechain_entries(
+        thread_id,
+        parent_thread,
+        parent_turn,
+        item,
+        fallback,
+        &sidechain_entries,
+    )
+}
+
+fn collab_agent_tool_id_candidates(thread_id: &str, item: &Value) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    if let Some(tool_id) = item
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(|id| id.strip_prefix("claude-tool-"))
+        .and_then(non_empty_string)
+    {
+        ids.insert(tool_id);
+    }
+    for value in collab_agent_item_receiver_thread_ids(item)
+        .into_iter()
+        .chain(std::iter::once(thread_id.to_string()))
+    {
+        let value = strip_local_thread_prefix(&value);
+        if let Some(tool_id) = value
+            .strip_prefix("claude-subagent-")
+            .or_else(|| value.strip_prefix("claude-subagent_"))
+            .and_then(non_empty_string)
+        {
+            ids.insert(tool_id);
+        }
+    }
+    ids
+}
+
+fn subagent_sidechain_entries_for_tool<'a>(
+    entries: &'a [Value],
+    tool_ids: &BTreeSet<String>,
+) -> Vec<&'a Value> {
+    let mut root_parent_uuids = BTreeSet::new();
+    for entry in entries {
+        if transcript_assistant_tool_ids(entry)
+            .into_iter()
+            .any(|tool_id| tool_ids.contains(&tool_id))
+        {
+            if let Some(uuid) = transcript_entry_uuid(entry) {
+                root_parent_uuids.insert(uuid);
+            }
+        }
+    }
+
+    let mut selected_indices = BTreeSet::new();
+    let mut selected_uuids = root_parent_uuids;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (index, entry) in entries.iter().enumerate() {
+            if selected_indices.contains(&index) {
+                continue;
+            }
+            let explicit_match = transcript_entry_parent_tool_id(entry)
+                .is_some_and(|tool_id| tool_ids.contains(&tool_id));
+            let sidechain_child = entry
+                .get("isSidechain")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && transcript_entry_parent_uuid(entry)
+                    .is_some_and(|parent_uuid| selected_uuids.contains(&parent_uuid));
+            if !explicit_match && !sidechain_child {
+                continue;
+            }
+            selected_indices.insert(index);
+            if let Some(uuid) = transcript_entry_uuid(entry) {
+                selected_uuids.insert(uuid);
+            }
+            changed = true;
+        }
+    }
+
+    selected_indices
+        .into_iter()
+        .filter_map(|index| entries.get(index))
+        .collect()
+}
+
+fn virtual_subagent_thread_from_sidechain_entries(
+    thread_id: &str,
+    parent_thread: &ClaudeThread,
+    parent_turn: &ClaudeTurn,
+    item: &Value,
+    fallback: &ClaudeThread,
+    entries: &[&Value],
+) -> Option<ClaudeThread> {
+    let mut cwd = parent_thread.cwd.clone();
+    let mut model = parent_thread.model.clone();
+    let mut preview = fallback.preview.clone();
+    let mut created_at = fallback.created_at;
+    let mut updated_at = fallback.updated_at;
+    let mut pending_turn: Option<TranscriptTurnBuilder> = None;
+    let mut turn_builders = Vec::new();
+    let mut latest_token_usage_info = None;
+
+    for value in entries {
+        if let Some(entry_cwd) = value.get("cwd").and_then(Value::as_str) {
+            if !entry_cwd.trim().is_empty() {
+                cwd = entry_cwd.to_string();
+            }
+        }
+        if let Some(timestamp) = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_seconds)
+        {
+            created_at = created_at.min(timestamp);
+            updated_at = updated_at.max(timestamp);
+        }
+        if let Some(message_model) = claude_model_from_message(value) {
+            model = message_model.to_string();
+        }
+        if let Some(info) = claude_token_usage_info_from_message(value, &model) {
+            latest_token_usage_info = Some(info);
+        }
+        match value.get("type").and_then(Value::as_str) {
+            Some("user") => {
+                let started_at = value
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(parse_rfc3339_seconds)
+                    .unwrap_or(updated_at);
+                let tool_results = transcript_tool_results_from_user_entry(value, started_at);
+                if !tool_results.is_empty() {
+                    if let Some(turn) = pending_turn.as_mut() {
+                        for result in tool_results {
+                            turn.record_tool_result(result);
+                        }
+                    }
+                    continue;
+                }
+                if let Some(input) = user_input_from_transcript_entry(value) {
+                    if let Some(turn) = pending_turn.take() {
+                        turn_builders.push(turn);
+                    }
+                    if preview.trim().is_empty() {
+                        preview = prompt_from_input(&input).chars().take(160).collect();
+                    }
+                    pending_turn = Some(TranscriptTurnBuilder::new(input, started_at));
+                }
+            }
+            Some("assistant") => {
+                if let Some(turn) = pending_turn.as_mut() {
+                    let completed_at = value
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .and_then(parse_rfc3339_seconds)
+                        .unwrap_or(updated_at);
+                    let failed = value.get("error").and_then(Value::as_str).is_some()
+                        || value
+                            .get("isApiErrorMessage")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                    let error = failed.then(|| {
+                        value
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Claude Code subagent failed")
+                            .to_string()
+                    });
+                    turn.record_assistant_message(
+                        assistant_text_from_transcript_entry(value),
+                        transcript_reasoning_from_assistant_entry(value),
+                        transcript_tool_uses_from_assistant_entry(value, completed_at),
+                        completed_at,
+                        value
+                            .get("uuid")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        failed,
+                        error,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(turn) = pending_turn.take() {
+        turn_builders.push(turn);
+    }
+
+    let mut turns = turn_builders
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, turn)| turn.into_turn(thread_id, &cwd, index))
+        .collect::<Vec<_>>();
+    if turns.is_empty() {
+        return None;
+    }
+
+    for turn in &mut turns {
+        turn.approval_policy = parent_turn.approval_policy.clone();
+        turn.approvals_reviewer = parent_turn.approvals_reviewer.clone();
+        turn.reasoning_effort = item
+            .get("reasoningEffort")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .unwrap_or_else(|| parent_turn.reasoning_effort.clone());
+        turn.service_tier = parent_turn.service_tier.clone();
+        turn.collaboration_mode = parent_turn.collaboration_mode.clone();
+    }
+    apply_collab_agent_item_status_to_subagent_turns(item, &mut turns);
+
+    if preview.trim().is_empty() {
+        preview = turns
+            .first()
+            .map(|turn| prompt_from_input(&turn.input).chars().take(160).collect())
+            .unwrap_or_default();
+    }
+
+    let mut thread = fallback.clone();
+    thread.preview = preview;
+    thread.cwd = cwd.clone();
+    thread.git_info = parent_thread.git_info.clone();
+    thread.workspace_kind = parent_thread.workspace_kind.clone();
+    thread.workspace_roots = parent_thread.workspace_roots.clone();
+    thread.workspace_browser_root = parent_thread.workspace_browser_root.clone();
+    thread.projectless_output_directory = parent_thread.projectless_output_directory.clone();
+    thread.model = model;
+    thread.created_at = created_at;
+    thread.updated_at = updated_at.max(parent_thread.updated_at);
+    thread.turns = turns;
+    thread.latest_token_usage_info =
+        latest_token_usage_info.or_else(|| fallback.latest_token_usage_info.clone());
+    Some(thread)
+}
+
+fn apply_collab_agent_item_status_to_subagent_turns(item: &Value, turns: &mut [ClaudeTurn]) {
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .map(collab_agent_item_turn_status)
+        .unwrap_or(TurnStatus::InProgress);
+    let Some(last_turn) = turns.last_mut() else {
+        return;
+    };
+    match status {
+        TurnStatus::InProgress => {
+            last_turn.status = TurnStatus::InProgress;
+            last_turn.completed_at = None;
+            last_turn.duration_ms = None;
+        }
+        TurnStatus::Failed => {
+            complete_subagent_turn_status(last_turn, TurnStatus::Failed);
+            last_turn.status = TurnStatus::Failed;
+            last_turn.error = Some(
+                item.pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Claude Code subagent failed")
+                    .to_string(),
+            );
+        }
+        TurnStatus::Interrupted => {
+            last_turn.status = TurnStatus::Interrupted;
+            last_turn.completed_at = None;
+            last_turn.duration_ms = None;
+        }
+        TurnStatus::Completed => {
+            complete_subagent_turn_status(last_turn, TurnStatus::Completed);
+            last_turn.error = None;
+        }
+    }
+}
+
+fn apply_collab_agent_item_result_to_subagent_turns(item: &Value, turns: &mut [ClaudeTurn]) {
+    let Some(result) = collab_agent_item_result_text(item) else {
+        return;
+    };
+    let Some(last_turn) = turns.last_mut() else {
+        return;
+    };
+    merge_subagent_result_text(last_turn, &result);
+}
+
+fn collab_agent_item_result_text(item: &Value) -> Option<String> {
+    item.get("result").and_then(|value| match value {
+        Value::String(text) => non_empty_string(text),
+        Value::Null => None,
+        value => claude_text_from_content(value).or_else(|| non_empty_string(&compact_json(value))),
+    })
+}
+
+fn merge_subagent_result_text(turn: &mut ClaudeTurn, result: &str) {
+    let Some(result) = non_empty_string(result) else {
+        return;
+    };
+    if turn.agent_text.trim().is_empty() {
+        turn.agent_text = result;
+        return;
+    }
+    let existing_key = compact_cli_text(&turn.agent_text);
+    let result_key = compact_cli_text(&result);
+    if existing_key == result_key || existing_key.contains(&result_key) {
+        return;
+    }
+    if result_key.contains(&existing_key) {
+        turn.agent_text = result;
+        return;
+    }
+    turn.agent_text.push_str("\n\n");
+    turn.agent_text.push_str(&result);
+}
+
+fn complete_subagent_turn_status(turn: &mut ClaudeTurn, status: TurnStatus) {
+    turn.status = status;
+    let completed_at = turn.completed_at.unwrap_or_else(now_seconds);
+    turn.completed_at = Some(completed_at);
+    if turn.duration_ms.is_none() {
+        turn.duration_ms = Some(seconds_to_millis(
+            completed_at.saturating_sub(turn.started_at),
+        ));
+    }
+}
+
+fn transcript_assistant_tool_ids(value: &Value) -> Vec<String> {
+    let Some(content) = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+    else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    collect_transcript_assistant_tool_ids(content, &mut ids);
+    ids
+}
+
+fn collect_transcript_assistant_tool_ids(value: &Value, ids: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_transcript_assistant_tool_ids(item, ids);
+            }
+        }
+        Value::Object(map) => {
+            if matches!(map.get("type").and_then(Value::as_str), Some("tool_use")) {
+                if let Some(id) = map
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(non_empty_string)
+                {
+                    ids.push(id);
+                }
+            } else if let Some(content) = map.get("content") {
+                collect_transcript_assistant_tool_ids(content, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn transcript_entry_uuid(value: &Value) -> Option<String> {
+    value
+        .get("uuid")
+        .and_then(Value::as_str)
+        .and_then(non_empty_string)
+        .or_else(|| {
+            value
+                .pointer("/message/id")
+                .and_then(Value::as_str)
+                .and_then(non_empty_string)
+        })
+}
+
+fn transcript_entry_parent_uuid(value: &Value) -> Option<String> {
+    value
+        .get("parentUuid")
+        .or_else(|| value.get("parent_uuid"))
+        .and_then(Value::as_str)
+        .and_then(non_empty_string)
+}
+
+fn transcript_entry_parent_tool_id(value: &Value) -> Option<String> {
+    for pointer in [
+        "/parent_tool_use_id",
+        "/parentToolUseId",
+        "/parentToolUseID",
+        "/message/parent_tool_use_id",
+        "/message/parentToolUseId",
+        "/message/parentToolUseID",
+    ] {
+        if let Some(value) = value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .and_then(non_empty_string)
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn fallback_virtual_subagent_thread(thread_id: &str, workspace_name: Option<&str>) -> ClaudeThread {
+    let cwd = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .to_string_lossy()
+        .to_string();
+    let workspace_metadata = default_thread_workspace_metadata(&cwd);
+    let now = now_seconds();
+    ClaudeThread {
+        id: thread_id.to_string(),
+        session_id: thread_id.to_string(),
+        claude_session_id: thread_id.to_string(),
+        path: None,
+        preview: String::new(),
+        cwd,
+        git_info: Value::Null,
+        workspace_kind: workspace_metadata.kind,
+        workspace_roots: workspace_metadata.roots,
+        workspace_browser_root: workspace_metadata.browser_root,
+        projectless_output_directory: workspace_metadata.projectless_output_directory,
+        base_instructions: None,
+        developer_instructions: None,
+        personality: Value::Null,
+        persist_extended_history: Value::Null,
+        model: DEFAULT_MODEL.to_string(),
+        reasoning_effort: Value::Null,
+        service_tier: Value::Null,
+        collaboration_mode: Value::Null,
+        created_at: now,
+        updated_at: now,
+        archived: false,
+        name: Some(
+            workspace_name
+                .map(str::to_string)
+                .unwrap_or_else(|| "Claude Code subagent".to_string()),
+        ),
+        approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
+        approvals_reviewer: DEFAULT_APPROVALS_REVIEWER.to_string(),
+        turns: Vec::new(),
+        goal: None,
+        latest_token_usage_info: None,
+    }
+}
+
+fn collab_agent_item_turn_status(status: &str) -> TurnStatus {
+    match status {
+        "completed" => TurnStatus::Completed,
+        "failed" => TurnStatus::Failed,
+        "interrupted" => TurnStatus::Interrupted,
+        _ => TurnStatus::InProgress,
+    }
+}
+
 fn claude_thread_archived_notification(thread_id: &str) -> Value {
     json!({
         "method": "thread/archived",
@@ -5360,28 +7061,50 @@ fn claude_conversation_state(thread: &ClaudeThread) -> Value {
             .iter()
             .map(|turn| claude_conversation_turn(thread, turn))
             .collect::<Vec<_>>(),
-        "title": thread.name.clone().unwrap_or_default(),
+        "title": thread.display_title().unwrap_or_default(),
         "source": "cli",
         "modelProvider": PROVIDER_NAME,
         "latestModel": thread.model,
-        "latestReasoningEffort": Value::Null,
+        "latestReasoningEffort": thread.reasoning_effort,
         "previousTurnModel": Value::Null,
-        "latestCollaborationMode": Value::Null,
+        "latestCollaborationMode": thread.collaboration_mode,
+        "baseInstructions": thread
+            .base_instructions
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+        "developerInstructions": thread
+            .developer_instructions
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+        "personality": thread.personality.clone(),
+        "persistExtendedHistory": thread.persist_extended_history.clone(),
         "hasUnreadTurn": false,
-        "threadGoal": Value::Null,
+        "threadGoal": thread.goal.clone().unwrap_or(Value::Null),
         "threadGoalResumeConfirmation": Value::Null,
         "completedThreadGoal": Value::Null,
         "threadRuntimeStatus": thread.status_json(),
         "rolloutPath": Value::Null,
         "cwd": thread.cwd,
-        "gitInfo": Value::Null,
+        "gitInfo": thread.git_info.clone(),
         "resumeState": "resumed",
         "latestTokenUsageInfo": thread
             .latest_token_usage_info
             .clone()
             .unwrap_or(Value::Null),
-        "workspaceKind": "project",
-        "workspaceBrowserRoot": Value::Null,
+        "workspaceKind": thread.workspace_kind,
+        "workspaceRoots": thread.workspace_roots,
+        "workspaceBrowserRoot": thread
+            .workspace_browser_root
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+        "projectlessOutputDirectory": thread
+            .projectless_output_directory
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
         "turnsPagination": {
             "olderCursor": Value::Null,
             "isLoadingOlder": false,
@@ -5397,18 +7120,26 @@ fn claude_conversation_turn(thread: &ClaudeThread, turn: &ClaudeTurn) -> Value {
             "input": turn.input,
             "approvalPolicy": turn.approval_policy,
             "approvalsReviewer": turn.approvals_reviewer,
-            "sandboxPolicy": {
-                "type": "workspaceWrite",
-                "writableRoots": [&thread.cwd],
-            },
+            "sandboxPolicy": claude_workspace_write_sandbox_policy(&thread.workspace_roots),
             "model": thread.model,
             "cwd": thread.cwd,
             "attachments": [],
-            "effort": Value::Null,
+            "effort": turn.reasoning_effort,
+            "serviceTier": turn.service_tier,
             "summary": "none",
-            "personality": Value::Null,
+            "personality": thread.personality.clone(),
+            "baseInstructions": thread
+                .base_instructions
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+            "developerInstructions": thread
+                .developer_instructions
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
             "outputSchema": Value::Null,
-            "collaborationMode": Value::Null,
+            "collaborationMode": turn.collaboration_mode,
         },
         "turnId": turn.id,
         "turnStartedAtMs": seconds_to_millis_value(turn.started_at),
@@ -5436,7 +7167,38 @@ fn seconds_to_millis_value(value: i64) -> Value {
 }
 
 impl ClaudeThread {
+    fn display_title(&self) -> Option<String> {
+        self.raw_non_fallback_name()
+            .or_else(|| self.display_title_from_first_turn())
+            .or_else(|| display_safe_thread_title(&self.preview))
+    }
+
+    fn raw_non_fallback_name(&self) -> Option<String> {
+        self.name.as_deref().and_then(display_safe_thread_title)
+    }
+
+    fn display_title_from_first_turn(&self) -> Option<String> {
+        self.turns
+            .first()
+            .map(|turn| prompt_from_input(&turn.input))
+            .and_then(|prompt| display_safe_thread_title(&prompt))
+    }
+
+    fn serialized_name(&self) -> Option<String> {
+        let raw_name = self
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())?;
+        if is_claude_resume_fallback_thread_name(raw_name) {
+            return self.display_title();
+        }
+        Some(raw_name.to_string())
+    }
+
     fn to_json(&self, include_turns: bool) -> Value {
+        let display_title = self.display_title();
+        let serialized_name = self.serialized_name();
         json!({
             "id": self.id,
             "sessionId": self.session_id,
@@ -5458,10 +7220,39 @@ impl ClaudeThread {
             "threadSource": Value::Null,
             "agentNickname": Value::Null,
             "agentRole": Value::Null,
-            "gitInfo": Value::Null,
+            "gitInfo": self.git_info.clone(),
+            "workspaceKind": self.workspace_kind,
+            "workspaceRoots": self.workspace_roots,
+            "workspaceBrowserRoot": self
+                .workspace_browser_root
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+            "projectlessOutputDirectory": self
+                .projectless_output_directory
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+            "reasoningEffort": self.reasoning_effort.clone(),
+            "serviceTier": self.service_tier.clone(),
+            "collaborationMode": self.collaboration_mode.clone(),
+            "baseInstructions": self
+                .base_instructions
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+            "developerInstructions": self
+                .developer_instructions
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+            "personality": self.personality.clone(),
+            "persistExtendedHistory": self.persist_extended_history.clone(),
             "approvalPolicy": self.approval_policy,
             "approvalsReviewer": self.approvals_reviewer,
-            "name": self.name,
+            "name": serialized_name.map(Value::String).unwrap_or(Value::Null),
+            "title": display_title.map(Value::String).unwrap_or(Value::Null),
+            "threadGoal": self.goal.clone().unwrap_or(Value::Null),
             "requests": [],
             "turns": if include_turns {
                 Value::Array(self.turns.iter().map(|turn| turn.to_json(true)).collect())
@@ -5589,14 +7380,10 @@ fn thread_matches_list_params(thread: &ClaudeThread, params: &Value, archived: b
             return false;
         }
     }
-    if let Some(search) = params
-        .get("searchTerm")
-        .and_then(Value::as_str)
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(search) = thread_list_search_term(params) {
         let haystack = format!(
-            "{}\n{}\n{}",
+            "{}\n{}\n{}\n{}",
+            thread.id,
             thread.preview,
             thread.name.clone().unwrap_or_default(),
             thread.cwd
@@ -5607,6 +7394,273 @@ fn thread_matches_list_params(thread: &ClaudeThread, params: &Value, archived: b
         }
     }
     true
+}
+
+fn thread_list_search_term(params: &Value) -> Option<String> {
+    ["searchTerm", "query", "q", "text"].iter().find_map(|key| {
+        params
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+    })
+}
+
+impl ClaudeResumeTranscriptMetadata {
+    fn record_entry(&mut self, value: &Value) {
+        if let Some(session_id) = transcript_metadata_string(value, &["sessionId", "session_id"]) {
+            self.session_id = Some(session_id);
+        }
+        if let Some(cwd) = transcript_metadata_string(value, &["cwd"]) {
+            self.cwd = Some(cwd);
+        }
+        if let Some(team_name) = transcript_metadata_string(value, &["teamName", "team_name"]) {
+            self.team_name = Some(team_name);
+        }
+        if let Some(session_kind) =
+            transcript_metadata_string(value, &["sessionKind", "session_kind"])
+        {
+            self.session_kind = Some(session_kind);
+        }
+        if let Some(entrypoint) = transcript_metadata_string(value, &["entrypoint"]) {
+            self.entrypoint = Some(entrypoint);
+        }
+        if value
+            .get("isLoopSession")
+            .or_else(|| value.get("is_loop_session"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            self.is_loop_session = true;
+        }
+
+        match value.get("type").and_then(Value::as_str) {
+            Some("last-prompt") => {
+                if let Some(last_prompt) = transcript_metadata_string(value, &["lastPrompt"]) {
+                    self.last_prompt = Some(last_prompt);
+                }
+            }
+            Some("agent-name") => {
+                if let Some(agent_name) = transcript_metadata_string(value, &["agentName", "name"])
+                {
+                    self.agent_name = Some(agent_name);
+                }
+            }
+            Some("custom-title") => {
+                if let Some(title) = transcript_metadata_string(value, &["customTitle", "title"]) {
+                    self.custom_title = Some(title);
+                }
+            }
+            Some("ai-title") => {
+                if let Some(title) = transcript_metadata_string(value, &["aiTitle", "title"]) {
+                    self.ai_title = Some(title);
+                }
+            }
+            Some("summary") => {
+                if let Some(summary) = transcript_metadata_string(value, &["summary", "content"]) {
+                    self.summary = Some(summary);
+                }
+            }
+            Some("user") | Some("assistant") => {
+                self.record_message_entry(value);
+            }
+            _ => {}
+        }
+
+        if let Some(first_prompt) =
+            transcript_metadata_string(value, &["firstPrompt", "first_prompt"])
+        {
+            self.first_prompt = Some(first_prompt);
+        }
+        if let Some(agent_name) = transcript_metadata_string(value, &["agentName", "agent_name"]) {
+            self.agent_name = Some(agent_name);
+        }
+        if let Some(custom_title) = transcript_metadata_string(value, &["customTitle"]) {
+            self.custom_title = Some(custom_title);
+        }
+        if let Some(ai_title) = transcript_metadata_string(value, &["aiTitle"]) {
+            self.ai_title = Some(ai_title);
+        }
+        if let Some(last_prompt) = transcript_metadata_string(value, &["lastPrompt"]) {
+            self.last_prompt = Some(last_prompt);
+        }
+        if let Some(summary) = transcript_metadata_string(value, &["summary", "summaryHint"]) {
+            self.summary = Some(summary);
+        }
+    }
+
+    fn record_message_entry(&mut self, value: &Value) {
+        let is_sidechain = transcript_entry_is_sidechain(value);
+        if !self.saw_message {
+            self.head_is_sidechain = is_sidechain;
+        }
+        self.saw_message = true;
+        if is_sidechain {
+            self.saw_sidechain_message = true;
+        } else {
+            self.saw_non_sidechain_message = true;
+        }
+
+        if value.get("type").and_then(Value::as_str) == Some("user")
+            && !is_sidechain
+            && !value
+                .get("isMeta")
+                .or_else(|| value.get("is_meta"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && transcript_tool_results_from_user_entry(value, 0).is_empty()
+        {
+            if let Some(input) = user_input_from_transcript_entry(value) {
+                let prompt = prompt_from_input(&input);
+                if !prompt.trim().is_empty() {
+                    if self.first_prompt.is_none() {
+                        self.first_prompt = Some(prompt.clone());
+                    }
+                    self.last_prompt = Some(prompt);
+                }
+            }
+        }
+    }
+
+    fn hidden_from_resume(&self) -> bool {
+        self.head_is_sidechain
+            || (self.saw_sidechain_message && !self.saw_non_sidechain_message)
+            || self.team_name.is_some()
+            || self
+                .session_kind
+                .as_deref()
+                .is_some_and(|kind| matches!(kind, "daemon" | "daemon-worker"))
+            || self
+                .entrypoint
+                .as_deref()
+                .is_some_and(claude_resume_entrypoint_is_hidden)
+            || self.is_loop_session
+    }
+
+    fn display_title(&self) -> Option<String> {
+        [
+            self.agent_name.as_deref(),
+            self.custom_title.as_deref(),
+            self.ai_title.as_deref(),
+            self.summary.as_deref(),
+            self.first_prompt.as_deref(),
+            self.last_prompt.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(sanitize_resume_thread_title)
+    }
+
+    fn preview(&self) -> Option<String> {
+        self.last_prompt
+            .as_deref()
+            .or(self.first_prompt.as_deref())
+            .map(|prompt| prompt.chars().take(160).collect())
+    }
+}
+
+fn claude_resume_entrypoint_is_hidden(entrypoint: &str) -> bool {
+    let entrypoint = entrypoint.trim();
+    !entrypoint.is_empty() && entrypoint.starts_with("command-name/")
+}
+
+fn transcript_entry_is_sidechain(value: &Value) -> bool {
+    value
+        .get("isSidechain")
+        .or_else(|| value.get("is_sidechain"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn transcript_metadata_string(value: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(text) = value
+            .get(*key)
+            .and_then(Value::as_str)
+            .and_then(non_empty_string)
+        {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn sanitize_resume_thread_title(text: &str) -> Option<String> {
+    let stripped = strip_claude_resume_context_tags(text);
+    let source = if stripped.trim().is_empty() {
+        text
+    } else {
+        stripped.as_str()
+    };
+    let title = source
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'))
+        .trim();
+    if title.is_empty() {
+        return None;
+    }
+    let mut chars = title.chars();
+    let mut truncated = chars.by_ref().take(80).collect::<String>();
+    if chars.next().is_some() {
+        truncated.push_str("...");
+    }
+    Some(truncated)
+}
+
+fn strip_claude_resume_context_tags(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+    while let Some(open_offset) = text[index..].find('<') {
+        let open = index + open_offset;
+        output.push_str(&text[index..open]);
+        let tag_start = open + 1;
+        let Some(first) = text[tag_start..].chars().next() else {
+            output.push('<');
+            index = tag_start;
+            continue;
+        };
+        if !first.is_ascii_lowercase() {
+            output.push('<');
+            index = tag_start;
+            continue;
+        }
+        let mut tag_end = tag_start + first.len_utf8();
+        for ch in text[tag_end..].chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                tag_end += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let Some(close_bracket_offset) = text[tag_end..].find('>') else {
+            output.push('<');
+            index = tag_start;
+            continue;
+        };
+        let close_bracket = tag_end + close_bracket_offset;
+        let tag_name = &text[tag_start..tag_end];
+        let close_tag = format!("</{tag_name}>");
+        let content_start = close_bracket + 1;
+        let Some(close_tag_offset) = text[content_start..].find(&close_tag) else {
+            output.push('<');
+            index = tag_start;
+            continue;
+        };
+        index = content_start + close_tag_offset + close_tag.len();
+        if text[index..].starts_with('\n') {
+            index += 1;
+        }
+    }
+    output.push_str(&text[index..]);
+    output
+}
+
+fn display_safe_thread_title(value: &str) -> Option<String> {
+    sanitize_resume_thread_title(value)
+        .filter(|title| !is_claude_resume_fallback_thread_name(title))
 }
 
 fn load_claude_thread_from_params(
@@ -5627,8 +7681,11 @@ fn load_claude_thread_from_params(
         .and_then(Value::as_str)
         .filter(|cwd| !cwd.trim().is_empty())
     {
-        thread.cwd = normalize_cwd(Some(cwd));
+        update_thread_cwd(&mut thread, normalize_cwd(Some(cwd)));
     }
+    apply_thread_workspace_metadata_from_params(&mut thread, params);
+    apply_thread_instruction_metadata_from_params(&mut thread, params);
+    apply_thread_git_info_from_params(&mut thread, params);
     apply_generated_titles_to_claude_thread(&mut thread, workspace_name.as_deref());
     Some(thread)
 }
@@ -5645,6 +7702,388 @@ fn load_claude_thread_by_id(
         .max_by_key(|thread| thread.updated_at)?;
     apply_generated_titles_to_claude_thread(&mut thread, workspace_name.as_deref());
     Some(thread)
+}
+
+fn load_claude_thread_list_snapshot(
+    params: &Value,
+    workspace_name: Option<String>,
+) -> ClaudeThreadListSnapshot {
+    let projects_dir = claude_projects_dir();
+    let scan_limit = claude_thread_list_scan_limit(params);
+    let now = now_millis();
+    let cache = CLAUDE_THREAD_LIST_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some(entry) = guard.as_ref() {
+            if entry.projects_dir == projects_dir
+                && entry.workspace_name == workspace_name
+                && entry.scan_limit == scan_limit
+                && now.saturating_sub(entry.loaded_at_ms) <= CLAUDE_THREAD_LIST_CACHE_TTL_MS
+            {
+                return entry.snapshot.clone();
+            }
+        }
+    }
+
+    let paths = claude_transcript_files_for_thread_list(scan_limit);
+    let snapshot = load_claude_thread_list_snapshot_from_paths(&paths, workspace_name.clone());
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(ClaudeThreadListCacheEntry {
+            projects_dir,
+            workspace_name,
+            scan_limit,
+            loaded_at_ms: now,
+            snapshot: snapshot.clone(),
+        });
+    }
+    snapshot
+}
+
+fn clear_claude_thread_list_cache() {
+    if let Some(cache) = CLAUDE_THREAD_LIST_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+}
+
+fn claude_thread_list_scan_limit(params: &Value) -> Option<usize> {
+    if thread_list_search_term(params).is_some() {
+        return None;
+    }
+    let limit = params.get("limit").and_then(Value::as_u64)? as usize;
+    Some(
+        limit
+            .saturating_mul(CLAUDE_THREAD_LIST_LIMIT_MULTIPLIER)
+            .clamp(
+                CLAUDE_THREAD_LIST_MIN_SCAN_LIMIT,
+                CLAUDE_THREAD_LIST_MAX_SCAN_LIMIT,
+            ),
+    )
+}
+
+fn load_claude_thread_list_snapshot_from_paths(
+    paths: &[PathBuf],
+    workspace_name: Option<String>,
+) -> ClaudeThreadListSnapshot {
+    let mut threads = BTreeMap::new();
+    let mut generated_titles = Vec::new();
+    let mut inline_titles = BTreeMap::new();
+    let thread_names = load_claude_thread_names();
+    let thread_goals = load_claude_thread_goals();
+    let archived_threads = load_claude_thread_archived();
+    for path in paths {
+        match load_claude_thread_list_entry_from_transcript_path(
+            path,
+            workspace_name.as_deref(),
+            &thread_names,
+            &thread_goals,
+            &archived_threads,
+        ) {
+            Some(ClaudeThreadListTranscriptEntry::Thread {
+                thread,
+                inline_title,
+            }) => {
+                if let Some(inline_title) = inline_title {
+                    inline_titles.insert(thread.id.clone(), inline_title);
+                }
+                threads
+                    .entry(thread.id.clone())
+                    .and_modify(|existing: &mut ClaudeThread| {
+                        if thread.updated_at > existing.updated_at {
+                            *existing = thread.clone();
+                        }
+                    })
+                    .or_insert(thread);
+            }
+            Some(ClaudeThreadListTranscriptEntry::GeneratedTitle(generated_title)) => {
+                generated_titles.push(generated_title);
+            }
+            None => {}
+        }
+    }
+    apply_generated_titles_to_claude_threads(
+        &mut threads,
+        &generated_titles,
+        workspace_name.as_deref(),
+    );
+    ClaudeThreadListSnapshot {
+        threads,
+        generated_titles,
+        inline_titles,
+    }
+}
+
+fn load_claude_thread_list_entry_from_transcript_path(
+    path: &Path,
+    workspace_name: Option<&str>,
+    thread_names: &BTreeMap<String, String>,
+    thread_goals: &BTreeMap<String, Value>,
+    archived_threads: &BTreeSet<String>,
+) -> Option<ClaudeThreadListTranscriptEntry> {
+    let file = File::open(path).ok()?;
+    let path_session_id = path.file_stem()?.to_string_lossy().to_string();
+    let (fallback_created_at, fallback_updated_at) = transcript_fallback_times(path);
+    let mut session_id = path_session_id.clone();
+    let mut cwd = String::new();
+    let mut model = DEFAULT_MODEL.to_string();
+    let mut preview = String::new();
+    let mut created_at = fallback_created_at;
+    let mut updated_at = fallback_updated_at;
+    let mut inline_title = None;
+    let mut source_prompt = None;
+    let mut assistant_title = None;
+    let mut ai_title = None;
+    let mut resume_metadata = ClaudeResumeTranscriptMetadata::default();
+
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        if index >= CLAUDE_THREAD_LIST_MAX_LINES_PER_TRANSCRIPT {
+            break;
+        }
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        resume_metadata.record_entry(&value);
+        if let Some(entry_session_id) = value.get("sessionId").and_then(Value::as_str) {
+            if !entry_session_id.trim().is_empty() {
+                session_id = entry_session_id.to_string();
+            }
+        }
+        if let Some(entry_cwd) = value.get("cwd").and_then(Value::as_str) {
+            if !entry_cwd.trim().is_empty() {
+                cwd = entry_cwd.to_string();
+            }
+        }
+        if let Some(timestamp) = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_seconds)
+        {
+            created_at = created_at.min(timestamp);
+            updated_at = updated_at.max(timestamp);
+        }
+        if let Some(entry_model) = claude_model_from_message(&value) {
+            if entry_model != "<synthetic>" {
+                model = entry_model.to_string();
+            }
+        }
+        match value.get("type").and_then(Value::as_str) {
+            Some("user") if !transcript_entry_is_sidechain(&value) => {
+                if let Some(input) = user_input_from_transcript_entry(&value) {
+                    let prompt = prompt_from_input(&input);
+                    if preview.is_empty() {
+                        preview = prompt.chars().take(160).collect();
+                    }
+                    if source_prompt.is_none() {
+                        source_prompt = extract_claude_title_generation_source_prompt(&prompt);
+                    }
+                }
+            }
+            Some("assistant") if !transcript_entry_is_sidechain(&value) => {
+                if source_prompt.is_some() {
+                    assistant_title = assistant_text_from_transcript_entry(&value)
+                        .and_then(|text| sanitize_generated_thread_title(&text));
+                }
+            }
+            Some("last-prompt") => {
+                if let Some(last_prompt) = value.get("lastPrompt").and_then(Value::as_str) {
+                    if !last_prompt.trim().is_empty() {
+                        preview = last_prompt.chars().take(160).collect();
+                    }
+                }
+            }
+            Some("ai-title") => {
+                let title_text = value
+                    .get("aiTitle")
+                    .or_else(|| value.get("title"))
+                    .and_then(Value::as_str);
+                if let Some(title_text) = title_text {
+                    inline_title = sanitize_generated_thread_title(title_text);
+                    if source_prompt.is_some() {
+                        ai_title = inline_title.clone();
+                    }
+                }
+            }
+            _ => {}
+        }
+        if source_prompt.is_some() && ai_title.is_some() {
+            break;
+        }
+    }
+
+    record_claude_thread_list_tail_metadata(
+        path,
+        &mut resume_metadata,
+        &mut inline_title,
+        &mut ai_title,
+        &mut preview,
+    );
+    if let Some(metadata_session_id) = resume_metadata.session_id.clone() {
+        session_id = metadata_session_id;
+    }
+    if let Some(metadata_cwd) = resume_metadata.cwd.clone() {
+        cwd = metadata_cwd;
+    }
+    if ai_title.is_none() {
+        ai_title = resume_metadata
+            .ai_title
+            .as_deref()
+            .and_then(sanitize_generated_thread_title);
+    }
+    let resume_display_title = resume_metadata.display_title();
+    if resume_display_title.is_some() {
+        inline_title = resume_display_title.clone();
+    }
+
+    if cwd.is_empty() {
+        cwd = cwd_from_claude_project_dir(path).unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .to_string_lossy()
+                .to_string()
+        });
+    }
+    if let Some(source_prompt) = source_prompt {
+        return Some(ClaudeThreadListTranscriptEntry::GeneratedTitle(
+            ClaudeGeneratedTitle {
+                source_prompt,
+                title: ai_title.or(assistant_title),
+                cwd,
+                created_at,
+                updated_at,
+            },
+        ));
+    }
+
+    if resume_metadata.hidden_from_resume() {
+        return None;
+    }
+    let resume_display_title = resume_metadata.display_title();
+    if preview.is_empty() {
+        preview = resume_metadata
+            .preview()
+            .or_else(|| resume_display_title.clone())
+            .unwrap_or_else(|| session_id.clone());
+    }
+    let name = thread_names
+        .get(&session_id)
+        .cloned()
+        .filter(|name| !is_claude_resume_fallback_thread_name(name))
+        .or_else(|| inline_title.clone())
+        .or_else(|| resume_display_title.clone())
+        .or_else(|| workspace_name.map(str::to_string));
+    let goal = thread_goals.get(&session_id).cloned();
+    let archived = archived_threads.contains(&session_id);
+    let workspace_metadata = default_thread_workspace_metadata(&cwd);
+    let thread = ClaudeThread {
+        id: session_id.clone(),
+        session_id: session_id.clone(),
+        claude_session_id: session_id,
+        path: Some(path.to_string_lossy().to_string()),
+        preview,
+        cwd,
+        git_info: Value::Null,
+        workspace_kind: workspace_metadata.kind,
+        workspace_roots: workspace_metadata.roots,
+        workspace_browser_root: workspace_metadata.browser_root,
+        projectless_output_directory: workspace_metadata.projectless_output_directory,
+        base_instructions: None,
+        developer_instructions: None,
+        personality: Value::Null,
+        persist_extended_history: Value::Null,
+        model,
+        reasoning_effort: Value::Null,
+        service_tier: Value::Null,
+        collaboration_mode: Value::Null,
+        created_at,
+        updated_at,
+        archived,
+        name,
+        approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
+        approvals_reviewer: DEFAULT_APPROVALS_REVIEWER.to_string(),
+        turns: Vec::new(),
+        goal,
+        latest_token_usage_info: None,
+    };
+    Some(ClaudeThreadListTranscriptEntry::Thread {
+        thread,
+        inline_title,
+    })
+}
+
+fn record_claude_thread_list_tail_metadata(
+    path: &Path,
+    resume_metadata: &mut ClaudeResumeTranscriptMetadata,
+    inline_title: &mut Option<String>,
+    ai_title: &mut Option<String>,
+    preview: &mut String,
+) {
+    let Some(tail) = read_claude_transcript_tail(path, CLAUDE_THREAD_LIST_TAIL_BYTES) else {
+        return;
+    };
+    for line in tail.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        resume_metadata.record_entry(&value);
+        match value.get("type").and_then(Value::as_str) {
+            Some("last-prompt") => {
+                if let Some(last_prompt) = value.get("lastPrompt").and_then(Value::as_str) {
+                    if !last_prompt.trim().is_empty() {
+                        *preview = last_prompt.chars().take(160).collect();
+                    }
+                }
+            }
+            Some("custom-title") => {
+                if let Some(title) = value
+                    .get("customTitle")
+                    .or_else(|| value.get("title"))
+                    .and_then(Value::as_str)
+                    .and_then(sanitize_resume_thread_title)
+                {
+                    *inline_title = Some(title);
+                }
+            }
+            Some("ai-title") => {
+                if let Some(title) = value
+                    .get("aiTitle")
+                    .or_else(|| value.get("title"))
+                    .and_then(Value::as_str)
+                    .and_then(sanitize_generated_thread_title)
+                {
+                    *inline_title = Some(title.clone());
+                    *ai_title = Some(title);
+                }
+            }
+            Some("agent-name") => {
+                if let Some(title) = value
+                    .get("agentName")
+                    .or_else(|| value.get("name"))
+                    .and_then(Value::as_str)
+                    .and_then(sanitize_resume_thread_title)
+                {
+                    *inline_title = Some(title);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn read_claude_transcript_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut content = String::new();
+    file.read_to_string(&mut content).ok()?;
+    if start == 0 {
+        return Some(content);
+    }
+    let newline = content.find('\n')?;
+    Some(content[newline + 1..].to_string())
 }
 
 fn strip_local_thread_prefix(thread_id: &str) -> &str {
@@ -5703,15 +8142,17 @@ fn load_claude_thread_from_transcript_path(
     let mut preview = String::new();
     let mut created_at = fallback_created_at;
     let mut updated_at = fallback_updated_at;
-    let mut pending_user: Option<(Vec<Value>, i64)> = None;
-    let mut turns = Vec::new();
+    let mut pending_turn: Option<TranscriptTurnBuilder> = None;
+    let mut turn_builders = Vec::new();
     let mut latest_token_usage_info = None;
     let mut inline_title = None;
+    let mut resume_metadata = ClaudeResumeTranscriptMetadata::default();
 
     for value in transcript
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
     {
+        resume_metadata.record_entry(&value);
         if let Some(entry_session_id) = value.get("sessionId").and_then(Value::as_str) {
             if !entry_session_id.trim().is_empty() {
                 session_id = entry_session_id.to_string();
@@ -5734,30 +8175,32 @@ fn load_claude_thread_from_transcript_path(
             latest_token_usage_info = Some(info);
         }
         match value.get("type").and_then(Value::as_str) {
-            Some("user")
-                if !value
-                    .get("isSidechain")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false) =>
-            {
+            Some("user") if !transcript_entry_is_sidechain(&value) => {
+                let started_at = value
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(parse_rfc3339_seconds)
+                    .unwrap_or(updated_at);
+                let tool_results = transcript_tool_results_from_user_entry(&value, started_at);
+                if !tool_results.is_empty() {
+                    if let Some(turn) = pending_turn.as_mut() {
+                        for result in tool_results {
+                            turn.record_tool_result(result);
+                        }
+                    }
+                    continue;
+                }
                 if let Some(input) = user_input_from_transcript_entry(&value) {
+                    if let Some(turn) = pending_turn.take() {
+                        turn_builders.push(turn);
+                    }
                     if preview.is_empty() {
                         preview = prompt_from_input(&input).chars().take(160).collect();
                     }
-                    let started_at = value
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .and_then(parse_rfc3339_seconds)
-                        .unwrap_or(updated_at);
-                    pending_user = Some((input, started_at));
+                    pending_turn = Some(TranscriptTurnBuilder::new(input, started_at));
                 }
             }
-            Some("assistant")
-                if !value
-                    .get("isSidechain")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false) =>
-            {
+            Some("assistant") if !transcript_entry_is_sidechain(&value) => {
                 if let Some(assistant_model) = value
                     .get("message")
                     .and_then(|message| message.get("model"))
@@ -5766,10 +8209,7 @@ fn load_claude_thread_from_transcript_path(
                 {
                     model = assistant_model.to_string();
                 }
-                if let (Some((input, started_at)), Some(agent_text)) = (
-                    pending_user.take(),
-                    assistant_text_from_transcript_entry(&value),
-                ) {
+                if let Some(turn) = pending_turn.as_mut() {
                     let completed_at = value
                         .get("timestamp")
                         .and_then(Value::as_str)
@@ -5783,31 +8223,23 @@ fn load_claude_thread_from_transcript_path(
                     let turn_suffix = value
                         .get("uuid")
                         .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| turns.len().to_string());
-                    turns.push(ClaudeTurn {
-                        id: format!("turn-{turn_suffix}"),
-                        input,
-                        tool_items: Vec::new(),
-                        agent_text,
-                        status: if failed {
-                            TurnStatus::Failed
-                        } else {
-                            TurnStatus::Completed
-                        },
-                        error: failed.then(|| {
-                            value
-                                .get("error")
-                                .and_then(Value::as_str)
-                                .unwrap_or("Claude Code turn failed")
-                                .to_string()
-                        }),
-                        started_at,
-                        completed_at: Some(completed_at),
-                        duration_ms: Some((completed_at - started_at).max(0) * 1000),
-                        approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
-                        approvals_reviewer: DEFAULT_APPROVALS_REVIEWER.to_string(),
+                        .map(str::to_string);
+                    let error = failed.then(|| {
+                        value
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Claude Code turn failed")
+                            .to_string()
                     });
+                    turn.record_assistant_message(
+                        assistant_text_from_transcript_entry(&value),
+                        transcript_reasoning_from_assistant_entry(&value),
+                        transcript_tool_uses_from_assistant_entry(&value, completed_at),
+                        completed_at,
+                        turn_suffix,
+                        failed,
+                        error,
+                    );
                 }
             }
             Some("last-prompt") => {
@@ -5829,6 +8261,9 @@ fn load_claude_thread_from_transcript_path(
             _ => {}
         }
     }
+    if let Some(turn) = pending_turn.take() {
+        turn_builders.push(turn);
+    }
 
     if cwd.is_empty() {
         cwd = cwd_from_claude_project_dir(path).unwrap_or_else(|| {
@@ -5838,14 +8273,31 @@ fn load_claude_thread_from_transcript_path(
                 .to_string()
         });
     }
-    if preview.is_empty() {
-        preview = session_id.clone();
+    if resume_metadata.hidden_from_resume() {
+        return None;
     }
+    let resume_display_title = resume_metadata.display_title();
+    if preview.is_empty() {
+        preview = resume_metadata
+            .preview()
+            .or_else(|| resume_display_title.clone())
+            .unwrap_or_else(|| session_id.clone());
+    }
+    let turns = turn_builders
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, turn)| turn.into_turn(&session_id, &cwd, index))
+        .collect::<Vec<_>>();
 
     let name = persisted_claude_thread_name(&session_id)
+        .or_else(|| resume_display_title.clone())
         .or(inline_title)
         .or(workspace_name);
+    let goal = persisted_claude_thread_goal(&session_id);
+    let archived = persisted_claude_thread_archived(&session_id);
+    let workspace_metadata = default_thread_workspace_metadata(&cwd);
 
+    let git_info = git_info_for_cwd(&cwd);
     Some(ClaudeThread {
         id: session_id.clone(),
         session_id: session_id.clone(),
@@ -5853,14 +8305,27 @@ fn load_claude_thread_from_transcript_path(
         path: Some(path.to_string_lossy().to_string()),
         preview,
         cwd,
+        git_info,
+        workspace_kind: workspace_metadata.kind,
+        workspace_roots: workspace_metadata.roots,
+        workspace_browser_root: workspace_metadata.browser_root,
+        projectless_output_directory: workspace_metadata.projectless_output_directory,
+        base_instructions: None,
+        developer_instructions: None,
+        personality: Value::Null,
+        persist_extended_history: Value::Null,
         model,
+        reasoning_effort: Value::Null,
+        service_tier: Value::Null,
+        collaboration_mode: Value::Null,
         created_at,
         updated_at,
-        archived: false,
+        archived,
         name,
         approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
         approvals_reviewer: DEFAULT_APPROVALS_REVIEWER.to_string(),
         turns,
+        goal,
         latest_token_usage_info,
     })
 }
@@ -5884,15 +8349,20 @@ fn load_claude_generated_titles() -> Vec<ClaudeGeneratedTitle> {
 }
 
 fn load_claude_inline_thread_titles() -> BTreeMap<String, String> {
+    let paths = claude_transcript_files();
+    load_claude_inline_thread_titles_from_paths(&paths)
+}
+
+fn load_claude_inline_thread_titles_from_paths(paths: &[PathBuf]) -> BTreeMap<String, String> {
     let mut titles = BTreeMap::new();
-    for path in claude_transcript_files() {
+    for path in paths {
         let Ok(transcript) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let (fallback_created_at, fallback_updated_at) = transcript_fallback_times(&path);
+        let (fallback_created_at, fallback_updated_at) = transcript_fallback_times(path);
         if claude_generated_title_from_transcript(
             &transcript,
-            &path,
+            path,
             fallback_created_at,
             fallback_updated_at,
         )
@@ -5915,23 +8385,14 @@ fn load_claude_inline_thread_titles() -> BTreeMap<String, String> {
 }
 
 fn claude_inline_thread_title_from_transcript(transcript: &str) -> Option<String> {
-    let mut title = None;
+    let mut metadata = ClaudeResumeTranscriptMetadata::default();
     for value in transcript
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
     {
-        if value.get("type").and_then(Value::as_str) != Some("ai-title") {
-            continue;
-        }
-        let title_text = value
-            .get("aiTitle")
-            .or_else(|| value.get("title"))
-            .and_then(Value::as_str);
-        if let Some(title_text) = title_text {
-            title = sanitize_generated_thread_title(title_text);
-        }
+        metadata.record_entry(&value);
     }
-    title
+    metadata.display_title()
 }
 
 fn claude_session_id_from_transcript(transcript: &str) -> Option<String> {
@@ -6118,7 +8579,10 @@ fn apply_generated_title_to_claude_threads(
     let title = generated_title.title.clone()?;
     let thread_id = generated_title_target_thread_id(threads, generated_title)?;
     let thread = threads.get_mut(&thread_id)?;
-    if !should_replace_thread_name(thread.name.as_deref(), workspace_name) {
+    let prompt_title = sanitize_resume_thread_title(&generated_title.source_prompt);
+    if !should_replace_thread_name(thread.name.as_deref(), workspace_name)
+        && thread.name.as_deref() != prompt_title.as_deref()
+    {
         return None;
     }
     if thread.name.as_deref() == Some(title.as_str()) {
@@ -6139,7 +8603,10 @@ fn apply_inline_claude_thread_title(
         .or_else(|| inline_titles.get(&thread.session_id))
         .or_else(|| inline_titles.get(&thread.claude_session_id))?
         .clone();
-    if !should_replace_thread_name(thread.name.as_deref(), workspace_name) {
+    let prompt_title = sanitize_resume_thread_title(&thread_initial_prompt(thread));
+    if !should_replace_thread_name(thread.name.as_deref(), workspace_name)
+        && thread.name.as_deref() != prompt_title.as_deref()
+    {
         return None;
     }
     if thread.name.as_deref() == Some(title.as_str()) {
@@ -6234,8 +8701,14 @@ fn should_replace_thread_name(current: Option<&str>, workspace_name: Option<&str
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 == Some(current)
+                || is_claude_resume_fallback_thread_name(current)
         }
     }
+}
+
+fn is_claude_resume_fallback_thread_name(value: &str) -> bool {
+    let value = strip_local_thread_prefix(value.trim());
+    is_uuid_like(value) || (value.len() == 8 && value.as_bytes().iter().all(u8::is_ascii_hexdigit))
 }
 
 fn transcript_fallback_times(path: &Path) -> (i64, i64) {
@@ -6255,7 +8728,10 @@ fn transcript_fallback_times(path: &Path) -> (i64, i64) {
 
 fn persisted_claude_thread_name(thread_id: &str) -> Option<String> {
     let thread_id = strip_local_thread_prefix(thread_id);
-    load_claude_thread_names().get(thread_id).cloned()
+    load_claude_thread_names()
+        .get(thread_id)
+        .cloned()
+        .filter(|name| !is_claude_resume_fallback_thread_name(name))
 }
 
 fn persist_claude_thread_name(thread_id: &str, name: Option<&str>) {
@@ -6278,6 +8754,7 @@ fn persist_claude_thread_name(thread_id: &str, name: Option<&str>) {
     if let Ok(content) = serde_json::to_string_pretty(&names) {
         let _ = std::fs::write(path, content);
     }
+    clear_claude_thread_list_cache();
 }
 
 fn load_claude_thread_names() -> BTreeMap<String, String> {
@@ -6306,11 +8783,318 @@ fn claude_thread_names_path() -> Option<PathBuf> {
     )
 }
 
+fn persisted_claude_thread_goal(thread_id: &str) -> Option<Value> {
+    let thread_id = strip_local_thread_prefix(thread_id);
+    load_claude_thread_goals().get(thread_id).cloned()
+}
+
+fn persist_claude_thread_goal(thread_id: &str, goal: Option<&Value>) {
+    let thread_id = strip_local_thread_prefix(thread_id).trim();
+    if thread_id.is_empty() {
+        return;
+    }
+    let mut goals = load_claude_thread_goals();
+    if let Some(goal) = goal.filter(|goal| !goal.is_null()) {
+        goals.insert(thread_id.to_string(), goal.clone());
+    } else {
+        goals.remove(thread_id);
+    }
+    let Some(path) = claude_thread_goals_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(content) = serde_json::to_string_pretty(&goals) {
+        let _ = std::fs::write(path, content);
+    }
+    clear_claude_thread_list_cache();
+}
+
+fn load_claude_thread_goals() -> BTreeMap<String, Value> {
+    let Some(path) = claude_thread_goals_path() else {
+        return BTreeMap::new();
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content) else {
+        return BTreeMap::new();
+    };
+    map.into_iter()
+        .filter(|(key, value)| !key.trim().is_empty() && !value.is_null())
+        .collect()
+}
+
+fn claude_thread_goals_path() -> Option<PathBuf> {
+    Some(
+        user_home_dir()?
+            .join(".claude")
+            .join(CLAUDE_THREAD_GOALS_FILE),
+    )
+}
+
+fn persisted_claude_thread_archived(thread_id: &str) -> bool {
+    let thread_id = strip_local_thread_prefix(thread_id);
+    load_claude_thread_archived().contains(thread_id)
+}
+
+fn persist_claude_thread_archived(thread_id: &str, archived: bool) {
+    let thread_id = strip_local_thread_prefix(thread_id).trim();
+    if thread_id.is_empty() {
+        return;
+    }
+    let mut archived_ids = load_claude_thread_archived();
+    if archived {
+        archived_ids.insert(thread_id.to_string());
+    } else {
+        archived_ids.remove(thread_id);
+    }
+    let Some(path) = claude_thread_archived_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let values = archived_ids.into_iter().collect::<Vec<_>>();
+    if let Ok(content) = serde_json::to_string_pretty(&values) {
+        let _ = std::fs::write(path, content);
+    }
+    clear_claude_thread_list_cache();
+}
+
+fn load_claude_thread_archived() -> BTreeSet<String> {
+    let Some(path) = claude_thread_archived_path() else {
+        return BTreeSet::new();
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return BTreeSet::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return BTreeSet::new();
+    };
+    match value {
+        Value::Array(values) => values
+            .into_iter()
+            .filter_map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+            .collect(),
+        Value::Object(map) => map
+            .into_iter()
+            .filter_map(|(key, value)| {
+                (!key.trim().is_empty() && value.as_bool().unwrap_or(false)).then_some(key)
+            })
+            .collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
+fn claude_thread_archived_path() -> Option<PathBuf> {
+    Some(
+        user_home_dir()?
+            .join(".claude")
+            .join(CLAUDE_THREAD_ARCHIVED_FILE),
+    )
+}
+
+fn thread_goal_from_params(params: &Value) -> Value {
+    if let Some(goal) = params.get("goal").filter(|goal| !goal.is_null()) {
+        return goal.clone();
+    }
+    let mut goal = Map::new();
+    for key in [
+        "objective",
+        "status",
+        "tokenBudget",
+        "token_budget",
+        "summary",
+        "createdAt",
+        "updatedAt",
+    ] {
+        if let Some(value) = params.get(key).filter(|value| !value.is_null()) {
+            goal.insert(key.to_string(), value.clone());
+        }
+    }
+    if goal.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(goal)
+    }
+}
+
 fn user_input_from_transcript_entry(value: &Value) -> Option<Vec<Value>> {
     let content = value.get("message")?.get("content")?;
     let mut items = Vec::new();
     collect_user_input_items(content, &mut items);
     (!items.is_empty()).then_some(items)
+}
+
+fn transcript_reasoning_from_assistant_entry(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let message = value.get("message")?;
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let content = message.get("content")?;
+    let mut parts = Vec::new();
+    collect_transcript_reasoning(content, &mut parts);
+    let text = parts.join("");
+    (!text.trim().is_empty()).then(|| text.trim().to_string())
+}
+
+fn collect_transcript_reasoning(value: &Value, parts: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_transcript_reasoning(item, parts);
+            }
+        }
+        Value::Object(map) => {
+            if matches!(
+                map.get("type").and_then(Value::as_str),
+                Some("thinking") | Some("thinking_delta")
+            ) {
+                if let Some(text) = map
+                    .get("thinking")
+                    .or_else(|| map.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    parts.push(text.to_string());
+                }
+            } else if let Some(content) = map.get("content") {
+                collect_transcript_reasoning(content, parts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn transcript_tool_uses_from_assistant_entry(
+    value: &Value,
+    started_at: i64,
+) -> Vec<TranscriptToolUse> {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+    let Some(message) = value.get("message") else {
+        return Vec::new();
+    };
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+    let Some(content) = message.get("content") else {
+        return Vec::new();
+    };
+    let mut tool_uses = Vec::new();
+    collect_transcript_tool_uses(content, started_at, &mut tool_uses);
+    tool_uses
+}
+
+fn collect_transcript_tool_uses(
+    value: &Value,
+    started_at: i64,
+    tool_uses: &mut Vec<TranscriptToolUse>,
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_transcript_tool_uses(item, started_at, tool_uses);
+            }
+        }
+        Value::Object(map) => {
+            if matches!(map.get("type").and_then(Value::as_str), Some("tool_use")) {
+                let id = map
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(non_empty_string)
+                    .unwrap_or_else(|| format!("tool-{}", tool_uses.len()));
+                let name = map
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .and_then(non_empty_string)
+                    .unwrap_or_else(|| "tool".to_string());
+                let input = map.get("input").cloned().unwrap_or_else(|| json!({}));
+                tool_uses.push(TranscriptToolUse {
+                    id,
+                    name,
+                    input,
+                    started_at,
+                });
+            } else if let Some(content) = map.get("content") {
+                collect_transcript_tool_uses(content, started_at, tool_uses);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn transcript_tool_results_from_user_entry(
+    value: &Value,
+    completed_at: i64,
+) -> Vec<TranscriptToolResult> {
+    if value.get("type").and_then(Value::as_str) != Some("user") {
+        return Vec::new();
+    }
+    let Some(message) = value.get("message") else {
+        return Vec::new();
+    };
+    if message.get("role").and_then(Value::as_str) != Some("user") {
+        return Vec::new();
+    }
+    let Some(content) = message.get("content") else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    collect_transcript_tool_results(content, completed_at, &mut results);
+    results
+}
+
+fn collect_transcript_tool_results(
+    value: &Value,
+    completed_at: i64,
+    results: &mut Vec<TranscriptToolResult>,
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_transcript_tool_results(item, completed_at, results);
+            }
+        }
+        Value::Object(map) => {
+            if matches!(map.get("type").and_then(Value::as_str), Some("tool_result")) {
+                let Some(tool_id) = map
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .and_then(non_empty_string)
+                else {
+                    return;
+                };
+                let result = map
+                    .get("content")
+                    .and_then(claude_text_from_content)
+                    .unwrap_or_else(|| compact_json(value));
+                results.push(TranscriptToolResult {
+                    tool_id,
+                    result,
+                    failed: map
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    completed_at,
+                });
+            } else if let Some(content) = map.get("content") {
+                collect_transcript_tool_results(content, completed_at, results);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_user_input_items(value: &Value, items: &mut Vec<Value>) {
@@ -6372,6 +9156,25 @@ fn claude_transcript_files() -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+fn claude_transcript_files_for_thread_list(scan_limit: Option<usize>) -> Vec<PathBuf> {
+    let mut files = claude_transcript_files()
+        .into_iter()
+        .map(|path| {
+            let modified_at = std::fs::metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(system_time_to_unix_seconds)
+                .unwrap_or_default();
+            (path, modified_at)
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    if let Some(limit) = scan_limit {
+        files.truncate(limit);
+    }
+    files.into_iter().map(|(path, _)| path).collect()
 }
 
 fn claude_projects_dir() -> Option<PathBuf> {
@@ -6924,7 +9727,7 @@ where
             } else {
                 flush_pending_agent_text_as_agent(&output, work, &mut stream);
             }
-            emit_reasoning_completed_if_started(&output, work, &stream);
+            emit_reasoning_completed_if_started(&output, work, &mut stream);
 
             let success = stream.result_error.is_none();
             finalize_open_tool_calls(&output, work, &mut stream, success);
@@ -7040,7 +9843,7 @@ where
     } else {
         flush_pending_agent_text_as_agent(&output, work, &mut stream);
     }
-    emit_reasoning_completed_if_started(&output, work, &stream);
+    emit_reasoning_completed_if_started(&output, work, &mut stream);
 
     let duration_ms = elapsed_millis(started);
     match status {
@@ -7349,7 +10152,211 @@ where
         return write_claude_child_json_line(child_stdin, &control_response);
     }
     handle_claude_stream_message(&message, work, output, stream, command_output);
+    sync_claude_stream_state_to_thread(state, output, work, stream);
     Ok(())
+}
+
+fn sync_claude_stream_state_to_thread<W>(
+    state: &SharedState,
+    output: &SharedOutput<W>,
+    work: &TurnWork,
+    stream: &ClaudeStreamState,
+) where
+    W: Write,
+{
+    if is_claude_title_generation_prompt(&work.prompt) {
+        return;
+    }
+    let notifications = lock_state(state).ok().map(|mut state| {
+        let mut notifications = Vec::new();
+        let (thread_notification, subagent_threads) = {
+            let thread = state.threads.get_mut(&work.thread_id)?;
+            let turn = thread
+                .turns
+                .iter_mut()
+                .find(|turn| turn.id == work.turn_id)?;
+            apply_live_claude_stream_state_to_turn(work, stream, turn);
+            if let Some(info) = stream.latest_token_usage_info.clone() {
+                thread.latest_token_usage_info = Some(info);
+            }
+            thread.updated_at = now_seconds();
+            let thread_snapshot = thread.clone();
+            let turn_snapshot = thread_snapshot
+                .turns
+                .iter()
+                .find(|turn| turn.id == work.turn_id)?;
+            (
+                claude_thread_stream_state_changed_notification(&thread_snapshot),
+                live_subagent_threads_for_stream(work, stream, &thread_snapshot, turn_snapshot),
+            )
+        };
+        notifications.push(thread_notification);
+        for subagent_thread in subagent_threads {
+            state
+                .threads
+                .insert(subagent_thread.id.clone(), subagent_thread);
+        }
+        Some(notifications)
+    });
+    if let Some(Some(notifications)) = notifications {
+        for notification in notifications {
+            let _ = write_notification(output, notification);
+        }
+    }
+}
+
+fn apply_live_claude_stream_state_to_turn(
+    work: &TurnWork,
+    stream: &ClaudeStreamState,
+    turn: &mut ClaudeTurn,
+) {
+    turn.agent_text = live_agent_text_for_stream(stream);
+    turn.tool_items = live_tool_items_for_stream(work, stream);
+}
+
+fn live_agent_text_for_stream(stream: &ClaudeStreamState) -> String {
+    if !stream.emitted_text.is_empty() {
+        return stream.emitted_text.clone();
+    }
+    if !stream.saw_tool_call && !stream.pending_agent_text.trim().is_empty() {
+        return stream.pending_agent_text.clone();
+    }
+    String::new()
+}
+
+fn live_tool_items_for_stream(work: &TurnWork, stream: &ClaudeStreamState) -> Vec<Value> {
+    let mut items = Vec::new();
+    if !stream.reasoning_item_completed {
+        let mut reasoning_text = stream.reasoning_text.clone();
+        if stream.saw_tool_call && !stream.pending_agent_text.trim().is_empty() {
+            reasoning_text.push_str(&stream.pending_agent_text);
+        }
+        if !reasoning_text.trim().is_empty() {
+            items.push(reasoning_item_json(&work.turn_id, &reasoning_text));
+        }
+    }
+    items.extend(stream.completed_tool_items.iter().cloned());
+    for (tool_id, state) in &stream.tool_calls {
+        if stream.completed_tool_ids.contains(tool_id) {
+            continue;
+        }
+        if !state.started_emitted && is_empty_tool_arguments(&state.arguments) {
+            continue;
+        }
+        items.push(tool_call_item(
+            &work.thread_id,
+            &work.cwd,
+            tool_id,
+            state,
+            "inProgress",
+            None,
+            Value::Null,
+        ));
+    }
+    items
+}
+
+fn live_subagent_threads_for_stream(
+    work: &TurnWork,
+    stream: &ClaudeStreamState,
+    parent_thread: &ClaudeThread,
+    parent_turn: &ClaudeTurn,
+) -> Vec<ClaudeThread> {
+    parent_turn
+        .tool_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("collabAgentToolCall"))
+        .flat_map(|item| {
+            let tool_id = collab_agent_item_parent_tool_id(item);
+            collab_agent_item_receiver_thread_ids(item)
+                .into_iter()
+                .map(move |thread_id| (thread_id, tool_id.clone(), item))
+        })
+        .map(|(thread_id, tool_id, item)| {
+            let mut thread =
+                virtual_subagent_thread_from_item(&thread_id, parent_thread, parent_turn, item);
+            if let Some(tool_id) = tool_id.as_deref() {
+                if let Some(subagent_stream) = stream.subagent_streams.get(tool_id) {
+                    apply_live_subagent_stream_to_thread(work, subagent_stream, &mut thread);
+                }
+            }
+            thread
+        })
+        .collect()
+}
+
+fn apply_live_subagent_stream_to_thread(
+    work: &TurnWork,
+    stream: &ClaudeSubagentStreamState,
+    thread: &mut ClaudeThread,
+) {
+    let Some(turn) = thread.turns.last_mut() else {
+        return;
+    };
+    turn.agent_text = live_agent_text_for_subagent_stream(stream);
+    turn.tool_items = live_tool_items_for_subagent_stream(&thread.id, &work.cwd, &turn.id, stream);
+    turn.status = TurnStatus::InProgress;
+    turn.completed_at = None;
+    turn.duration_ms = None;
+    thread.updated_at = now_seconds();
+}
+
+fn live_agent_text_for_subagent_stream(stream: &ClaudeSubagentStreamState) -> String {
+    if !stream.emitted_text.is_empty() {
+        return stream.emitted_text.clone();
+    }
+    if !stream.saw_tool_call && !stream.pending_agent_text.trim().is_empty() {
+        return stream.pending_agent_text.clone();
+    }
+    String::new()
+}
+
+fn live_tool_items_for_subagent_stream(
+    thread_id: &str,
+    cwd: &str,
+    turn_id: &str,
+    stream: &ClaudeSubagentStreamState,
+) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut reasoning_text = stream.reasoning_text.clone();
+    if stream.saw_tool_call && !stream.pending_agent_text.trim().is_empty() {
+        reasoning_text.push_str(&stream.pending_agent_text);
+    }
+    if !reasoning_text.trim().is_empty() {
+        items.push(reasoning_item_json(turn_id, &reasoning_text));
+    }
+    for tool_id in &stream.tool_order {
+        let Some(state) = stream.tool_calls.get(tool_id) else {
+            continue;
+        };
+        if let Some(completion) = stream.completed_tools.get(tool_id) {
+            let duration_ms = json!((completion.completed_at_ms - state.started_at_ms).max(0));
+            items.push(tool_call_item(
+                thread_id,
+                cwd,
+                tool_id,
+                state,
+                if completion.success {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                completion.result.as_deref(),
+                duration_ms,
+            ));
+        } else if state.started_emitted || !is_empty_tool_arguments(&state.arguments) {
+            items.push(tool_call_item(
+                thread_id,
+                cwd,
+                tool_id,
+                state,
+                "inProgress",
+                None,
+                Value::Null,
+            ));
+        }
+    }
+    items
 }
 
 fn request_codex_app_permissions<W: Write>(
@@ -7877,17 +10884,13 @@ fn claude_stream_json_input(work: &TurnWork) -> String {
         "request_id": new_uuid_v4(),
         "request": { "subtype": "initialize" },
     });
+    let content = claude_stream_json_user_content(work);
     let user_message = json!({
         "type": "user",
         "session_id": "",
         "message": {
             "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": work.prompt,
-                }
-            ],
+            "content": content,
         },
         "parent_tool_use_id": Value::Null,
     });
@@ -7896,6 +10899,116 @@ fn claude_stream_json_input(work: &TurnWork) -> String {
         serde_json::to_string(&initialize).unwrap_or_default(),
         serde_json::to_string(&user_message).unwrap_or_default()
     )
+}
+
+fn claude_stream_json_user_content(work: &TurnWork) -> Vec<Value> {
+    let mut content = Vec::new();
+    if let Some(instruction_context) = work
+        .instruction_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        content.push(json!({ "type": "text", "text": instruction_context }));
+    }
+    if work.input.is_empty() {
+        content.push(json!({ "type": "text", "text": work.prompt }));
+        return content;
+    }
+    let mut has_user_content = false;
+    for item in &work.input {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    content.push(json!({ "type": "text", "text": text }));
+                    has_user_content = true;
+                }
+            }
+            Some("localImage") | Some("image") => {
+                if let Some(image) = claude_stream_json_image_content(item) {
+                    content.push(image);
+                    has_user_content = true;
+                } else if let Some(text) = prompt_text_for_single_input_item(item) {
+                    content.push(json!({ "type": "text", "text": text }));
+                    has_user_content = true;
+                }
+            }
+            Some("mention") | Some("skill") => {
+                if let Some(text) = prompt_text_for_single_input_item(item) {
+                    content.push(json!({ "type": "text", "text": text }));
+                    has_user_content = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !has_user_content {
+        content.push(json!({ "type": "text", "text": work.prompt }));
+    }
+    content
+}
+
+fn claude_stream_json_image_content(item: &Value) -> Option<Value> {
+    if let Some(url) = first_input_item_string(item, &["url", "uri", "href", "src"]) {
+        return Some(json!({
+            "type": "image",
+            "source": {
+                "type": "url",
+                "url": url,
+            },
+        }));
+    }
+    let mime_type = first_input_item_string(item, &["mimeType", "mediaType", "mime_type"])
+        .unwrap_or_else(|| {
+            first_input_item_string(item, &["path", "filePath", "file_path"])
+                .as_deref()
+                .map(mime_type_for_image_path)
+                .unwrap_or("image/png")
+                .to_string()
+        });
+    let data = first_input_item_string(item, &["data", "dataBase64", "base64"]).or_else(|| {
+        first_input_item_string(item, &["path", "filePath", "file_path"])
+            .and_then(|path| std::fs::read(path).ok())
+            .map(|bytes| general_purpose::STANDARD.encode(bytes))
+    })?;
+    Some(json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": mime_type,
+            "data": data,
+        },
+    }))
+}
+
+fn prompt_text_for_single_input_item(item: &Value) -> Option<String> {
+    let prompt = prompt_from_input(std::slice::from_ref(item));
+    (prompt != "(empty prompt)").then_some(prompt)
+}
+
+fn first_input_item_string(item: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        item.get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn mime_type_for_image_path(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("png") => "image/png",
+        _ => "image/png",
+    }
 }
 
 fn handle_claude_stream_message<W>(
@@ -7980,6 +11093,10 @@ fn handle_claude_stream_event<W>(
     W: Write,
 {
     let parent_tool_use_id = envelope.get("parent_tool_use_id").and_then(Value::as_str);
+    if let Some(parent_tool_use_id) = parent_tool_use_id {
+        handle_claude_subagent_stream_event(parent_tool_use_id, event, stream);
+        return;
+    }
     match event.get("type").and_then(Value::as_str) {
         Some("content_block_start") => {
             let index = event.get("index").and_then(Value::as_i64);
@@ -8070,6 +11187,15 @@ fn handle_claude_assistant_message<W>(
         return;
     };
     if let Some(content) = message_body.get("content") {
+        if let Some(parent_tool_use_id) = parent_tool_use_id {
+            handle_claude_subagent_assistant_content(parent_tool_use_id, content, stream);
+            if !content_contains_tool_use(content) {
+                if let Some(text) = claude_text_from_content(content) {
+                    complete_tool_call(output, work, stream, parent_tool_use_id, true, Some(text));
+                }
+            }
+            return;
+        }
         if parent_tool_use_id.is_none() {
             if let Some(text) = claude_text_from_content(content) {
                 let Some(text) = visible_agent_snapshot_text(stream, &text) else {
@@ -8091,15 +11217,6 @@ fn handle_claude_assistant_message<W>(
                     &text,
                 );
             }
-        } else if let Some(text) = claude_text_from_content(content) {
-            complete_tool_call(
-                output,
-                work,
-                stream,
-                parent_tool_use_id.unwrap_or_default(),
-                true,
-                Some(text),
-            );
         }
         if let Value::Array(items) = content {
             for item in items {
@@ -8132,6 +11249,10 @@ fn handle_claude_user_message<W>(
     else {
         return;
     };
+    if let Some(parent_tool_use_id) = parent_tool_use_id {
+        handle_claude_subagent_user_content(parent_tool_use_id, content, stream);
+        return;
+    }
     match content {
         Value::Array(items) => {
             for item in items {
@@ -8159,6 +11280,303 @@ fn handle_claude_user_message<W>(
         }
         _ => {}
     }
+}
+
+fn handle_claude_subagent_stream_event(
+    parent_tool_use_id: &str,
+    event: &Value,
+    stream: &mut ClaudeStreamState,
+) {
+    match event.get("type").and_then(Value::as_str) {
+        Some("content_block_start") => {
+            let index = event.get("index").and_then(Value::as_i64);
+            if let Some(content_block) = event.get("content_block") {
+                let subagent = stream
+                    .subagent_streams
+                    .entry(parent_tool_use_id.to_string())
+                    .or_default();
+                if let (Some(index), Some(tool_id)) =
+                    (index, content_block.get("id").and_then(Value::as_str))
+                {
+                    subagent
+                        .tool_block_by_index
+                        .insert(index, tool_id.to_string());
+                }
+                handle_claude_subagent_content_block(content_block, subagent);
+            }
+        }
+        Some("content_block_delta") => {
+            let Some(delta) = event.get("delta") else {
+                return;
+            };
+            let subagent = stream
+                .subagent_streams
+                .entry(parent_tool_use_id.to_string())
+                .or_default();
+            match delta.get("type").and_then(Value::as_str) {
+                Some("text_delta") => {
+                    if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                        append_subagent_agent_text_delta(subagent, text);
+                    }
+                }
+                Some("thinking_delta") => {
+                    if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                        append_subagent_reasoning(subagent, text);
+                    }
+                }
+                Some("input_json_delta") => {
+                    if let (Some(index), Some(partial_json)) = (
+                        event.get("index").and_then(Value::as_i64),
+                        delta.get("partial_json").and_then(Value::as_str),
+                    ) {
+                        if let Some(tool_id) = subagent.tool_block_by_index.get(&index) {
+                            subagent
+                                .tool_input_deltas
+                                .entry(tool_id.clone())
+                                .or_default()
+                                .push_str(partial_json);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some("content_block_stop") => {
+            let Some(index) = event.get("index").and_then(Value::as_i64) else {
+                return;
+            };
+            let Some(subagent) = stream.subagent_streams.get_mut(parent_tool_use_id) else {
+                return;
+            };
+            if let Some(tool_id) = subagent.tool_block_by_index.get(&index).cloned() {
+                if let Some(input) = subagent.tool_input_deltas.remove(&tool_id) {
+                    if !input.trim().is_empty() {
+                        update_subagent_tool_call_arguments(
+                            subagent,
+                            &tool_id,
+                            parse_tool_arguments(input.trim()),
+                        );
+                    }
+                }
+            }
+        }
+        Some("message_start") | Some("message_delta") | Some("message_stop") => {}
+        _ => {}
+    }
+}
+
+fn handle_claude_subagent_assistant_content(
+    parent_tool_use_id: &str,
+    content: &Value,
+    stream: &mut ClaudeStreamState,
+) {
+    let subagent = stream
+        .subagent_streams
+        .entry(parent_tool_use_id.to_string())
+        .or_default();
+    if let Some(text) = claude_text_from_content(content) {
+        set_subagent_agent_text(subagent, &text);
+    }
+    collect_claude_subagent_content_blocks(content, subagent);
+}
+
+fn handle_claude_subagent_user_content(
+    parent_tool_use_id: &str,
+    content: &Value,
+    stream: &mut ClaudeStreamState,
+) {
+    let subagent = stream
+        .subagent_streams
+        .entry(parent_tool_use_id.to_string())
+        .or_default();
+    collect_claude_subagent_content_blocks(content, subagent);
+}
+
+fn collect_claude_subagent_content_blocks(
+    content: &Value,
+    subagent: &mut ClaudeSubagentStreamState,
+) {
+    match content {
+        Value::Array(items) => {
+            for item in items {
+                handle_claude_subagent_content_block(item, subagent);
+            }
+        }
+        Value::Object(_) => handle_claude_subagent_content_block(content, subagent),
+        _ => {}
+    }
+}
+
+fn handle_claude_subagent_content_block(block: &Value, subagent: &mut ClaudeSubagentStreamState) {
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                set_subagent_agent_text(subagent, text);
+            }
+        }
+        Some("thinking") | Some("thinking_delta") => {
+            if let Some(text) = block
+                .get("thinking")
+                .or_else(|| block.get("text"))
+                .and_then(Value::as_str)
+            {
+                append_subagent_reasoning(subagent, text);
+            }
+        }
+        Some("tool_use") | Some("server_tool_use") | Some("mcp_tool_use") => {
+            let tool_id = block.get("id").and_then(Value::as_str).unwrap_or("unknown");
+            let tool_name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let arguments = block.get("input").cloned().unwrap_or_else(|| json!({}));
+            start_subagent_tool_call(subagent, tool_id, tool_name, arguments);
+        }
+        Some("tool_result")
+        | Some("tool_search_tool_result")
+        | Some("web_fetch_tool_result")
+        | Some("web_search_tool_result")
+        | Some("code_execution_tool_result")
+        | Some("bash_code_execution_tool_result")
+        | Some("text_editor_code_execution_tool_result")
+        | Some("mcp_tool_result") => {
+            let tool_id = block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let success = !block
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let result = block
+                .get("content")
+                .and_then(claude_text_from_content)
+                .unwrap_or_else(|| compact_json(block));
+            complete_subagent_tool_call(subagent, tool_id, success, Some(result));
+        }
+        _ => {}
+    }
+}
+
+fn content_contains_tool_use(content: &Value) -> bool {
+    match content {
+        Value::Array(items) => items.iter().any(content_contains_tool_use),
+        Value::Object(map) => {
+            matches!(
+                map.get("type").and_then(Value::as_str),
+                Some("tool_use") | Some("server_tool_use") | Some("mcp_tool_use")
+            ) || map.get("content").is_some_and(content_contains_tool_use)
+        }
+        _ => false,
+    }
+}
+
+fn append_subagent_agent_text_delta(subagent: &mut ClaudeSubagentStreamState, delta: &str) {
+    if delta.is_empty() {
+        return;
+    }
+    if !subagent.saw_tool_call && subagent.emitted_text.is_empty() {
+        subagent.pending_agent_text.push_str(delta);
+    } else {
+        subagent.emitted_text.push_str(delta);
+    }
+}
+
+fn set_subagent_agent_text(subagent: &mut ClaudeSubagentStreamState, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if !subagent.saw_tool_call && subagent.emitted_text.is_empty() {
+        subagent.pending_agent_text = text.to_string();
+    } else {
+        subagent.emitted_text = text.to_string();
+    }
+}
+
+fn append_subagent_reasoning(subagent: &mut ClaudeSubagentStreamState, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    subagent.reasoning_text.push_str(text);
+}
+
+fn flush_subagent_pending_agent_text_as_reasoning(subagent: &mut ClaudeSubagentStreamState) {
+    if subagent.pending_agent_text.trim().is_empty() {
+        subagent.pending_agent_text.clear();
+        return;
+    }
+    let text = std::mem::take(&mut subagent.pending_agent_text);
+    subagent.reasoning_text.push_str(&text);
+}
+
+fn start_subagent_tool_call(
+    subagent: &mut ClaudeSubagentStreamState,
+    tool_id: &str,
+    tool_name: &str,
+    arguments: Value,
+) {
+    let tool_id = non_empty_string(tool_id).unwrap_or_else(|| "unknown".to_string());
+    let tool_name = non_empty_string(tool_name).unwrap_or_else(|| "tool".to_string());
+    subagent.saw_tool_call = true;
+    flush_subagent_pending_agent_text_as_reasoning(subagent);
+    if !subagent.tool_calls.contains_key(&tool_id) {
+        subagent.tool_order.push(tool_id.clone());
+    }
+    let started_emitted = !is_empty_tool_arguments(&arguments);
+    let entry = subagent
+        .tool_calls
+        .entry(tool_id)
+        .or_insert_with(|| ClaudeToolCallState {
+            name: tool_name.clone(),
+            arguments: json!({}),
+            started_at_ms: now_millis(),
+            started_emitted,
+            kind: claude_tool_item_kind(&tool_name),
+        });
+    entry.name = tool_name;
+    entry.kind = claude_tool_item_kind(&entry.name);
+    if !is_empty_tool_arguments(&arguments) {
+        entry.arguments = arguments;
+        entry.started_emitted = true;
+    }
+}
+
+fn update_subagent_tool_call_arguments(
+    subagent: &mut ClaudeSubagentStreamState,
+    tool_id: &str,
+    arguments: Value,
+) {
+    let tool_id = non_empty_string(tool_id).unwrap_or_else(|| "unknown".to_string());
+    if !subagent.tool_calls.contains_key(&tool_id) {
+        start_subagent_tool_call(subagent, &tool_id, "tool", arguments);
+        return;
+    }
+    if !is_empty_tool_arguments(&arguments) {
+        if let Some(state) = subagent.tool_calls.get_mut(&tool_id) {
+            state.arguments = arguments;
+            state.started_emitted = true;
+        }
+    }
+}
+
+fn complete_subagent_tool_call(
+    subagent: &mut ClaudeSubagentStreamState,
+    tool_id: &str,
+    success: bool,
+    result: Option<String>,
+) {
+    let tool_id = non_empty_string(tool_id).unwrap_or_else(|| "unknown".to_string());
+    if !subagent.tool_calls.contains_key(&tool_id) {
+        start_subagent_tool_call(subagent, &tool_id, "tool", json!({}));
+    }
+    if let Some(state) = subagent.tool_calls.get_mut(&tool_id) {
+        state.started_emitted = true;
+    }
+    subagent.completed_tools.insert(
+        tool_id,
+        ClaudeSubagentToolCompletion {
+            success,
+            result,
+            completed_at_ms: now_millis(),
+        },
+    );
 }
 
 fn handle_claude_result_message<W>(
@@ -8702,6 +12120,10 @@ fn tool_call_item(
         ClaudeToolItemKind::CollabAgentToolCall => {
             collab_agent_tool_call_item(thread_id, tool_id, state, status, result)
         }
+        ClaudeToolItemKind::FileChange => {
+            file_change_item_for_tool(tool_id, cwd, state, status, result)
+                .unwrap_or_else(|| mcp_tool_call_item(tool_id, state, status, result))
+        }
         ClaudeToolItemKind::McpToolCall => mcp_tool_call_item(tool_id, state, status, result),
     }
 }
@@ -8710,6 +12132,7 @@ fn claude_tool_item_kind(tool_name: &str) -> ClaudeToolItemKind {
     match tool_name {
         "Agent" | "Task" => ClaudeToolItemKind::CollabAgentToolCall,
         "Bash" => ClaudeToolItemKind::CommandExecution,
+        "Edit" => ClaudeToolItemKind::FileChange,
         _ => ClaudeToolItemKind::McpToolCall,
     }
 }
@@ -8872,6 +12295,115 @@ fn collab_agent_state_status(status: &str) -> &str {
         "failed" => "failed",
         _ => status,
     }
+}
+
+fn file_change_item_for_tool(
+    tool_id: &str,
+    cwd: &str,
+    state: &ClaudeToolCallState,
+    status: &str,
+    result: Option<&str>,
+) -> Option<Value> {
+    let path = file_change_path_from_arguments(&state.arguments)?;
+    let old_string = state.arguments.get("old_string").and_then(Value::as_str)?;
+    let new_string = state.arguments.get("new_string").and_then(Value::as_str)?;
+    let diff = unified_diff_for_edit(cwd, &path, old_string, new_string);
+    let failed = status == "failed";
+    Some(json!({
+        "type": "fileChange",
+        "id": tool_item_id(tool_id),
+        "status": status,
+        "changes": [
+            {
+                "path": path,
+                "kind": {
+                    "type": "update",
+                    "move_path": Value::Null,
+                },
+                "diff": diff,
+            }
+        ],
+        "error": if failed {
+            json!({ "message": result.unwrap_or("Claude Code file edit failed") })
+        } else {
+            Value::Null
+        },
+        "durationMs": Value::Null,
+    }))
+}
+
+fn file_change_path_from_arguments(arguments: &Value) -> Option<String> {
+    ["file_path", "path"]
+        .into_iter()
+        .find_map(|key| arguments.get(key).and_then(Value::as_str))
+        .and_then(non_empty_string)
+}
+
+fn unified_diff_for_edit(cwd: &str, path: &str, old_string: &str, new_string: &str) -> String {
+    let start_line = edit_hunk_start_line(cwd, path, old_string, new_string).unwrap_or(1);
+    let old_lines = diff_lines(old_string);
+    let new_lines = diff_lines(new_string);
+    let mut diff = format!(
+        "@@ -{},{} +{},{} @@\n",
+        start_line,
+        old_lines.len(),
+        start_line,
+        new_lines.len()
+    );
+    for line in &old_lines {
+        diff.push('-');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    for line in &new_lines {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    truncate_for_protocol(&diff, 200_000)
+}
+
+fn diff_lines(value: &str) -> Vec<&str> {
+    if value.is_empty() {
+        Vec::new()
+    } else {
+        value.trim_end_matches('\n').split('\n').collect()
+    }
+}
+
+fn edit_hunk_start_line(
+    cwd: &str,
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+) -> Option<usize> {
+    let file_path = resolve_tool_file_path(cwd, path);
+    let content = std::fs::read_to_string(file_path).ok()?;
+    find_text_start_line(&content, old_string)
+        .or_else(|| find_text_start_line(&content, new_string))
+}
+
+fn resolve_tool_file_path(cwd: &str, path: &str) -> PathBuf {
+    let file_path = PathBuf::from(path);
+    if file_path.is_absolute() {
+        file_path
+    } else {
+        PathBuf::from(cwd).join(file_path)
+    }
+}
+
+fn find_text_start_line(content: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let index = content.find(needle)?;
+    Some(
+        content[..index]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1,
+    )
 }
 
 fn mcp_tool_call_item(
@@ -10666,9 +14198,13 @@ fn latest_claude_transcript_token_usage_info(work: &TurnWork) -> Option<Value> {
 }
 
 fn claude_transcript_path(work: &TurnWork) -> Option<PathBuf> {
+    claude_transcript_path_for_session(&work.cwd, &work.claude_session_id)
+}
+
+fn claude_transcript_path_for_session(cwd: &str, session_id: &str) -> Option<PathBuf> {
     let projects_dir = claude_projects_dir()?;
-    let filename = format!("{}.jsonl", work.claude_session_id);
-    for dir_name in claude_project_dir_candidates(&work.cwd) {
+    let filename = format!("{session_id}.jsonl");
+    for dir_name in claude_project_dir_candidates(cwd) {
         let path = projects_dir.join(dir_name).join(&filename);
         if path.is_file() {
             return Some(path);
@@ -10700,16 +14236,57 @@ fn claude_project_dir_candidates(cwd: &str) -> Vec<String> {
 }
 
 fn claude_project_dir_name(path: &Path) -> String {
-    path.to_string_lossy()
-        .chars()
-        .map(|ch| {
-            if matches!(ch, '/' | '\\' | ':') {
-                '-'
+    let path = path.to_string_lossy();
+    let sanitized = path
+        .encode_utf16()
+        .map(|unit| {
+            if (b'0' as u16..=b'9' as u16).contains(&unit)
+                || (b'A' as u16..=b'Z' as u16).contains(&unit)
+                || (b'a' as u16..=b'z' as u16).contains(&unit)
+            {
+                char::from_u32(unit as u32).unwrap_or('-')
             } else {
-                ch
+                '-'
             }
         })
-        .collect()
+        .collect::<String>();
+    if sanitized.len() <= CLAUDE_PROJECT_DIR_MAX_LEN {
+        return sanitized;
+    }
+    format!(
+        "{}-{}",
+        &sanitized[..CLAUDE_PROJECT_DIR_MAX_LEN],
+        base36_u64(claude_js_string_hash_abs(&path))
+    )
+}
+
+fn claude_js_string_hash_abs(value: &str) -> u64 {
+    let mut hash = 0i32;
+    for unit in value.encode_utf16() {
+        hash = hash
+            .wrapping_shl(5)
+            .wrapping_sub(hash)
+            .wrapping_add(unit as i32);
+    }
+    (hash as i64).abs() as u64
+}
+
+fn base36_u64(mut value: u64) -> String {
+    if value == 0 {
+        return "0".to_string();
+    }
+    let mut digits = Vec::new();
+    while value > 0 {
+        let digit = (value % 36) as u8;
+        let ch = if digit < 10 {
+            (b'0' + digit) as char
+        } else {
+            (b'a' + digit - 10) as char
+        };
+        digits.push(ch);
+        value /= 36;
+    }
+    digits.iter().rev().collect()
 }
 
 fn latest_assistant_text_from_transcript(transcript: &str) -> Option<String> {
@@ -11004,14 +14581,16 @@ fn emit_reasoning_delta<W>(
 fn emit_reasoning_completed_if_started<W>(
     output: &SharedOutput<W>,
     work: &TurnWork,
-    stream: &ClaudeStreamState,
+    stream: &mut ClaudeStreamState,
 ) where
     W: Write,
 {
-    if !stream.reasoning_item_started {
+    if !stream.reasoning_item_started || stream.reasoning_item_completed {
         return;
     }
-    let item_id = reasoning_item_id_for_turn(&work.turn_id);
+    let item = reasoning_item_json(&work.turn_id, &stream.reasoning_text);
+    stream.completed_tool_items.push(item.clone());
+    stream.reasoning_item_completed = true;
     let _ = write_notification(
         output,
         json!({
@@ -11019,20 +14598,24 @@ fn emit_reasoning_completed_if_started<W>(
             "params": {
                 "threadId": work.thread_id,
                 "turnId": work.turn_id,
-                "item": {
-                    "type": "reasoning",
-                    "id": item_id,
-                    "summary": [],
-                    "content": if stream.reasoning_text.is_empty() {
-                        json!([])
-                    } else {
-                        json!([stream.reasoning_text])
-                    },
-                },
+                "item": item,
                 "completedAtMs": now_millis(),
             },
         }),
     );
+}
+
+fn reasoning_item_json(turn_id: &str, text: &str) -> Value {
+    json!({
+        "type": "reasoning",
+        "id": reasoning_item_id_for_turn(turn_id),
+        "summary": [],
+        "content": if text.is_empty() {
+            json!([])
+        } else {
+            json!([text])
+        },
+    })
 }
 
 fn user_item_id_for_turn(turn_id: &str) -> String {
@@ -11197,54 +14780,179 @@ fn thread_runtime_response(thread: &ClaudeThread, include_turns: bool) -> Value 
         "thread": thread.to_json(include_turns),
         "model": thread.model,
         "modelProvider": PROVIDER_NAME,
-        "serviceTier": Value::Null,
+        "serviceTier": thread.service_tier,
         "cwd": thread.cwd,
-        "runtimeWorkspaceRoots": [],
+        "runtimeWorkspaceRoots": thread.workspace_roots,
         "instructionSources": [],
         "approvalPolicy": thread.approval_policy,
         "approvalsReviewer": thread.approvals_reviewer,
-        "sandbox": { "type": "dangerFullAccess" },
+        "sandbox": claude_workspace_write_sandbox_policy(&thread.workspace_roots),
         "activePermissionProfile": Value::Null,
-        "reasoningEffort": Value::Null,
+        "reasoningEffort": thread.reasoning_effort,
+        "baseInstructions": thread
+            .base_instructions
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+        "developerInstructions": thread
+            .developer_instructions
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+        "personality": thread.personality.clone(),
+        "persistExtendedHistory": thread.persist_extended_history.clone(),
     })
 }
 
-fn config_read_response(params: &Value) -> Value {
+fn claude_workspace_write_sandbox_policy(workspace_roots: &[String]) -> Value {
+    json!({
+        "type": "workspaceWrite",
+        "writableRoots": workspace_roots,
+        "networkAccess": false,
+        "excludeTmpdirEnvVar": false,
+        "excludeSlashTmp": false,
+    })
+}
+
+fn config_read_response(params: &Value, overrides: &Map<String, Value>) -> Value {
     let layers = params
         .get("includeLayers")
         .and_then(Value::as_bool)
         .unwrap_or(false)
         .then(|| json!([]))
         .unwrap_or(Value::Null);
+    let mut config = default_config_read_config();
+    merge_config_values(&mut config, overrides);
     json!({
-        "config": {
-            "model": Value::Null,
-            "review_model": Value::Null,
-            "model_context_window": Value::Null,
-            "model_auto_compact_token_limit": Value::Null,
-            "model_auto_compact_token_limit_scope": Value::Null,
-            "model_provider": Value::Null,
-            "approval_policy": Value::Null,
-            "approvals_reviewer": Value::Null,
-            "sandbox_mode": Value::Null,
-            "sandbox_workspace_write": Value::Null,
-            "forced_chatgpt_workspace_id": Value::Null,
-            "forced_login_method": Value::Null,
-            "web_search": Value::Null,
-            "tools": Value::Null,
-            "instructions": Value::Null,
-            "developer_instructions": Value::Null,
-            "compact_prompt": Value::Null,
-            "model_reasoning_effort": Value::Null,
-            "model_reasoning_summary": Value::Null,
-            "model_verbosity": Value::Null,
-            "service_tier": Value::Null,
-            "analytics": Value::Null,
-            "desktop": Value::Null,
-        },
+        "config": Value::Object(config),
         "origins": {},
         "layers": layers,
     })
+}
+
+fn default_config_read_config() -> Map<String, Value> {
+    let mut config = Map::new();
+    for key in [
+        "model",
+        "review_model",
+        "model_context_window",
+        "model_auto_compact_token_limit",
+        "model_auto_compact_token_limit_scope",
+        "model_provider",
+        "approval_policy",
+        "approvals_reviewer",
+        "sandbox_mode",
+        "sandbox_workspace_write",
+        "forced_chatgpt_workspace_id",
+        "forced_login_method",
+        "web_search",
+        "tools",
+        "instructions",
+        "developer_instructions",
+        "compact_prompt",
+        "model_reasoning_effort",
+        "model_reasoning_summary",
+        "model_verbosity",
+        "service_tier",
+        "analytics",
+        "desktop",
+    ] {
+        config.insert(key.to_string(), Value::Null);
+    }
+    config.insert("projects".to_string(), json!({}));
+    config
+}
+
+fn apply_config_write_params(method: &str, params: &Value, config: &mut Map<String, Value>) {
+    if method == "config/value/write" {
+        if let Some((key, value)) = config_write_entry(params) {
+            insert_config_value(config, &key, value);
+        }
+        return;
+    }
+
+    if let Some(values) = params.get("values").and_then(Value::as_object) {
+        merge_config_values(config, values);
+    }
+    if let Some(values) = params.get("config").and_then(Value::as_object) {
+        merge_config_values(config, values);
+    }
+    if let Some(edits) = params.get("edits").and_then(Value::as_array) {
+        for edit in edits {
+            if let Some((key, value)) = config_write_entry(edit) {
+                insert_config_value(config, &key, value);
+            }
+        }
+    }
+}
+
+fn config_write_entry(value: &Value) -> Option<(String, Value)> {
+    let key = [
+        "keyPath",
+        "key_path",
+        "key",
+        "name",
+        "path",
+        "configKey",
+        "config_key",
+        "field",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })?;
+    let value = value
+        .get("value")
+        .or_else(|| value.get("configValue"))
+        .or_else(|| value.get("config_value"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Some((key, value))
+}
+
+fn merge_config_values(target: &mut Map<String, Value>, source: &Map<String, Value>) {
+    for (key, value) in source {
+        if let Some(source_object) = value.as_object() {
+            if let Some(target_object) = target.get_mut(key).and_then(Value::as_object_mut) {
+                merge_config_values(target_object, source_object);
+                continue;
+            }
+        }
+        target.insert(key.clone(), value.clone());
+    }
+}
+
+fn insert_config_value(config: &mut Map<String, Value>, key: &str, value: Value) {
+    let parts = key
+        .split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return;
+    }
+    insert_nested_config_value(config, &parts, value);
+}
+
+fn insert_nested_config_value(config: &mut Map<String, Value>, parts: &[&str], value: Value) {
+    if parts.len() == 1 {
+        config.insert(parts[0].to_string(), value);
+        return;
+    }
+    let child = config
+        .entry(parts[0].to_string())
+        .or_insert_with(|| json!({}));
+    if !child.is_object() {
+        *child = json!({});
+    }
+    if let Some(child) = child.as_object_mut() {
+        insert_nested_config_value(child, &parts[1..], value);
+    }
 }
 
 fn model_from_params(params: &Value) -> String {
@@ -11275,6 +14983,239 @@ fn approvals_reviewer_from_params(params: &Value, fallback: Option<&str>) -> Str
         .or_else(|| json_non_empty_string(params.pointer("/config/approvals_reviewer")))
         .or_else(|| fallback.and_then(non_empty_string))
         .unwrap_or_else(|| DEFAULT_APPROVALS_REVIEWER.to_string())
+}
+
+fn reasoning_effort_from_params(params: &Value, fallback: Option<&Value>) -> Value {
+    thread_runtime_metadata_value(params, &["reasoningEffort", "reasoning_effort", "effort"])
+        .or_else(|| {
+            params
+                .pointer("/collaborationMode/settings/reasoning_effort")
+                .or_else(|| params.pointer("/collaborationMode/settings/reasoningEffort"))
+                .filter(|value| !value.is_null())
+                .cloned()
+        })
+        .or_else(|| {
+            params
+                .pointer("/config/model_reasoning_effort")
+                .filter(|value| !value.is_null())
+                .cloned()
+        })
+        .or_else(|| fallback.filter(|value| !value.is_null()).cloned())
+        .unwrap_or(Value::Null)
+}
+
+fn service_tier_from_params(params: &Value, fallback: Option<&Value>) -> Value {
+    thread_runtime_metadata_value(params, &["serviceTier", "service_tier"])
+        .or_else(|| {
+            params
+                .pointer("/config/service_tier")
+                .filter(|value| !value.is_null())
+                .cloned()
+        })
+        .or_else(|| fallback.filter(|value| !value.is_null()).cloned())
+        .unwrap_or(Value::Null)
+}
+
+fn collaboration_mode_from_params(
+    params: &Value,
+    model: &str,
+    reasoning_effort: &Value,
+    fallback: Option<&Value>,
+) -> Value {
+    thread_metadata_value(params, &["collaborationMode"])
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(|value| normalized_collaboration_mode(value, model, reasoning_effort))
+        .or_else(|| fallback.filter(|value| !value.is_null()).cloned())
+        .unwrap_or(Value::Null)
+}
+
+fn apply_thread_runtime_metadata_from_params(thread: &mut ClaudeThread, params: &Value) {
+    if let Some(model) = params.get("model").and_then(Value::as_str) {
+        thread.model = model.to_string();
+    }
+    thread.reasoning_effort = reasoning_effort_from_params(params, Some(&thread.reasoning_effort));
+    thread.service_tier = service_tier_from_params(params, Some(&thread.service_tier));
+    thread.collaboration_mode = collaboration_mode_from_params(
+        params,
+        &thread.model,
+        &thread.reasoning_effort,
+        Some(&thread.collaboration_mode),
+    );
+}
+
+fn thread_instruction_metadata_from_params(params: &Value) -> ThreadInstructionMetadata {
+    ThreadInstructionMetadata {
+        base: instruction_string_from_params(params, &["baseInstructions", "base_instructions"]),
+        developer: combined_developer_instructions_from_params(params),
+        personality: thread_runtime_metadata_value(params, &["personality"]).unwrap_or(Value::Null),
+        persist_extended_history: thread_runtime_metadata_value(
+            params,
+            &["persistExtendedHistory", "persist_extended_history"],
+        )
+        .unwrap_or(Value::Null),
+    }
+}
+
+fn apply_thread_instruction_metadata_from_params(thread: &mut ClaudeThread, params: &Value) {
+    if let Some(base) =
+        thread_metadata_optional_string_update(params, &["baseInstructions", "base_instructions"])
+    {
+        thread.base_instructions = base;
+    }
+    if let Some(developer) = optional_combined_developer_instructions_from_params(params) {
+        thread.developer_instructions = developer;
+    }
+    if let Some(personality) = thread_runtime_metadata_value(params, &["personality"]) {
+        thread.personality = personality;
+    }
+    if let Some(persist_extended_history) = thread_runtime_metadata_value(
+        params,
+        &["persistExtendedHistory", "persist_extended_history"],
+    ) {
+        thread.persist_extended_history = persist_extended_history;
+    }
+}
+
+fn instruction_string_from_params(params: &Value, keys: &[&str]) -> Option<String> {
+    thread_metadata_string(params, keys)
+}
+
+fn optional_combined_developer_instructions_from_params(params: &Value) -> Option<Option<String>> {
+    let developer = thread_metadata_optional_string_update(
+        params,
+        &["developerInstructions", "developer_instructions"],
+    );
+    let additional = thread_metadata_string(
+        params,
+        &[
+            "additionalDeveloperInstructions",
+            "additional_developer_instructions",
+        ],
+    );
+    match (developer, additional) {
+        (None, None) => None,
+        (Some(None), None) => Some(None),
+        (Some(None), Some(additional)) => Some(Some(additional)),
+        (Some(Some(developer)), None) => Some(Some(developer)),
+        (None, Some(additional)) => Some(Some(additional)),
+        (Some(Some(developer)), Some(additional)) => {
+            Some(Some(format!("{}\n\n{}", developer, additional)))
+        }
+    }
+}
+
+fn combined_developer_instructions_from_params(params: &Value) -> Option<String> {
+    optional_combined_developer_instructions_from_params(params).flatten()
+}
+
+fn claude_thread_instruction_context(thread: &ClaudeThread) -> Option<String> {
+    let mut sections = Vec::new();
+    if let Some(base) = thread
+        .base_instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        sections.push(format!("Base instructions:\n{base}"));
+    }
+    if let Some(developer) = thread
+        .developer_instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        sections.push(format!("Developer instructions:\n{developer}"));
+    }
+    (!sections.is_empty()).then(|| {
+        format!(
+            "Follow these instructions for this Codex app turn:\n\n{}",
+            sections.join("\n\n")
+        )
+    })
+}
+
+fn thread_runtime_metadata_value(params: &Value, keys: &[&str]) -> Option<Value> {
+    thread_metadata_value(params, keys)
+        .filter(|value| !value.is_null())
+        .cloned()
+}
+
+fn git_info_from_params(params: &Value) -> Option<Value> {
+    thread_metadata_value(params, &["gitInfo", "git_info"])
+        .filter(|value| !value.is_null())
+        .cloned()
+}
+
+fn git_info_update_from_params(params: &Value) -> Option<Value> {
+    thread_metadata_value(params, &["gitInfo", "git_info"]).cloned()
+}
+
+fn apply_thread_git_info_from_params(thread: &mut ClaudeThread, params: &Value) {
+    if let Some(git_info) = git_info_update_from_params(params) {
+        thread.git_info = git_info;
+    }
+}
+
+fn git_info_for_cwd(cwd: &str) -> Value {
+    let inside_work_tree = git_command_stdout(cwd, &["rev-parse", "--is-inside-work-tree"])
+        .is_some_and(|value| value == "true");
+    if !inside_work_tree {
+        return Value::Null;
+    }
+
+    let branch = git_command_stdout(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .filter(|value| value != "HEAD");
+    let sha = git_command_stdout(cwd, &["rev-parse", "HEAD"]);
+    let origin_url = git_command_stdout(cwd, &["config", "--get", "remote.origin.url"]);
+    if branch.is_none() && sha.is_none() && origin_url.is_none() {
+        return Value::Null;
+    }
+
+    json!({
+        "branch": branch.map(Value::String).unwrap_or(Value::Null),
+        "sha": sha.map(Value::String).unwrap_or(Value::Null),
+        "originUrl": origin_url.map(Value::String).unwrap_or(Value::Null),
+    })
+}
+
+fn git_command_stdout(cwd: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn normalized_collaboration_mode(
+    mut collaboration_mode: Value,
+    model: &str,
+    reasoning_effort: &Value,
+) -> Value {
+    let Value::Object(map) = &mut collaboration_mode else {
+        return collaboration_mode;
+    };
+    map.entry("mode".to_string())
+        .or_insert_with(|| json!("default"));
+    let settings = map
+        .entry("settings".to_string())
+        .or_insert_with(|| json!({}));
+    if let Value::Object(settings) = settings {
+        settings.insert("model".to_string(), json!(model));
+        settings.insert("reasoning_effort".to_string(), reasoning_effort.clone());
+        settings
+            .entry("developer_instructions".to_string())
+            .or_insert(Value::Null);
+    }
+    collaboration_mode
 }
 
 fn json_non_empty_string(value: Option<&Value>) -> Option<String> {
@@ -11316,6 +15257,298 @@ fn prompt_from_input(input: &[Value]) -> String {
     }
 }
 
+fn append_turn_attachments_to_input(input: &mut Vec<Value>, params: &Value) {
+    let mut lines = Vec::new();
+    collect_turn_attachment_lines(params.get("attachments"), "attachment", &mut lines);
+    collect_turn_attachment_lines(
+        params.get("commentAttachments"),
+        "comment attachment",
+        &mut lines,
+    );
+    if lines.is_empty() {
+        return;
+    }
+    input.push(json!({
+        "type": "text",
+        "text": format!(
+            "Attached context:\n{}",
+            lines
+                .into_iter()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    }));
+}
+
+fn collect_turn_attachment_lines(value: Option<&Value>, label: &str, lines: &mut Vec<String>) {
+    match value {
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Some(line) = turn_attachment_line(item, label) {
+                    lines.push(line);
+                }
+            }
+        }
+        Some(value) => {
+            if let Some(line) = turn_attachment_line(value, label) {
+                lines.push(line);
+            }
+        }
+        None => {}
+    }
+}
+
+fn turn_attachment_line(value: &Value, label: &str) -> Option<String> {
+    if let Some(text) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(format!("{label}: {text}"));
+    }
+    let object = value.as_object()?;
+    let title =
+        first_attachment_string(object, &["name", "fileName", "filename", "title", "label"]);
+    let location = first_attachment_string(
+        object,
+        &["path", "filePath", "url", "uri", "href", "src", "id"],
+    );
+    let kind = first_attachment_string(object, &["type", "kind", "mimeType", "mediaType"]);
+    let text = first_attachment_string(object, &["text", "content", "description"]);
+    let mut parts = Vec::new();
+    if let Some(title) = title {
+        parts.push(title);
+    }
+    if let Some(location) = location {
+        parts.push(location);
+    }
+    if let Some(kind) = kind {
+        parts.push(format!("type={kind}"));
+    }
+    if let Some(text) = text {
+        parts.push(format!("text={}", truncate_for_protocol(&text, 2_000)));
+    }
+    (!parts.is_empty()).then(|| format!("{label}: {}", parts.join(" | ")))
+}
+
+fn first_attachment_string(object: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn thread_metadata_string(params: &Value, keys: &[&str]) -> Option<String> {
+    thread_metadata_value(params, keys)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn thread_metadata_string_array(params: &Value, keys: &[&str]) -> Option<Vec<String>> {
+    let value = thread_metadata_value(params, keys)?;
+    match value {
+        Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        Value::String(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                Some(Vec::new())
+            } else {
+                Some(vec![value.to_string()])
+            }
+        }
+        _ => None,
+    }
+}
+
+fn thread_metadata_text_update(params: &Value, keys: &[&str]) -> Option<ThreadMetadataTextUpdate> {
+    let value = thread_metadata_value(params, keys)?;
+    if value.is_null() {
+        return Some(ThreadMetadataTextUpdate::Clear);
+    }
+    let text = value.as_str()?.trim();
+    if text.is_empty() {
+        Some(ThreadMetadataTextUpdate::Clear)
+    } else {
+        Some(ThreadMetadataTextUpdate::Set(text.to_string()))
+    }
+}
+
+fn thread_metadata_optional_string_update(params: &Value, keys: &[&str]) -> Option<Option<String>> {
+    let value = thread_metadata_value(params, keys)?;
+    if value.is_null() {
+        return Some(None);
+    }
+    Some(
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    )
+}
+
+fn thread_metadata_bool(params: &Value, keys: &[&str]) -> Option<bool> {
+    thread_metadata_value(params, keys).and_then(Value::as_bool)
+}
+
+fn thread_metadata_value<'a>(params: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    if let Some(value) = value_at_any_key(params, keys) {
+        return Some(value);
+    }
+    for container_key in ["metadata", "updates", "thread"] {
+        if let Some(container) = params.get(container_key) {
+            if let Some(value) = value_at_any_key(container, keys) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn value_at_any_key<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|key| value.get(*key))
+}
+
+fn default_thread_workspace_metadata(cwd: &str) -> ThreadWorkspaceMetadata {
+    ThreadWorkspaceMetadata {
+        kind: "project".to_string(),
+        roots: vec![cwd.to_string()],
+        browser_root: None,
+        projectless_output_directory: None,
+    }
+}
+
+fn thread_workspace_metadata_from_params(params: &Value, cwd: &str) -> ThreadWorkspaceMetadata {
+    let kind = thread_metadata_string(params, &["workspaceKind", "workspace_kind"])
+        .unwrap_or_else(|| "project".to_string());
+    let roots = thread_metadata_string_array(params, &["workspaceRoots", "workspace_roots"])
+        .map(|roots| normalize_workspace_roots(roots, cwd))
+        .unwrap_or_else(|| vec![cwd.to_string()]);
+    let browser_root = thread_metadata_string(
+        params,
+        &[
+            "workspaceBrowserRoot",
+            "workspace_browser_root",
+            "workspaceRoot",
+            "workspace_root",
+        ],
+    )
+    .or_else(|| {
+        (kind == "projectless")
+            .then(|| roots.first().cloned())
+            .flatten()
+    });
+    let projectless_output_directory = thread_metadata_string(
+        params,
+        &[
+            "projectlessOutputDirectory",
+            "projectless_output_directory",
+            "outputDirectory",
+            "output_directory",
+        ],
+    )
+    .or_else(|| (kind == "projectless").then(|| cwd.to_string()));
+    ThreadWorkspaceMetadata {
+        kind,
+        roots,
+        browser_root,
+        projectless_output_directory,
+    }
+}
+
+fn apply_thread_workspace_metadata_from_params(thread: &mut ClaudeThread, params: &Value) {
+    if let Some(kind) = thread_metadata_string(params, &["workspaceKind", "workspace_kind"]) {
+        thread.workspace_kind = kind;
+    }
+    if let Some(roots) =
+        thread_metadata_string_array(params, &["workspaceRoots", "workspace_roots"])
+    {
+        thread.workspace_roots = normalize_workspace_roots(roots, &thread.cwd);
+    }
+    if let Some(browser_root) = thread_metadata_optional_string_update(
+        params,
+        &[
+            "workspaceBrowserRoot",
+            "workspace_browser_root",
+            "workspaceRoot",
+            "workspace_root",
+        ],
+    ) {
+        thread.workspace_browser_root = browser_root;
+    } else if thread.workspace_kind == "projectless" && thread.workspace_browser_root.is_none() {
+        thread.workspace_browser_root = thread.workspace_roots.first().cloned();
+    }
+    if let Some(output_directory) = thread_metadata_optional_string_update(
+        params,
+        &[
+            "projectlessOutputDirectory",
+            "projectless_output_directory",
+            "outputDirectory",
+            "output_directory",
+        ],
+    ) {
+        thread.projectless_output_directory = output_directory;
+    } else if thread.workspace_kind == "projectless"
+        && thread.projectless_output_directory.is_none()
+    {
+        thread.projectless_output_directory = Some(thread.cwd.clone());
+    }
+}
+
+fn update_thread_cwd(thread: &mut ClaudeThread, cwd: String) {
+    if thread.cwd == cwd {
+        return;
+    }
+    let old_cwd = std::mem::replace(&mut thread.cwd, cwd.clone());
+    if thread.workspace_roots.len() == 1
+        && thread
+            .workspace_roots
+            .first()
+            .is_some_and(|root| root == &old_cwd)
+    {
+        thread.workspace_roots = vec![cwd.clone()];
+    }
+    if thread.workspace_kind == "projectless"
+        && thread
+            .projectless_output_directory
+            .as_deref()
+            .is_none_or(|output_directory| output_directory == old_cwd)
+    {
+        thread.projectless_output_directory = Some(cwd);
+    }
+    thread.git_info = git_info_for_cwd(&thread.cwd);
+}
+
+fn normalize_workspace_roots(roots: Vec<String>, cwd: &str) -> Vec<String> {
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+    for root in roots {
+        let root = root.trim();
+        if !root.is_empty() && seen.insert(root.to_string()) {
+            normalized.push(root.to_string());
+        }
+    }
+    if normalized.is_empty() {
+        normalized.push(cwd.to_string());
+    }
+    normalized
+}
+
 fn normalize_cwd(value: Option<&str>) -> String {
     let path = value
         .map(str::trim)
@@ -11337,6 +15570,14 @@ fn required_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("missing required param: {}", key))
+}
+
+fn required_thread_id_param(params: &Value) -> Result<&str, String> {
+    params
+        .get("threadId")
+        .or_else(|| params.get("conversationId"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing required param: threadId".to_string())
 }
 
 fn uuid_from_thread_id(value: &str) -> String {
@@ -11539,6 +15780,58 @@ mod tests {
         ))
     }
 
+    fn test_state(workspace_name: Option<&str>) -> ClaudeAppServerState {
+        ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            config_values: Map::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: workspace_name.map(str::to_string),
+        }
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git -C {} {} failed\nstdout:\n{}\nstderr:\n{}",
+            cwd.display(),
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_test_git_repo(root: &Path) {
+        std::fs::create_dir_all(root).expect("create git repo dir");
+        run_git(root, &["init"]);
+        run_git(root, &["checkout", "-b", "feature/test"]);
+        std::fs::write(root.join("README.md"), "hello\n").expect("write git fixture");
+        run_git(root, &["add", "README.md"]);
+        run_git(
+            root,
+            &[
+                "-c",
+                "user.name=Codex Test",
+                "-c",
+                "user.email=codex@example.test",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        run_git(
+            root,
+            &["remote", "add", "origin", "https://example.test/repo.git"],
+        );
+    }
+
     #[test]
     fn claude_code_log_event_writes_configured_log_file() {
         let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
@@ -11725,6 +16018,7 @@ mod tests {
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -11760,6 +16054,7 @@ mod tests {
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -11870,6 +16165,285 @@ mod tests {
             .is_some());
         assert_eq!(config_result.get("layers"), Some(&json!([])));
         assert_eq!(output.lines().count(), 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_runtime_response_uses_workspace_write_sandbox() {
+        let root = test_dir("workspace-write-sandbox");
+        let cwd = root.join("workspace");
+        std::fs::create_dir_all(&cwd).expect("create workspace");
+        let mut state = test_state(None);
+
+        let (response, _) = state.start_thread(&json!({
+            "cwd": cwd.to_string_lossy(),
+            "reasoningEffort": "medium",
+            "serviceTier": "flex",
+            "collaborationMode": {
+                "mode": "default",
+                "settings": {
+                    "developer_instructions": "extra"
+                }
+            }
+        }));
+        assert_eq!(
+            response.pointer("/sandbox/type").and_then(Value::as_str),
+            Some("workspaceWrite")
+        );
+        assert_eq!(
+            response
+                .pointer("/sandbox/writableRoots/0")
+                .and_then(Value::as_str),
+            Some(cwd.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            response
+                .pointer("/sandbox/networkAccess")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            response
+                .pointer("/runtimeWorkspaceRoots/0")
+                .and_then(Value::as_str),
+            Some(cwd.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/workspaceRoots/0")
+                .and_then(Value::as_str),
+            Some(cwd.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/workspaceKind")
+                .and_then(Value::as_str),
+            Some("project")
+        );
+        assert_eq!(
+            response.get("reasoningEffort").and_then(Value::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            response.get("serviceTier").and_then(Value::as_str),
+            Some("flex")
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/workspaceKind")
+                .and_then(Value::as_str),
+            Some("project")
+        );
+
+        let thread_id = response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        let (_, notifications, _, _) = state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "hello" }],
+            }))
+            .expect("start turn");
+        let snapshot = notifications
+            .iter()
+            .find(|notification| {
+                notification.get("method").and_then(Value::as_str)
+                    == Some("thread-stream-state-changed")
+            })
+            .expect("snapshot");
+        assert_eq!(
+            snapshot
+                .pointer("/params/change/conversationState/turns/0/params/sandboxPolicy/type")
+                .and_then(Value::as_str),
+            Some("workspaceWrite")
+        );
+        assert_eq!(
+            snapshot
+                .pointer(
+                    "/params/change/conversationState/turns/0/params/sandboxPolicy/writableRoots/0"
+                )
+                .and_then(Value::as_str),
+            Some(cwd.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/params/change/conversationState/latestReasoningEffort")
+                .and_then(Value::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/params/change/conversationState/latestCollaborationMode/settings/model")
+                .and_then(Value::as_str),
+            Some(DEFAULT_MODEL)
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/params/change/conversationState/latestCollaborationMode/settings/reasoning_effort")
+                .and_then(Value::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/params/change/conversationState/turns/0/params/effort")
+                .and_then(Value::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/params/change/conversationState/turns/0/params/serviceTier")
+                .and_then(Value::as_str),
+            Some("flex")
+        );
+
+        let projectless_root = root.join("Codex");
+        let output_dir = projectless_root.join("2026-06-03").join("chat");
+        std::fs::create_dir_all(&output_dir).expect("create projectless output");
+        let (projectless_response, _) = state.start_thread(&json!({
+            "cwd": output_dir.to_string_lossy(),
+            "workspaceKind": "projectless",
+            "workspaceRoots": [projectless_root.to_string_lossy()],
+            "projectlessOutputDirectory": output_dir.to_string_lossy(),
+        }));
+        assert_eq!(
+            projectless_response
+                .pointer("/thread/workspaceKind")
+                .and_then(Value::as_str),
+            Some("projectless")
+        );
+        assert_eq!(
+            projectless_response
+                .pointer("/thread/workspaceRoots/0")
+                .and_then(Value::as_str),
+            Some(projectless_root.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            projectless_response
+                .pointer("/thread/workspaceBrowserRoot")
+                .and_then(Value::as_str),
+            Some(projectless_root.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            projectless_response
+                .pointer("/thread/projectlessOutputDirectory")
+                .and_then(Value::as_str),
+            Some(output_dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            projectless_response
+                .pointer("/runtimeWorkspaceRoots/0")
+                .and_then(Value::as_str),
+            Some(projectless_root.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            projectless_response
+                .pointer("/sandbox/writableRoots/0")
+                .and_then(Value::as_str),
+            Some(projectless_root.to_string_lossy().as_ref())
+        );
+        let projectless_thread_id = projectless_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("projectless thread id")
+            .to_string();
+        let (_, projectless_notifications, _, _) = state
+            .start_turn(&json!({
+                "threadId": projectless_thread_id,
+                "input": [{ "type": "text", "text": "hello projectless" }],
+            }))
+            .expect("start projectless turn");
+        let projectless_snapshot = projectless_notifications
+            .iter()
+            .find(|notification| {
+                notification.get("method").and_then(Value::as_str)
+                    == Some("thread-stream-state-changed")
+            })
+            .expect("projectless snapshot");
+        assert_eq!(
+            projectless_snapshot
+                .pointer("/params/change/conversationState/workspaceKind")
+                .and_then(Value::as_str),
+            Some("projectless")
+        );
+        assert_eq!(
+            projectless_snapshot
+                .pointer("/params/change/conversationState/workspaceBrowserRoot")
+                .and_then(Value::as_str),
+            Some(projectless_root.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            projectless_snapshot
+                .pointer(
+                    "/params/change/conversationState/turns/0/params/sandboxPolicy/writableRoots/0"
+                )
+                .and_then(Value::as_str),
+            Some(projectless_root.to_string_lossy().as_ref())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn start_thread_includes_git_info_for_git_workspace() {
+        let root = test_dir("thread-git-info");
+        init_test_git_repo(&root);
+        let mut state = test_state(None);
+
+        let (response, _) = state.start_thread(&json!({
+            "cwd": root.to_string_lossy(),
+        }));
+
+        assert_eq!(
+            response
+                .pointer("/thread/gitInfo/branch")
+                .and_then(Value::as_str),
+            Some("feature/test")
+        );
+        let sha = response
+            .pointer("/thread/gitInfo/sha")
+            .and_then(Value::as_str)
+            .expect("git sha");
+        assert_eq!(sha.len(), 40);
+        assert_eq!(
+            response
+                .pointer("/thread/gitInfo/originUrl")
+                .and_then(Value::as_str),
+            Some("https://example.test/repo.git")
+        );
+
+        let thread_id = response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        let (_, notifications, _, _) = state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "hello" }],
+            }))
+            .expect("start turn");
+        let snapshot = notifications
+            .iter()
+            .find(|notification| {
+                notification.get("method").and_then(Value::as_str)
+                    == Some("thread-stream-state-changed")
+            })
+            .expect("snapshot");
+        assert_eq!(
+            snapshot
+                .pointer("/params/change/conversationState/gitInfo/branch")
+                .and_then(Value::as_str),
+            Some("feature/test")
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/params/change/conversationState/gitInfo/originUrl")
+                .and_then(Value::as_str),
+            Some("https://example.test/repo.git")
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -12127,6 +16701,8 @@ args = ["server.js", "--stdio"]
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: root.to_string_lossy().to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -12188,6 +16764,8 @@ args = ["server.js", "--stdio"]
             claude_session_id: "22222222-2222-4222-8222-222222222222".to_string(),
             cwd: root.to_string_lossy().to_string(),
             prompt: "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\nGenerate a concise UI title (up to 36 characters) for this task.\n\nUser prompt:\nhello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         });
@@ -12219,6 +16797,8 @@ args = ["server.js", "--stdio"]
             claude_session_id: "session".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -12248,6 +16828,7 @@ args = ["server.js", "--stdio"]
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -12340,6 +16921,7 @@ args = ["server.js", "--stdio"]
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -12447,6 +17029,1164 @@ args = ["server.js", "--stdio"]
                 .expect("thread goal result");
             assert!(result.get("goal").is_some_and(Value::is_null));
         }
+    }
+
+    #[test]
+    fn thread_metadata_update_applies_fields_and_emits_snapshot() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("thread-metadata-update");
+        std::fs::create_dir_all(&root).expect("create temp home");
+        std::env::set_var("HOME", &root);
+
+        let mut state = test_state(Some("workspace"));
+        let initial_cwd = root.join("old");
+        let new_cwd = root.join("new");
+        let workspace_root = root.join("workspace-root");
+        let (thread_response, _) = state.start_thread(&json!({
+            "cwd": initial_cwd.to_string_lossy(),
+            "model": "claude-code",
+        }));
+        let thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+
+        let (response, notification) = state
+            .thread_metadata_update(&json!({
+                "threadId": format!("local:{thread_id}"),
+                "metadata": {
+                    "title": "Manual thread title",
+                    "cwd": new_cwd.to_string_lossy(),
+                    "model": "opus",
+                    "preview": "manual preview",
+                    "workspaceKind": "projectless",
+                    "workspaceRoots": [workspace_root.to_string_lossy()],
+                    "workspaceBrowserRoot": workspace_root.to_string_lossy(),
+                    "projectlessOutputDirectory": new_cwd.to_string_lossy(),
+                    "reasoningEffort": "high",
+                    "serviceTier": "priority",
+                    "collaborationMode": {
+                        "mode": "default",
+                        "settings": {}
+                    },
+                    "baseInstructions": "base update",
+                    "developerInstructions": "developer update",
+                    "additionalDeveloperInstructions": "additional update",
+                    "personality": "concise",
+                    "persistExtendedHistory": true,
+                    "gitInfo": {
+                        "branch": "manual-branch",
+                        "sha": "abc123",
+                        "originUrl": "https://example.test/manual.git"
+                    },
+                    "approvalPolicy": "never",
+                    "approvalsReviewer": "auto_review",
+                    "archived": true,
+                },
+            }))
+            .expect("metadata update");
+        assert_eq!(
+            response.pointer("/thread/name").and_then(Value::as_str),
+            Some("Manual thread title")
+        );
+        assert_eq!(
+            response.pointer("/thread/cwd").and_then(Value::as_str),
+            Some(new_cwd.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/modelProvider")
+                .and_then(Value::as_str),
+            Some(PROVIDER_NAME)
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/approvalPolicy")
+                .and_then(Value::as_str),
+            Some("never")
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/workspaceKind")
+                .and_then(Value::as_str),
+            Some("projectless")
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/workspaceRoots/0")
+                .and_then(Value::as_str),
+            Some(workspace_root.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/projectlessOutputDirectory")
+                .and_then(Value::as_str),
+            Some(new_cwd.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/reasoningEffort")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/serviceTier")
+                .and_then(Value::as_str),
+            Some("priority")
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/baseInstructions")
+                .and_then(Value::as_str),
+            Some("base update")
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/developerInstructions")
+                .and_then(Value::as_str),
+            Some("developer update\n\nadditional update")
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/personality")
+                .and_then(Value::as_str),
+            Some("concise")
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/persistExtendedHistory")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/gitInfo/branch")
+                .and_then(Value::as_str),
+            Some("manual-branch")
+        );
+        assert_eq!(
+            response
+                .pointer("/thread/gitInfo/originUrl")
+                .and_then(Value::as_str),
+            Some("https://example.test/manual.git")
+        );
+        let notification = notification.expect("snapshot notification");
+        assert_eq!(
+            notification
+                .pointer("/params/change/conversationState/title")
+                .and_then(Value::as_str),
+            Some("Manual thread title")
+        );
+        assert_eq!(
+            notification
+                .pointer("/params/change/conversationState/latestModel")
+                .and_then(Value::as_str),
+            Some("opus")
+        );
+        assert_eq!(
+            notification
+                .pointer("/params/change/conversationState/cwd")
+                .and_then(Value::as_str),
+            Some(new_cwd.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            notification
+                .pointer("/params/change/conversationState/workspaceKind")
+                .and_then(Value::as_str),
+            Some("projectless")
+        );
+        assert_eq!(
+            notification
+                .pointer("/params/change/conversationState/workspaceBrowserRoot")
+                .and_then(Value::as_str),
+            Some(workspace_root.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            notification
+                .pointer("/params/change/conversationState/latestReasoningEffort")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            notification
+                .pointer("/params/change/conversationState/latestCollaborationMode/settings/model")
+                .and_then(Value::as_str),
+            Some("opus")
+        );
+        assert_eq!(
+            notification
+                .pointer(
+                    "/params/change/conversationState/latestCollaborationMode/settings/reasoning_effort"
+                )
+                .and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            notification
+                .pointer("/params/change/conversationState/baseInstructions")
+                .and_then(Value::as_str),
+            Some("base update")
+        );
+        assert_eq!(
+            notification
+                .pointer("/params/change/conversationState/developerInstructions")
+                .and_then(Value::as_str),
+            Some("developer update\n\nadditional update")
+        );
+        assert_eq!(
+            notification
+                .pointer("/params/change/conversationState/personality")
+                .and_then(Value::as_str),
+            Some("concise")
+        );
+        assert_eq!(
+            notification
+                .pointer("/params/change/conversationState/persistExtendedHistory")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            notification
+                .pointer("/params/change/conversationState/gitInfo/branch")
+                .and_then(Value::as_str),
+            Some("manual-branch")
+        );
+        assert!(state.threads.get(&thread_id).expect("thread").archived);
+
+        let read = state
+            .thread_read(&json!({ "threadId": thread_id }))
+            .expect("thread read");
+        assert_eq!(
+            read.pointer("/thread/name").and_then(Value::as_str),
+            Some("Manual thread title")
+        );
+        assert_eq!(
+            read.pointer("/thread/workspaceRoots/0")
+                .and_then(Value::as_str),
+            Some(workspace_root.to_string_lossy().as_ref())
+        );
+        assert!(root
+            .join(".claude")
+            .join(CLAUDE_THREAD_NAMES_FILE)
+            .is_file());
+
+        let (clear_response, _) = state
+            .thread_metadata_update(&json!({
+                "threadId": read.pointer("/thread/id").and_then(Value::as_str),
+                "name": Value::Null,
+            }))
+            .expect("clear metadata name");
+        assert!(clear_response
+            .pointer("/thread/name")
+            .is_some_and(Value::is_null));
+
+        let (clear_git_response, _) = state
+            .thread_metadata_update(&json!({
+                "threadId": read.pointer("/thread/id").and_then(Value::as_str),
+                "gitInfo": Value::Null,
+            }))
+            .expect("clear metadata git info");
+        assert!(clear_git_response
+            .pointer("/thread/gitInfo")
+            .is_some_and(Value::is_null));
+
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_goal_methods_store_clear_and_emit_snapshot() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("thread-goal-state");
+        std::fs::create_dir_all(&root).expect("create temp home");
+        std::env::set_var("HOME", &root);
+
+        let mut state = test_state(Some("workspace"));
+        let (thread_response, _) = state.start_thread(&json!({ "cwd": root }));
+        let thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+
+        let (set_response, notification) = state
+            .thread_goal_set(&json!({
+                "threadId": thread_id,
+                "goal": {
+                    "objective": "finish claude-code adapter",
+                    "status": "active",
+                },
+            }))
+            .expect("set goal");
+        assert_eq!(
+            set_response
+                .pointer("/goal/objective")
+                .and_then(Value::as_str),
+            Some("finish claude-code adapter")
+        );
+        assert_eq!(
+            notification
+                .as_ref()
+                .and_then(
+                    |value| value.pointer("/params/change/conversationState/threadGoal/objective")
+                )
+                .and_then(Value::as_str),
+            Some("finish claude-code adapter")
+        );
+        assert_eq!(
+            state
+                .thread_goal_get(&json!({ "threadId": thread_id }))
+                .expect("get goal")
+                .pointer("/goal/status")
+                .and_then(Value::as_str),
+            Some("active")
+        );
+        assert!(root
+            .join(".claude")
+            .join(CLAUDE_THREAD_GOALS_FILE)
+            .is_file());
+
+        let (clear_response, _) = state
+            .thread_goal_clear(&json!({ "threadId": thread_id }))
+            .expect("clear goal");
+        assert!(clear_response.get("goal").is_some_and(Value::is_null));
+        assert!(state
+            .thread_goal_get(&json!({ "threadId": thread_id }))
+            .expect("get cleared goal")
+            .get("goal")
+            .is_some_and(Value::is_null));
+
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_write_updates_later_config_read() {
+        let mut state = test_state(None);
+
+        let write = state.config_write(
+            "config/value/write",
+            &json!({ "key": "model", "value": "sonnet" }),
+        );
+        assert_eq!(write.get("status").and_then(Value::as_str), Some("ok"));
+        state.config_write(
+            "config/batchWrite",
+            &json!({
+                "edits": [
+                    { "key": "projects.demo.trust_level", "value": "trusted" },
+                    { "keyPath": "profiles.claude-code.model", "value": "opus" },
+                    { "key_path": "profiles.claude-code.model_reasoning_effort", "value": "high" }
+                ],
+                "values": {
+                    "approval_policy": "on-request"
+                }
+            }),
+        );
+
+        let read = state.config_read(&json!({ "includeLayers": true }));
+        assert_eq!(
+            read.pointer("/config/model").and_then(Value::as_str),
+            Some("sonnet")
+        );
+        assert_eq!(
+            read.pointer("/config/approval_policy")
+                .and_then(Value::as_str),
+            Some("on-request")
+        );
+        assert_eq!(
+            read.pointer("/config/projects/demo/trust_level")
+                .and_then(Value::as_str),
+            Some("trusted")
+        );
+        assert_eq!(
+            read.pointer("/config/profiles/claude-code/model")
+                .and_then(Value::as_str),
+            Some("opus")
+        );
+        assert_eq!(
+            read.pointer("/config/profiles/claude-code/model_reasoning_effort")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(read.get("layers"), Some(&json!([])));
+    }
+
+    #[test]
+    fn model_list_exposes_claude_code_model_aliases() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_model = std::env::var_os(MODEL_ENV);
+        std::env::set_var(MODEL_ENV, "sonnet");
+
+        let result =
+            standalone_codex_app_result("model/list", &json!({ "limit": 2 })).expect("model list");
+        let models = result
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("models");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].get("id").and_then(Value::as_str), Some("sonnet"));
+        assert_eq!(
+            models[0].get("isDefault").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            models[0]
+                .get("inputModalities")
+                .and_then(Value::as_array)
+                .and_then(|items| items.get(1))
+                .and_then(Value::as_str),
+            Some("image")
+        );
+        assert_eq!(result.get("nextCursor").and_then(Value::as_str), Some("2"));
+
+        restore_env(MODEL_ENV, old_model);
+    }
+
+    #[test]
+    fn collaboration_mode_list_exposes_plan_and_default_modes() {
+        let result = standalone_codex_app_result("collaborationMode/list", &json!({}))
+            .expect("collaboration mode list");
+        let modes = result.get("data").and_then(Value::as_array).expect("modes");
+
+        assert_eq!(
+            modes
+                .iter()
+                .filter_map(|mode| mode.get("mode").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["plan", "default"]
+        );
+        assert_eq!(
+            modes[0].get("model").and_then(Value::as_str),
+            Some(DEFAULT_MODEL)
+        );
+        assert!(modes[0].get("reasoning_effort").is_some_and(Value::is_null));
+    }
+
+    #[test]
+    fn thread_turns_items_list_returns_materialized_items() {
+        let mut state = test_state(None);
+        let (thread_response, _) = state.start_thread(&json!({ "cwd": "/tmp" }));
+        let thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        let (_, _, work, _) = state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "run a tool" }],
+            }))
+            .expect("start turn");
+        state
+            .finish_turn(
+                &work.thread_id,
+                &work.turn_id,
+                ClaudeRunResult {
+                    text: "done".to_string(),
+                    error: None,
+                    duration_ms: 5,
+                    tool_items: vec![json!({
+                        "type": "mcpToolCall",
+                        "id": "tool-1",
+                        "server": "claude-code",
+                        "tool": "Read",
+                        "status": "completed",
+                    })],
+                    agent_item_streamed: false,
+                    latest_token_usage_info: None,
+                },
+                None,
+            )
+            .expect("finish turn");
+
+        let response = state
+            .thread_turns_items_list(&json!({
+                "threadId": work.thread_id,
+                "turnId": work.turn_id,
+                "sortDirection": "asc",
+            }))
+            .expect("items list");
+        let item_types = response
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("items")
+            .iter()
+            .filter_map(|item| item.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            item_types,
+            vec!["userMessage", "mcpToolCall", "agentMessage"]
+        );
+    }
+
+    #[test]
+    fn subagent_receiver_thread_id_returns_virtual_thread() {
+        let mut state = test_state(Some("workspace"));
+        let (thread_response, _) = state.start_thread(&json!({ "cwd": "/tmp" }));
+        let thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        let (_, _, work, _) = state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "spawn a subagent" }],
+            }))
+            .expect("start turn");
+        let receiver_thread_id = "claude-subagent-call_e375199e78234d0eb05ed702";
+        state
+            .finish_turn(
+                &work.thread_id,
+                &work.turn_id,
+                ClaudeRunResult {
+                    text: "parent done".to_string(),
+                    error: None,
+                    duration_ms: 5,
+                    tool_items: vec![json!({
+                        "type": "collabAgentToolCall",
+                        "id": "tool-agent",
+                        "tool": "spawnAgent",
+                        "status": "completed",
+                        "senderThreadId": work.thread_id,
+                        "receiverThreadIds": [receiver_thread_id],
+                        "receiverThreads": [
+                            {
+                                "threadId": receiver_thread_id,
+                                "thread": Value::Null,
+                            }
+                        ],
+                        "prompt": "Inspect the project structure",
+                        "model": Value::Null,
+                        "reasoningEffort": Value::Null,
+                        "agentsStates": {
+                            receiver_thread_id: { "status": "completed" }
+                        },
+                        "result": "subagent done",
+                        "error": Value::Null,
+                    })],
+                    agent_item_streamed: false,
+                    latest_token_usage_info: None,
+                },
+                None,
+            )
+            .expect("finish turn");
+
+        let read = state
+            .thread_read(&json!({
+                "threadId": receiver_thread_id,
+                "includeTurns": true,
+            }))
+            .expect("subagent thread read");
+        assert_eq!(
+            read.pointer("/thread/id").and_then(Value::as_str),
+            Some(receiver_thread_id)
+        );
+        assert_eq!(
+            read.pointer("/thread/turns/0/items/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("Inspect the project structure")
+        );
+        assert_eq!(
+            read.pointer("/thread/turns/0/items/1/text")
+                .and_then(Value::as_str),
+            Some("subagent done")
+        );
+
+        let turns = state
+            .thread_turns_list(&json!({
+                "threadId": receiver_thread_id,
+                "sortDirection": "asc",
+            }))
+            .expect("subagent turns list");
+        assert_eq!(
+            turns
+                .pointer("/data/0/items/1/text")
+                .and_then(Value::as_str),
+            Some("subagent done")
+        );
+
+        let items = state
+            .thread_turns_items_list(&json!({
+                "threadId": receiver_thread_id,
+                "sortDirection": "asc",
+            }))
+            .expect("subagent items list");
+        assert_eq!(
+            items.pointer("/data/1/text").and_then(Value::as_str),
+            Some("subagent done")
+        );
+
+        let (resumed, _) = state
+            .resume_thread(&json!({
+                "threadId": receiver_thread_id,
+                "excludeTurns": false,
+            }))
+            .expect("subagent resume");
+        assert_eq!(
+            resumed.pointer("/thread/id").and_then(Value::as_str),
+            Some(receiver_thread_id)
+        );
+    }
+
+    #[test]
+    fn subagent_receiver_thread_loads_sidechain_transcript_history() {
+        let _guard = ENV_TEST_LOCK.lock().expect("env lock poisoned");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("subagent-sidechain");
+        let cwd = root.join("workspace");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::env::set_var("HOME", &root);
+
+        let mut state = test_state(Some("workspace"));
+        let (thread_response, _) = state.start_thread(&json!({ "cwd": cwd.to_string_lossy() }));
+        let thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        let (_, _, work, _) = state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "spawn a subagent" }],
+            }))
+            .expect("start turn");
+
+        let projects_dir = root
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_dir_name(&cwd));
+        std::fs::create_dir_all(&projects_dir).expect("create projects dir");
+        let transcript_path = projects_dir.join(format!("{}.jsonl", work.claude_session_id));
+        let transcript_lines = [
+            json!({
+                "type": "user",
+                "sessionId": work.claude_session_id,
+                "cwd": cwd,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "uuid": "parent-user",
+                "isSidechain": false,
+                "message": { "role": "user", "content": "spawn a subagent" }
+            }),
+            json!({
+                "type": "assistant",
+                "sessionId": work.claude_session_id,
+                "cwd": cwd,
+                "timestamp": "2026-01-01T00:00:01Z",
+                "uuid": "parent-assistant",
+                "parentUuid": "parent-user",
+                "isSidechain": false,
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-20250514",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_agent",
+                        "name": "Task",
+                        "input": {
+                            "description": "Explore repo",
+                            "prompt": "Inspect the project structure",
+                            "subagent_type": "Explore"
+                        }
+                    }]
+                }
+            }),
+            json!({
+                "type": "user",
+                "sessionId": work.claude_session_id,
+                "cwd": cwd,
+                "timestamp": "2026-01-01T00:00:02Z",
+                "uuid": "side-user",
+                "parentUuid": "parent-assistant",
+                "isSidechain": true,
+                "message": { "role": "user", "content": "Inspect the project structure" }
+            }),
+            json!({
+                "type": "assistant",
+                "sessionId": work.claude_session_id,
+                "cwd": cwd,
+                "timestamp": "2026-01-01T00:00:03Z",
+                "uuid": "side-assistant-tool",
+                "parentUuid": "side-user",
+                "isSidechain": true,
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-20250514",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_read",
+                        "name": "Read",
+                        "input": { "file_path": "/tmp/README.md" }
+                    }]
+                }
+            }),
+            json!({
+                "type": "user",
+                "sessionId": work.claude_session_id,
+                "cwd": cwd,
+                "timestamp": "2026-01-01T00:00:04Z",
+                "uuid": "side-tool-result",
+                "parentUuid": "side-assistant-tool",
+                "isSidechain": true,
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_read",
+                        "content": "README contents"
+                    }]
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "sessionId": work.claude_session_id,
+                "cwd": cwd,
+                "timestamp": "2026-01-01T00:00:05Z",
+                "uuid": "side-final",
+                "parentUuid": "side-tool-result",
+                "isSidechain": true,
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-20250514",
+                    "content": [{ "type": "text", "text": "sidechain done" }]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&transcript_path, transcript_lines).expect("write transcript");
+
+        let receiver_thread_id = "claude-subagent-toolu_agent";
+        state
+            .finish_turn(
+                &work.thread_id,
+                &work.turn_id,
+                ClaudeRunResult {
+                    text: "parent done".to_string(),
+                    error: None,
+                    duration_ms: 5,
+                    tool_items: vec![json!({
+                        "type": "collabAgentToolCall",
+                        "id": "claude-tool-toolu_agent",
+                        "tool": "spawnAgent",
+                        "status": "completed",
+                        "senderThreadId": work.thread_id,
+                        "receiverThreadIds": [receiver_thread_id],
+                        "receiverThreads": [{ "threadId": receiver_thread_id, "thread": Value::Null }],
+                        "prompt": "Inspect the project structure",
+                        "model": Value::Null,
+                        "reasoningEffort": Value::Null,
+                        "agentsStates": { receiver_thread_id: { "status": "completed" } },
+                        "result": "parent summary",
+                        "error": Value::Null,
+                    })],
+                    agent_item_streamed: false,
+                    latest_token_usage_info: None,
+                },
+                None,
+            )
+            .expect("finish turn");
+
+        let read = state
+            .thread_read(&json!({
+                "threadId": receiver_thread_id,
+                "includeTurns": true,
+            }))
+            .expect("subagent thread read");
+        assert_eq!(
+            read.pointer("/thread/turns/0/items/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("Inspect the project structure")
+        );
+        assert_eq!(
+            read.pointer("/thread/turns/0/items/1/type")
+                .and_then(Value::as_str),
+            Some("mcpToolCall")
+        );
+        assert_eq!(
+            read.pointer("/thread/turns/0/items/1/tool")
+                .and_then(Value::as_str),
+            Some("Read")
+        );
+        assert_eq!(
+            read.pointer("/thread/turns/0/items/1/result/content/0/text")
+                .and_then(Value::as_str),
+            Some("README contents")
+        );
+        assert_eq!(
+            read.pointer("/thread/turns/0/items/2/text")
+                .and_then(Value::as_str),
+            Some("sidechain done")
+        );
+        assert_ne!(
+            read.pointer("/thread/turns/0/items/2/text")
+                .and_then(Value::as_str),
+            Some("parent summary")
+        );
+
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagent_live_stream_finishes_receiver_thread_and_broadcasts_snapshot() {
+        let mut initial_state = test_state(None);
+        let (thread_response, _) = initial_state.start_thread(&json!({ "cwd": "/tmp" }));
+        let thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        let (_, _, work, _) = initial_state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "spawn a subagent" }],
+            }))
+            .expect("start turn");
+        let state = Arc::new(Mutex::new(initial_state));
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut child_stdin = Vec::<u8>::new();
+        let mut stream = ClaudeStreamState::default();
+        let mut command_output = String::new();
+
+        handle_claude_stdout_line(
+            &json!({
+                "type": "stream_event",
+                "parent_tool_use_id": Value::Null,
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_agent",
+                        "name": "Task",
+                        "input": {
+                            "description": "Explore repo",
+                            "prompt": "Inspect the project structure"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+            &work,
+            &state,
+            &output,
+            &mut child_stdin,
+            &mut stream,
+            &mut command_output,
+        )
+        .expect("handle agent tool");
+        handle_claude_stdout_line(
+            &json!({
+                "type": "stream_event",
+                "parent_tool_use_id": "toolu_agent",
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "text_delta", "text": "subagent live" }
+                }
+            })
+            .to_string(),
+            &work,
+            &state,
+            &output,
+            &mut child_stdin,
+            &mut stream,
+            &mut command_output,
+        )
+        .expect("handle subagent text");
+
+        let receiver_thread_id = "claude-subagent-toolu_agent";
+        let read = state
+            .lock()
+            .expect("state lock")
+            .thread_read(&json!({
+                "threadId": receiver_thread_id,
+                "includeTurns": true,
+            }))
+            .expect("subagent thread read");
+        assert_eq!(
+            read.pointer("/thread/status/type").and_then(Value::as_str),
+            Some("active")
+        );
+        assert_eq!(
+            read.pointer("/thread/turns/0/items/1/text")
+                .and_then(Value::as_str),
+            Some("subagent live")
+        );
+
+        let finish_notifications = {
+            let mut state = state.lock().expect("state lock");
+            state
+                .finish_turn(
+                    &work.thread_id,
+                    &work.turn_id,
+                    ClaudeRunResult {
+                        text: "parent done".to_string(),
+                        error: None,
+                        duration_ms: 10,
+                        tool_items: vec![json!({
+                            "type": "collabAgentToolCall",
+                            "id": "claude-tool-toolu_agent",
+                            "tool": "spawnAgent",
+                            "status": "completed",
+                            "senderThreadId": work.thread_id,
+                            "receiverThreadIds": [receiver_thread_id],
+                            "receiverThreads": [{ "threadId": receiver_thread_id, "thread": Value::Null }],
+                            "prompt": "Inspect the project structure",
+                            "model": Value::Null,
+                            "reasoningEffort": Value::Null,
+                            "agentsStates": {
+                                receiver_thread_id: { "status": "completed" }
+                            },
+                            "result": "subagent done",
+                            "error": Value::Null,
+                        })],
+                        agent_item_streamed: false,
+                        latest_token_usage_info: None,
+                    },
+                    None,
+                )
+                .expect("finish parent turn")
+        };
+        let completed_read = state
+            .lock()
+            .expect("state lock")
+            .thread_read(&json!({
+                "threadId": receiver_thread_id,
+                "includeTurns": true,
+            }))
+            .expect("completed subagent thread read");
+        assert_eq!(
+            completed_read
+                .pointer("/thread/status/type")
+                .and_then(Value::as_str),
+            Some("idle")
+        );
+        assert_eq!(
+            completed_read
+                .pointer("/thread/turns/0/status")
+                .and_then(Value::as_str),
+            Some("completed")
+        );
+        assert_eq!(
+            completed_read
+                .pointer("/thread/turns/0/items/1/text")
+                .and_then(Value::as_str),
+            Some("subagent live\n\nsubagent done")
+        );
+        assert!(
+            finish_notifications
+                .extra_notifications
+                .iter()
+                .any(|message| {
+                    message.get("method").and_then(Value::as_str)
+                        == Some("thread-stream-state-changed")
+                        && message
+                            .pointer("/params/conversationId")
+                            .and_then(Value::as_str)
+                            == Some(receiver_thread_id)
+                        && message
+                            .pointer("/params/change/conversationState/threadRuntimeStatus/type")
+                            .and_then(Value::as_str)
+                            == Some("idle")
+                        && message
+                            .pointer("/params/change/conversationState/turns/0/status")
+                            .and_then(Value::as_str)
+                            == Some("completed")
+                        && message
+                            .pointer("/params/change/conversationState/turns/0/items/1/text")
+                            .and_then(Value::as_str)
+                            == Some("subagent live\n\nsubagent done")
+                }),
+            "{:#?}",
+            finish_notifications.extra_notifications
+        );
+    }
+
+    #[test]
+    fn unknown_subagent_receiver_thread_id_uses_empty_virtual_thread() {
+        let state = test_state(None);
+        let response = state
+            .thread_read(&json!({
+                "threadId": "claude-subagent-call_missing",
+                "includeTurns": true,
+            }))
+            .expect("unknown subagent thread read");
+        assert_eq!(
+            response.pointer("/thread/id").and_then(Value::as_str),
+            Some("claude-subagent-call_missing")
+        );
+        assert!(response
+            .pointer("/thread/turns")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty));
+        assert!(state
+            .thread_read(&json!({ "threadId": "missing-real-thread" }))
+            .is_err());
+    }
+
+    #[test]
+    fn start_turn_appends_attachments_to_prompt_and_history() {
+        let mut state = test_state(None);
+        let (thread_response, _) = state.start_thread(&json!({ "cwd": "/tmp" }));
+        let thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+
+        let (_, _, work, _) = state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "inspect this" }],
+                "attachments": [
+                    { "name": "report", "path": "/tmp/report.txt", "mimeType": "text/plain" }
+                ],
+                "commentAttachments": [
+                    { "url": "https://example.test/design.png", "type": "image" }
+                ]
+            }))
+            .expect("start turn with attachments");
+
+        assert!(work.prompt.contains("Attached context:"), "{}", work.prompt);
+        assert!(work.prompt.contains("/tmp/report.txt"), "{}", work.prompt);
+        assert!(
+            work.prompt.contains("https://example.test/design.png"),
+            "{}",
+            work.prompt
+        );
+        let thread = state.threads.get(&work.thread_id).expect("thread");
+        let turn_input = thread
+            .turns
+            .first()
+            .expect("turn")
+            .input
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(turn_input.contains("Attached context:"), "{turn_input}");
+    }
+
+    #[test]
+    fn start_turn_injects_thread_instructions_without_polluting_visible_input() {
+        let mut state = test_state(None);
+        let (thread_response, _) = state.start_thread(&json!({
+            "cwd": "/tmp",
+            "baseInstructions": "base policy",
+            "developerInstructions": "developer policy",
+            "additionalDeveloperInstructions": "additional policy",
+            "personality": "pragmatic",
+            "persistExtendedHistory": true,
+        }));
+        assert_eq!(
+            thread_response
+                .pointer("/baseInstructions")
+                .and_then(Value::as_str),
+            Some("base policy")
+        );
+        assert_eq!(
+            thread_response
+                .pointer("/developerInstructions")
+                .and_then(Value::as_str),
+            Some("developer policy\n\nadditional policy")
+        );
+        assert_eq!(
+            thread_response
+                .pointer("/thread/personality")
+                .and_then(Value::as_str),
+            Some("pragmatic")
+        );
+        assert_eq!(
+            thread_response
+                .pointer("/persistExtendedHistory")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+
+        let (_, notifications, work, _) = state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "visible user request" }],
+            }))
+            .expect("start turn");
+
+        let thread = state.threads.get(&work.thread_id).expect("thread");
+        let turn = thread.turns.first().expect("turn");
+        assert_eq!(
+            turn.input
+                .first()
+                .and_then(|item| item.get("text"))
+                .and_then(Value::as_str),
+            Some("visible user request")
+        );
+        assert!(!format!("{:?}", turn.input).contains("base policy"));
+        assert!(!format!("{:?}", turn.input).contains("developer policy"));
+
+        let input = claude_stream_json_input(&work);
+        let lines = input
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("json line"))
+            .collect::<Vec<_>>();
+        let content = lines[1]
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .expect("content");
+        let instruction_text = content[0]
+            .get("text")
+            .and_then(Value::as_str)
+            .expect("instruction text");
+        assert!(instruction_text.contains("Base instructions:\nbase policy"));
+        assert!(instruction_text.contains("Developer instructions:\ndeveloper policy"));
+        assert!(instruction_text.contains("additional policy"));
+        assert_eq!(
+            content[1].get("text").and_then(Value::as_str),
+            Some("visible user request")
+        );
+
+        let snapshot = notifications
+            .iter()
+            .find(|notification| {
+                notification.get("method").and_then(Value::as_str)
+                    == Some("thread-stream-state-changed")
+            })
+            .expect("snapshot");
+        assert_eq!(
+            snapshot
+                .pointer("/params/change/conversationState/baseInstructions")
+                .and_then(Value::as_str),
+            Some("base policy")
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/params/change/conversationState/turns/0/params/developerInstructions")
+                .and_then(Value::as_str),
+            Some("developer policy\n\nadditional policy")
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/params/change/conversationState/personality")
+                .and_then(Value::as_str),
+            Some("pragmatic")
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/params/change/conversationState/persistExtendedHistory")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -12877,14 +18617,16 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
 
         let output_path = root.join("out.jsonl");
         let input = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             json!({"id":"1","method":"initialize","params":{}}),
             json!({"id":"2","method":"thread/list","params":{"limit":10,"sourceKinds":["cli"],"modelProviders":[PROVIDER_NAME]}}),
             json!({"id":"3","method":"thread/read","params":{"threadId":session_id,"includeTurns":true}}),
             json!({"id":"4","method":"thread/turns/list","params":{"threadId":session_id,"limit":1,"sortDirection":"desc"}}),
             json!({"id":"5","method":"thread/resume","params":{"threadId":session_id}}),
             json!({"id":"6","method":"thread/resume","params":{"threadId":session_id,"excludeTurns":true}}),
-            json!({"id":"7","method":"thread/read","params":{"threadId":format!("local:{session_id}"),"includeTurns":true}})
+            json!({"id":"7","method":"thread/read","params":{"threadId":format!("local:{session_id}"),"includeTurns":true}}),
+            json!({"id":"8","method":"thread/search","params":{"query":"transcript","limit":10}}),
+            json!({"id":"9","method":"turn/list","params":{"conversationId":session_id,"limit":1,"sortDirection":"desc"}})
         );
 
         run_stdio_app_server_with_io(
@@ -12952,6 +18694,406 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
         assert_eq!(
             local_read.pointer("/items/1/text").and_then(Value::as_str),
             Some("hello from claude")
+        );
+
+        let searched = response_by_id(&responses, "8")
+            .pointer("/result/data/0")
+            .expect("searched thread");
+        assert_eq!(searched.get("id").and_then(Value::as_str), Some(session_id));
+
+        let turn_alias = response_by_id(&responses, "9")
+            .pointer("/result/data/0")
+            .expect("turn/list alias");
+        assert_eq!(
+            turn_alias.pointer("/items/1/text").and_then(Value::as_str),
+            Some("hello from claude")
+        );
+
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_list_matches_claude_resume_filters_and_uses_prompt_title() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("claude-resume-metadata");
+        let cwd = root.join("workspace");
+        let main_session_id = "11111111-1111-4111-8111-333333333333";
+        let subagent_session_id = "22222222-2222-4222-8222-333333333333";
+        let daemon_session_id = "33333333-3333-4333-8333-333333333333";
+        let entrypoint_session_id = "44444444-4444-4444-8444-333333333333";
+        let loop_session_id = "55555555-5555-4555-8555-333333333333";
+        let projects_dir = root
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_dir_name(&cwd));
+        std::fs::create_dir_all(&projects_dir).expect("create claude projects dir");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::write(
+            projects_dir.join(format!("{main_session_id}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": main_session_id,
+                    "entrypoint": "cli",
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:00.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": "Build the main feature"
+                    }
+                }),
+                json!({
+                    "type": "assistant",
+                    "sessionId": main_session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:01.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "opus",
+                        "content": [{ "type": "text", "text": "done" }]
+                    }
+                })
+            ),
+        )
+        .expect("write main transcript");
+        std::fs::write(
+            projects_dir.join(format!("{subagent_session_id}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": subagent_session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:02.000Z",
+                    "isSidechain": true,
+                    "parentUuid": "parent-assistant",
+                    "message": {
+                        "role": "user",
+                        "content": "Inspect files for the parent agent"
+                    }
+                }),
+                json!({
+                    "type": "assistant",
+                    "sessionId": subagent_session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:03.000Z",
+                    "isSidechain": true,
+                    "parentUuid": "side-user",
+                    "message": {
+                        "role": "assistant",
+                        "model": "opus",
+                        "content": [{ "type": "text", "text": "subagent done" }]
+                    }
+                })
+            ),
+        )
+        .expect("write subagent transcript");
+        std::fs::write(
+            projects_dir.join(format!("{daemon_session_id}.jsonl")),
+            format!(
+                "{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": daemon_session_id,
+                    "sessionKind": "daemon",
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:04.000Z",
+                    "message": { "role": "user", "content": "daemon task" }
+                })
+            ),
+        )
+        .expect("write daemon transcript");
+        std::fs::write(
+            projects_dir.join(format!("{entrypoint_session_id}.jsonl")),
+            format!(
+                "{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": entrypoint_session_id,
+                    "entrypoint": "command-name/loop",
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:05.000Z",
+                    "message": { "role": "user", "content": "entrypoint task" }
+                })
+            ),
+        )
+        .expect("write entrypoint transcript");
+        std::fs::write(
+            projects_dir.join(format!("{loop_session_id}.jsonl")),
+            format!(
+                "{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": loop_session_id,
+                    "isLoopSession": true,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:06.000Z",
+                    "message": { "role": "user", "content": "loop task" }
+                })
+            ),
+        )
+        .expect("write loop transcript");
+        std::env::set_var("HOME", &root);
+        clear_claude_thread_list_cache();
+
+        let state = test_state(None);
+        let listed = state.thread_list(&json!({ "limit": 10 }));
+        let listed_threads = listed
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("listed threads");
+        assert_eq!(listed_threads.len(), 1, "{listed_threads:#?}");
+        assert_eq!(
+            listed_threads[0].get("id").and_then(Value::as_str),
+            Some(main_session_id)
+        );
+        assert_eq!(
+            listed_threads[0].get("name").and_then(Value::as_str),
+            Some("Build the main feature")
+        );
+        assert_eq!(
+            listed_threads[0].get("preview").and_then(Value::as_str),
+            Some("Build the main feature")
+        );
+        for hidden_id in [
+            subagent_session_id,
+            daemon_session_id,
+            entrypoint_session_id,
+            loop_session_id,
+        ] {
+            assert!(
+                load_claude_thread_by_id(hidden_id, None).is_none(),
+                "{hidden_id} should follow Claude /resume hidden-session filters"
+            );
+        }
+
+        restore_env("HOME", old_home);
+        clear_claude_thread_list_cache();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_transcript_restores_tool_items_from_tool_use_results() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("claude-transcript-tool-items");
+        let cwd = root.join("workspace");
+        let session_id = "22222222-2222-4222-8222-333333333333";
+        let projects_dir = root
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_dir_name(&cwd));
+        std::fs::create_dir_all(&projects_dir).expect("create claude projects dir");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        let transcript_path = projects_dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(
+            &transcript_path,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:00.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": "list files"
+                    }
+                }),
+                json!({
+                    "type": "assistant",
+                    "sessionId": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:01.000Z",
+                    "uuid": "assistant-tool-message",
+                    "message": {
+                        "role": "assistant",
+                        "model": "opus",
+                        "content": [
+                            { "type": "thinking", "thinking": "I should inspect the directory." },
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_bash",
+                                "name": "Bash",
+                                "input": { "command": "ls -la" }
+                            }
+                        ]
+                    }
+                }),
+                json!({
+                    "type": "user",
+                    "sessionId": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:02.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_bash",
+                            "content": "total 8\n-rw-r--r-- README.md\n"
+                        }]
+                    }
+                }),
+                json!({
+                    "type": "assistant",
+                    "sessionId": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:03.000Z",
+                    "uuid": "assistant-final-message",
+                    "message": {
+                        "role": "assistant",
+                        "model": "opus",
+                        "content": [{ "type": "text", "text": "done" }]
+                    }
+                })
+            ),
+        )
+        .expect("write transcript");
+        std::env::set_var("HOME", &root);
+
+        let thread =
+            load_claude_thread_from_transcript_path(&transcript_path, None).expect("thread");
+        assert_eq!(thread.turns.len(), 1);
+        let items = thread.turns[0]
+            .items_json()
+            .as_array()
+            .cloned()
+            .expect("turn items");
+        assert_eq!(
+            items
+                .iter()
+                .filter_map(|item| item.get("type").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec![
+                "userMessage",
+                "reasoning",
+                "commandExecution",
+                "agentMessage"
+            ]
+        );
+        assert_eq!(items[1].get("command").and_then(Value::as_str), None);
+        assert_eq!(
+            items[1]
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|content| content.first())
+                .and_then(Value::as_str),
+            Some("I should inspect the directory.")
+        );
+        assert_eq!(
+            items[2].get("command").and_then(Value::as_str),
+            Some("ls -la")
+        );
+        assert_eq!(
+            items[2].get("status").and_then(Value::as_str),
+            Some("completed")
+        );
+        assert_eq!(
+            items[2].get("aggregatedOutput").and_then(Value::as_str),
+            Some("total 8\n-rw-r--r-- README.md\n")
+        );
+        assert_eq!(
+            items[2].get("durationMs").and_then(Value::as_i64),
+            Some(1000)
+        );
+        assert_eq!(items[3].get("text").and_then(Value::as_str), Some("done"));
+
+        let state = test_state(None);
+        let listed_items = state
+            .thread_turns_items_list(&json!({
+                "threadId": session_id,
+                "sortDirection": "asc",
+            }))
+            .expect("items list");
+        assert_eq!(
+            listed_items.pointer("/data/1/type").and_then(Value::as_str),
+            Some("reasoning")
+        );
+        assert_eq!(
+            listed_items.pointer("/data/2/type").and_then(Value::as_str),
+            Some("commandExecution")
+        );
+        assert_eq!(
+            listed_items
+                .pointer("/data/2/aggregatedOutput")
+                .and_then(Value::as_str),
+            Some("total 8\n-rw-r--r-- README.md\n")
+        );
+
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_persists_for_unloaded_claude_transcript_threads() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("claude-archive-persist");
+        let cwd = root.join("workspace");
+        let session_id = "33333333-3333-4333-8333-444444444444";
+        let projects_dir = root
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_dir_name(&cwd));
+        std::fs::create_dir_all(&projects_dir).expect("create claude projects dir");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::write(
+            projects_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:00.000Z",
+                    "message": { "role": "user", "content": "archive me" }
+                }),
+                json!({
+                    "type": "assistant",
+                    "sessionId": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:01.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "opus",
+                        "content": [{ "type": "text", "text": "ok" }]
+                    }
+                })
+            ),
+        )
+        .expect("write transcript");
+        std::env::set_var("HOME", &root);
+
+        let mut state = test_state(None);
+        assert!(state
+            .set_archived(&json!({ "threadId": session_id }), true)
+            .is_none());
+        assert!(root
+            .join(".claude")
+            .join(CLAUDE_THREAD_ARCHIVED_FILE)
+            .is_file());
+
+        let active = state.thread_list(&json!({ "limit": 10, "archived": false }));
+        assert!(active
+            .get("data")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty));
+        let archived = state.thread_list(&json!({ "limit": 10, "archived": true }));
+        assert_eq!(
+            archived.pointer("/data/0/id").and_then(Value::as_str),
+            Some(session_id)
+        );
+
+        assert!(state
+            .set_archived(&json!({ "threadId": format!("local:{session_id}") }), false)
+            .is_none());
+        let active = state.thread_list(&json!({ "limit": 10, "archived": false }));
+        assert_eq!(
+            active.pointer("/data/0/id").and_then(Value::as_str),
+            Some(session_id)
         );
 
         restore_env("HOME", old_home);
@@ -13124,6 +19266,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: Some("workspace".to_string()),
@@ -13186,6 +19329,152 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
     }
 
     #[test]
+    fn thread_list_uses_tail_resume_title_over_live_uuid_name() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("claude-tail-title-live");
+        std::fs::create_dir_all(&root).expect("create temp home");
+        std::env::set_var("HOME", &root);
+        clear_claude_thread_list_cache();
+
+        let cwd = root.join("workspace").to_string_lossy().to_string();
+        let mut state = ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            config_values: Map::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: Some("workspace".to_string()),
+        };
+        let (response, _) = state.start_thread(&json!({ "cwd": cwd }));
+        let thread_id = response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        state.threads.get_mut(&thread_id).expect("live thread").name = Some(thread_id.clone());
+
+        let projects_dir = root
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_dir_name(Path::new(&cwd)));
+        std::fs::create_dir_all(&projects_dir).expect("create claude projects dir");
+        let transcript_path = projects_dir.join(format!("{thread_id}.jsonl"));
+        let mut transcript = format!(
+            "{}\n",
+            json!({
+                "type": "user",
+                "sessionId": thread_id,
+                "cwd": cwd,
+                "timestamp": "2026-05-25T07:00:00.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{ "type": "text", "text": "initial prompt title" }]
+                }
+            })
+        );
+        for index in 0..120 {
+            transcript.push_str(
+                &json!({
+                    "type": "progress",
+                    "sessionId": thread_id,
+                    "timestamp": format!("2026-05-25T07:{:02}:00.000Z", index % 60),
+                    "message": format!("filler {index}")
+                })
+                .to_string(),
+            );
+            transcript.push('\n');
+        }
+        transcript.push_str(
+            &json!({
+                "type": "custom-title",
+                "sessionId": thread_id,
+                "cwd": cwd,
+                "timestamp": "2026-05-25T08:00:00.000Z",
+                "customTitle": "Tail custom title"
+            })
+            .to_string(),
+        );
+        transcript.push('\n');
+        std::fs::write(&transcript_path, transcript).expect("write transcript");
+
+        let listed = state.thread_list(&json!({ "limit": 10 }));
+        let listed_threads = listed
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("listed threads");
+        assert_eq!(listed_threads.len(), 1, "{listed_threads:#?}");
+        assert_eq!(
+            listed_threads[0].get("name").and_then(Value::as_str),
+            Some("Tail custom title")
+        );
+
+        restore_env("HOME", old_home);
+        clear_claude_thread_list_cache();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_json_uses_display_title_when_name_is_uuid() {
+        let root = test_dir("claude-display-title");
+        let cwd = root.join("workspace").to_string_lossy().to_string();
+        let mut state = ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            config_values: Map::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: Some("workspace".to_string()),
+        };
+        let (response, _) = state.start_thread(&json!({ "cwd": cwd }));
+        let thread_id = response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        let (_, _, _, _) = state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "Analyze Claude resume titles" }],
+            }))
+            .expect("start turn");
+
+        let thread = state.threads.get_mut(&thread_id).expect("live thread");
+        thread.name = Some(thread_id.clone());
+        let thread_json = thread.to_json(false);
+        assert_eq!(
+            thread_json.get("name").and_then(Value::as_str),
+            Some("Analyze Claude resume titles")
+        );
+        assert_eq!(
+            thread_json.get("title").and_then(Value::as_str),
+            Some("Analyze Claude resume titles")
+        );
+        assert_eq!(
+            claude_conversation_state(thread)
+                .get("title")
+                .and_then(Value::as_str),
+            Some("Analyze Claude resume titles")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_project_dir_name_matches_resume_truncation_rule() {
+        assert_eq!(claude_project_dir_name(Path::new("/tmp/项目")), "-tmp---");
+        let long_path = format!("/Users/jinhuilee/{}", "a".repeat(260));
+        let expected_prefix = format!(
+            "-Users-jinhuilee-{}",
+            "a".repeat(CLAUDE_PROJECT_DIR_MAX_LEN - "-Users-jinhuilee-".len())
+        );
+        assert_eq!(
+            claude_project_dir_name(Path::new(&long_path)),
+            format!("{expected_prefix}-1gt486")
+        );
+    }
+
+    #[test]
     fn recognizes_current_claude_title_generation_prompt_template() {
         let prompt = "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\nThe tasks typically have to do with coding-related tasks.\nFill the structured title field with plain text.\nGenerate a clear, informative task title.\n\nHow to write a good title:\n- Prefer concrete nouns and verbs.\n- Do not wrap the title in quotes.\n\nUser prompt:\n分析代码说明该项目适配windows还有哪些问题";
 
@@ -13207,6 +19496,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: Some("workspace".to_string()),
@@ -13370,6 +19660,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: Some("workspace".to_string()),
@@ -13408,6 +19699,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: Some("workspace".to_string()),
@@ -13622,6 +19914,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -13678,6 +19971,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -13701,6 +19995,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -13736,6 +20031,8 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -13756,6 +20053,8 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -13775,6 +20074,8 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -13796,6 +20097,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -13857,6 +20159,8 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: Some("auto".to_string()),
         };
@@ -13881,6 +20185,8 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -13897,6 +20203,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
         let state = Arc::new(Mutex::new(ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -13925,6 +20232,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
         let state = Arc::new(Mutex::new(ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -13938,6 +20246,8 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp/workspace".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -14030,6 +20340,8 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp/workspace".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -14068,6 +20380,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
         let state = Arc::new(Mutex::new(ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -14081,6 +20394,8 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp/workspace".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -14174,6 +20489,8 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -14216,6 +20533,103 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
         );
     }
 
+    #[test]
+    fn claude_stream_json_input_preserves_image_blocks() {
+        let root = test_dir("stream-json-image-input");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let image_path = root.join("sample.png");
+        std::fs::write(&image_path, [1_u8, 2, 3]).expect("write image");
+        let work = TurnWork {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            agent_item_id: "agent".to_string(),
+            cli_item_id: "cli".to_string(),
+            claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            cwd: "/tmp".to_string(),
+            prompt: "inspect images".to_string(),
+            input: vec![
+                json!({ "type": "text", "text": "inspect images" }),
+                json!({ "type": "localImage", "path": image_path.to_string_lossy() }),
+                json!({ "type": "image", "url": "https://example.test/image.png" }),
+            ],
+            instruction_context: None,
+            resume_existing: false,
+            permission_mode: None,
+        };
+
+        let input = claude_stream_json_input(&work);
+        let lines = input
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("json line"))
+            .collect::<Vec<_>>();
+        let content = lines[1]
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .expect("content");
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0].get("type").and_then(Value::as_str), Some("text"));
+        assert_eq!(
+            content[1].pointer("/source/type").and_then(Value::as_str),
+            Some("base64")
+        );
+        assert_eq!(
+            content[1]
+                .pointer("/source/media_type")
+                .and_then(Value::as_str),
+            Some("image/png")
+        );
+        assert_eq!(
+            content[1].pointer("/source/data").and_then(Value::as_str),
+            Some("AQID")
+        );
+        assert_eq!(
+            content[2].pointer("/source/type").and_then(Value::as_str),
+            Some("url")
+        );
+        assert_eq!(
+            content[2].pointer("/source/url").and_then(Value::as_str),
+            Some("https://example.test/image.png")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_stream_json_input_keeps_prompt_fallback_with_instruction_context() {
+        let work = TurnWork {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            agent_item_id: "agent".to_string(),
+            cli_item_id: "cli".to_string(),
+            claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            cwd: "/tmp".to_string(),
+            prompt: "visible prompt".to_string(),
+            input: vec![json!({ "type": "unsupported" })],
+            instruction_context: Some("hidden instructions".to_string()),
+            resume_existing: false,
+            permission_mode: None,
+        };
+
+        let input = claude_stream_json_input(&work);
+        let lines = input
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("json line"))
+            .collect::<Vec<_>>();
+        let content = lines[1]
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .expect("content");
+
+        assert_eq!(
+            content[0].get("text").and_then(Value::as_str),
+            Some("hidden instructions")
+        );
+        assert_eq!(
+            content[1].get("text").and_then(Value::as_str),
+            Some("visible prompt")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn stream_json_reemits_active_thread_state_after_claude_starts() {
@@ -14231,6 +20645,7 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"done","duration_ms":1
         let mut initial_state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -14311,6 +20726,7 @@ sleep 60
         let state = Arc::new(Mutex::new(ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -14324,6 +20740,8 @@ sleep 60
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: root.to_string_lossy().to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -14385,6 +20803,8 @@ sleep 60
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -14472,7 +20892,7 @@ sleep 60
                 &mut command_output,
             );
         }
-        emit_reasoning_completed_if_started(&output, &work, &stream);
+        emit_reasoning_completed_if_started(&output, &work, &mut stream);
 
         let output =
             String::from_utf8(output.lock().expect("output lock").clone()).expect("utf8 output");
@@ -14505,7 +20925,140 @@ sleep 60
         assert!(agent_delta_index > tool_completed_index);
         assert_eq!(stream.emitted_text, "Done");
         assert_eq!(stream.result_text, Some("Done".to_string()));
-        assert_eq!(stream.completed_tool_items.len(), 1);
+        assert_eq!(stream.completed_tool_items.len(), 2);
+        assert_eq!(
+            stream.completed_tool_items[1]
+                .get("type")
+                .and_then(Value::as_str),
+            Some("reasoning")
+        );
+    }
+
+    #[test]
+    fn stdout_stream_updates_loaded_thread_snapshots_realtime() {
+        let mut initial_state = test_state(None);
+        let (thread_response, _) = initial_state.start_thread(&json!({ "cwd": "/tmp" }));
+        let thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        let (_, _, work, _) = initial_state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "inspect" }],
+            }))
+            .expect("start turn");
+        let state = Arc::new(Mutex::new(initial_state));
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut child_stdin = Vec::<u8>::new();
+        let mut stream = ClaudeStreamState::default();
+        let mut command_output = String::new();
+
+        handle_claude_stdout_line(
+            &json!({
+                "type": "stream_event",
+                "parent_tool_use_id": Value::Null,
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "text_delta", "text": "Thinking live" }
+                }
+            })
+            .to_string(),
+            &work,
+            &state,
+            &output,
+            &mut child_stdin,
+            &mut stream,
+            &mut command_output,
+        )
+        .expect("handle text delta");
+        {
+            let state = state.lock().expect("state lock");
+            let turn = &state.threads.get(&work.thread_id).expect("thread").turns[0];
+            assert_eq!(turn.agent_text, "Thinking live");
+        }
+
+        handle_claude_stdout_line(
+            &json!({
+                "type": "stream_event",
+                "parent_tool_use_id": Value::Null,
+                "event": {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_read",
+                        "name": "Read",
+                        "input": { "file_path": "/tmp/README.md" }
+                    }
+                }
+            })
+            .to_string(),
+            &work,
+            &state,
+            &output,
+            &mut child_stdin,
+            &mut stream,
+            &mut command_output,
+        )
+        .expect("handle tool use");
+        {
+            let state = state.lock().expect("state lock");
+            let turn = &state.threads.get(&work.thread_id).expect("thread").turns[0];
+            assert_eq!(turn.agent_text, "");
+            let item_types = turn
+                .tool_items
+                .iter()
+                .filter_map(|item| item.get("type").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(item_types, vec!["reasoning", "mcpToolCall"]);
+            assert_eq!(
+                turn.tool_items[0]
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .and_then(|content| content.first())
+                    .and_then(Value::as_str),
+                Some("Thinking live")
+            );
+            assert_eq!(
+                turn.tool_items[1].get("status").and_then(Value::as_str),
+                Some("inProgress")
+            );
+        }
+
+        let output =
+            String::from_utf8(output.lock().expect("output lock").clone()).expect("utf8 output");
+        let snapshots = json_lines(&output)
+            .into_iter()
+            .filter(|message| {
+                message.get("method").and_then(Value::as_str) == Some("thread-stream-state-changed")
+            })
+            .collect::<Vec<_>>();
+        assert!(snapshots.len() >= 2, "{output}");
+        assert!(snapshots.iter().any(|snapshot| {
+            snapshot
+                .pointer("/params/change/conversationState/turns/0/items")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                            && item.get("text").and_then(Value::as_str) == Some("Thinking live")
+                    })
+                })
+        }));
+        assert!(snapshots.iter().any(|snapshot| {
+            snapshot
+                .pointer("/params/change/conversationState/turns/0/items")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("mcpToolCall")
+                            && item.get("status").and_then(Value::as_str) == Some("inProgress")
+                    })
+                })
+        }));
     }
 
     #[test]
@@ -14519,6 +21072,8 @@ sleep 60
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -14616,6 +21171,8 @@ sleep 60
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -14693,6 +21250,8 @@ sleep 60
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -14756,6 +21315,8 @@ sleep 60
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -14888,6 +21449,8 @@ sleep 60
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -14944,6 +21507,107 @@ sleep 60
     }
 
     #[test]
+    fn maps_edit_tool_to_file_change_item() {
+        let root = test_dir("edit-tool-file-change");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let file_path = root.join("notes.txt");
+        std::fs::write(&file_path, "alpha\nold line\nomega\n").expect("write file");
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let work = TurnWork {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            agent_item_id: "agent".to_string(),
+            cli_item_id: "cli".to_string(),
+            claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            cwd: root.to_string_lossy().to_string(),
+            prompt: "edit a file".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
+            resume_existing: false,
+            permission_mode: None,
+        };
+        let mut stream = ClaudeStreamState::default();
+        let mut command_output = String::new();
+        let messages = [
+            json!({
+                "type": "stream_event",
+                "parent_tool_use_id": Value::Null,
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_edit",
+                        "name": "Edit",
+                        "input": {
+                            "file_path": "notes.txt",
+                            "old_string": "old line",
+                            "new_string": "new line"
+                        }
+                    }
+                }
+            }),
+            json!({
+                "type": "stream_event",
+                "parent_tool_use_id": Value::Null,
+                "event": {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_edit",
+                        "content": "Updated notes.txt"
+                    }
+                }
+            }),
+        ];
+
+        for message in messages {
+            handle_claude_stream_message(
+                &message,
+                &work,
+                &output,
+                &mut stream,
+                &mut command_output,
+            );
+        }
+
+        let output =
+            String::from_utf8(output.lock().expect("output lock").clone()).expect("utf8 output");
+        assert!(output.contains(r#""type":"fileChange""#));
+        assert!(!output.contains(r#""type":"mcpToolCall""#));
+        let completed = json_lines(&output)
+            .into_iter()
+            .find(|value| {
+                value.get("method").and_then(Value::as_str) == Some("item/completed")
+                    && value.pointer("/params/item/type").and_then(Value::as_str)
+                        == Some("fileChange")
+            })
+            .expect("file change completed notification");
+        assert_eq!(
+            completed
+                .pointer("/params/item/changes/0/path")
+                .and_then(Value::as_str),
+            Some("notes.txt")
+        );
+        assert_eq!(
+            completed
+                .pointer("/params/item/changes/0/kind/type")
+                .and_then(Value::as_str),
+            Some("update")
+        );
+        let diff = completed
+            .pointer("/params/item/changes/0/diff")
+            .and_then(Value::as_str)
+            .expect("diff");
+        assert!(diff.contains("@@ -2,1 +2,1 @@"), "{diff}");
+        assert!(diff.contains("-old line"), "{diff}");
+        assert!(diff.contains("+new line"), "{diff}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn ignores_matching_final_assistant_snapshot_after_text_stream() {
         let output = Arc::new(Mutex::new(Vec::<u8>::new()));
         let work = TurnWork {
@@ -14954,6 +21618,8 @@ sleep 60
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
+            input: Vec::new(),
+            instruction_context: None,
             resume_existing: false,
             permission_mode: None,
         };
@@ -15000,6 +21666,7 @@ sleep 60
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
             app_responses: BTreeMap::new(),
+            config_values: Map::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
