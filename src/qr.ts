@@ -1,6 +1,7 @@
 type QrSvgOptions = {
   moduleSize?: number;
   quietZone?: number;
+  maxPixelSize?: number;
 };
 
 type DataCoord = {
@@ -560,7 +561,12 @@ function matrixToSvg(matrix: boolean[][], options: QrSvgOptions): string {
   const moduleSize = options.moduleSize ?? 6;
   const size = matrix.length;
   const unitSize = size + quietZone * 2;
-  const pixelSize = unitSize * moduleSize;
+  const requestedPixelSize = unitSize * moduleSize;
+  const maxPixelSize = options.maxPixelSize;
+  const pixelSize =
+    typeof maxPixelSize === "number" && Number.isFinite(maxPixelSize) && maxPixelSize > 0
+      ? Math.min(requestedPixelSize, maxPixelSize)
+      : requestedPixelSize;
   const path: string[] = [];
 
   for (let y = 0; y < size; y += 1) {

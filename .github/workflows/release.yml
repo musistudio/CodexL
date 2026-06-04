@@ -116,4 +116,4 @@ jobs:
           prerelease: ${{ contains(steps.release_tag.outputs.tag, '-') }}
           args: ${{ matrix.args }}
           updaterJsonPreferNsis: true
-          releaseAssetNamePattern: "[name]-[version]-[platform]-[arch][setup][ext]"
+          assetNamePattern: "[name]-[version]-[platform]-[arch][setup][ext]"
