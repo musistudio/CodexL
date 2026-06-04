@@ -1,5 +1,5 @@
-import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260603-readable-device-workspace-name-v2";
-import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260603-readable-device-workspace-name-v2";
+import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260604-pwa-preserve-lang-v13";
+import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260604-pwa-preserve-lang-v13";
 
 const MAX_SCREEN_ZOOM = 4;
 const MIN_SCREEN_ZOOM = 1;
@@ -40,7 +40,7 @@ const SIDEBAR_SWIPE_RIGHT_OPEN_REGION_RATIO = 0.22;
 const SIDEBAR_SWIPE_MIN_DISTANCE_PX = 72;
 const SIDEBAR_SWIPE_MAX_VERTICAL_PX = 52;
 const SIDEBAR_SWIPE_DIRECTION_RATIO = 1.35;
-const PWA_BUILD = "20260603-readable-device-workspace-name-v2";
+const PWA_BUILD = "20260604-pwa-preserve-lang-v13";
 const WEB_BRIDGE_URL_PARAM = "codexBridgeUrl";
 const PARENT_BRIDGE_OPEN_MESSAGE = "codex-web-parent-bridge-open";
 const PARENT_BRIDGE_OPENED_MESSAGE = "codex-web-parent-bridge-opened";
@@ -57,6 +57,132 @@ const E2EE_AAD = new TextEncoder().encode("codexl-remote-e2ee-v1");
 const E2EE_BINARY_MAGIC = new Uint8Array([0x43, 0x58, 0x45, 0x31]);
 const E2EE_PBKDF2_ITERATIONS = 150000;
 const urlParams = new URLSearchParams(location.search);
+const CONTROL_LANGUAGE = detectControlLanguage();
+const CONTROL_STRINGS = {
+  en: {
+    appName: "CodexL",
+    backToInstances: "Back to instances",
+    connect: "Connect",
+    connectionIssueBody: "Check that the desktop workspace is still running remote control, then try again.",
+    connectionIssueTitle: "Connection issue",
+    keyboardProxy: "Keyboard input proxy",
+    latest: "Latest",
+    loadingTitle: "Connecting",
+    locale: "en",
+    pageZoom: "Page zoom",
+    passwordDescription: "This workspace requires the password set on the desktop client.",
+    passwordPlaceholder: "Password",
+    passwordTitle: "Remote password",
+    quality: "Quality",
+    qualityAuto: "Auto",
+    qualityBad: "Saver",
+    qualityGood: "Quality",
+    qualityMedium: "Smooth",
+    remoteMode: "Remote mode",
+    retry: "Retry",
+    screenLabel: "Codex app screen",
+    secureWeb: "Use HTTPS",
+    webAssetVersion: "Codex app web bundle version",
+    webFrameTitle: "Codex web bridge",
+    webMode: "Web",
+    status: {
+      cdpConnected: "CDP connected",
+      connected: "Connected",
+      connecting: "Connecting",
+      connectingWebBridge: "Connecting web bridge",
+      controlDisconnectedRetrying: "Control disconnected, retrying",
+      enterPassword: "Enter the remote password.",
+      frameDecodeFailed: "Frame decode failed",
+      httpsBundleUnavailable: "HTTPS app bundle unavailable",
+      invalidUrl: "Invalid URL",
+      loadingRemoteScreen: "Loading remote screen",
+      loadingWebBridge: "Loading web bridge",
+      missingToken: "Missing token",
+      notConnected: "Not connected",
+      offlineWaiting: "Offline, waiting to reconnect",
+      openingLanRemote: "Opening LAN remote",
+      preparingWebCache: "Preparing web cache",
+      remoteConnectionUnavailable: "Remote connection unavailable.",
+      remoteMetadataTimedOut: "Remote metadata timed out.",
+      remotePasswordRequired: "Remote password required",
+      remoteServiceUnavailable: "Remote service is unavailable.",
+      remoteTokenExpired: "Connection token expired. Scan the latest remote QR code.",
+      restoringConnection: "Restoring connection",
+      unableUnlock: "Unable to unlock remote control.",
+      unlocking: "Unlocking",
+      waitingForCdp: "Waiting for CDP",
+      webBridgeDisconnectedRetrying: "Web bridge disconnected, retrying",
+      webBridgeUnavailable: "Web bridge unavailable",
+      webCacheFailed: "Web cache failed",
+      webConnected: "Web connected",
+    },
+    loadingAppBundle: (version) => `Loading app bundle (${version})`,
+    openingHttpsAppBundle: (version) => `Opening HTTPS app bundle (${version})`,
+    webCacheUpdated: (count) => `Web cache updated (${count})`,
+  },
+  zh: {
+    appName: "CodexL",
+    backToInstances: "返回实例列表",
+    connect: "连接",
+    connectionIssueBody: "请确认桌面端工作区仍在运行远程控制，然后重试。",
+    connectionIssueTitle: "连接遇到问题",
+    keyboardProxy: "键盘输入代理",
+    latest: "最新",
+    loadingTitle: "正在连接",
+    locale: "zh-CN",
+    pageZoom: "页面缩放",
+    passwordDescription: "该工作区需要输入桌面端设置的远程密码。",
+    passwordPlaceholder: "密码",
+    passwordTitle: "远程密码",
+    quality: "画质",
+    qualityAuto: "自动",
+    qualityBad: "省流",
+    qualityGood: "高画质",
+    qualityMedium: "流畅",
+    remoteMode: "远程模式",
+    retry: "重试",
+    screenLabel: "Codex 应用画面",
+    secureWeb: "使用 HTTPS",
+    webAssetVersion: "Codex App Web 包版本",
+    webFrameTitle: "Codex Web 桥接页",
+    webMode: "Web",
+    status: {
+      cdpConnected: "CDP 已连接",
+      connected: "已连接",
+      connecting: "连接中",
+      connectingWebBridge: "正在连接 Web 桥接",
+      controlDisconnectedRetrying: "控制连接已断开，正在重试",
+      enterPassword: "请输入远程密码。",
+      frameDecodeFailed: "画面解码失败",
+      httpsBundleUnavailable: "HTTPS App 包不可用",
+      invalidUrl: "URL 无效",
+      loadingRemoteScreen: "正在加载远程画面",
+      loadingWebBridge: "正在加载 Web 桥接",
+      missingToken: "连接 token 缺失",
+      notConnected: "未连接",
+      offlineWaiting: "网络离线，等待重连",
+      openingLanRemote: "正在打开局域网远程页面",
+      preparingWebCache: "正在准备 Web 缓存",
+      remoteConnectionUnavailable: "远程连接暂不可用。",
+      remoteMetadataTimedOut: "远程信息请求超时。",
+      remotePasswordRequired: "需要远程密码",
+      remoteServiceUnavailable: "远程服务不可用。",
+      remoteTokenExpired: "连接 token 已过期。请扫描最新的远程二维码。",
+      restoringConnection: "正在恢复连接",
+      unableUnlock: "无法解锁远程控制。",
+      unlocking: "正在解锁",
+      waitingForCdp: "等待 CDP",
+      webBridgeDisconnectedRetrying: "Web 桥接已断开，正在重试",
+      webBridgeUnavailable: "Web 桥接不可用",
+      webCacheFailed: "Web 缓存失败",
+      webConnected: "Web 已连接",
+    },
+    loadingAppBundle: (version) => `正在加载 App 包（${version}）`,
+    openingHttpsAppBundle: (version) => `正在打开 HTTPS App 包（${version}）`,
+    webCacheUpdated: (count) => `Web 缓存已更新（${count}）`,
+  },
+};
+const controlStrings = CONTROL_STRINGS[CONTROL_LANGUAGE];
 const initialConnection = connectionFromUrlParams(urlParams);
 
 let token = "";
@@ -80,6 +206,7 @@ let renderLoopStarted = false;
 let scanStream = null;
 let scanTimer = null;
 let activeInstanceId = "";
+let activeControlConnection = null;
 let addDialogLocked = false;
 let editingInstanceId = "";
 let pendingDeleteInstanceId = "";
@@ -159,6 +286,11 @@ const editDialogBackdrop = document.querySelector("#editDialogBackdrop");
 const editNameInput = document.querySelector("#editNameInput");
 const editStatus = document.querySelector("#editStatus");
 const emptyState = document.querySelector("#emptyState");
+const emptyStateActions = document.querySelector("#emptyStateActions");
+const emptyStateBackButton = document.querySelector("#emptyBackButton");
+const emptyStateMessage = document.querySelector("#emptyStateMessage");
+const emptyStateRetryButton = document.querySelector("#emptyRetryButton");
+const emptyStateTitle = document.querySelector("#emptyStateTitle");
 const instanceHeader = document.querySelector(".instance-header");
 const instanceList = document.querySelector("#instanceList");
 const instanceNameInput = document.querySelector("#instanceNameInput");
@@ -205,7 +337,7 @@ function initListPage() {
   resetTransientInstanceStatuses();
   renderInstances();
   if (initialConnection) {
-    const savedInitialInstance = upsertInstanceFromConnection(initialConnection, { status: "Not connected" });
+    const savedInitialInstance = upsertInstanceFromConnection(initialConnection, { status: controlStrings.status.notConnected });
     if (savedInitialInstance) {
       navigateToControl(savedInitialInstance);
       return;
@@ -215,6 +347,7 @@ function initListPage() {
 }
 
 function initControlPage() {
+  applyControlTranslations();
   setupControlEventHandlers();
   initializePageZoomControl();
   const connection = connectionForControlPage();
@@ -228,10 +361,8 @@ function initControlPage() {
 
 async function restoreControlConnectionFromCookie() {
   const instanceId = urlParams.get("id") || "";
-  setStatus("Restoring connection");
-  if (emptyState) {
-    emptyState.textContent = "Restoring connection";
-  }
+  setStatus(controlStrings.status.restoringConnection);
+  setEmptyStateText(controlStrings.status.restoringConnection);
   const connection = await connectionFromRemoteInfoCookie();
   if (connection) {
     void startConnection(connection, { instanceId });
@@ -239,6 +370,149 @@ async function restoreControlConnectionFromCookie() {
   }
 
   navigateToList();
+}
+
+function applyControlTranslations() {
+  document.documentElement.lang = controlStrings.locale;
+  document.title = controlStrings.appName;
+
+  setEmptyStateLoading(controlStrings.status.loadingWebBridge);
+  setControlLabel(backButton, controlStrings.backToInstances);
+  setControlLabel(remoteModeSelect, controlStrings.remoteMode);
+  setControlLabel(secureWebButton, controlStrings.secureWeb);
+  setControlLabel(webAssetVersionSelect, controlStrings.webAssetVersion);
+  setControlLabel(pageZoomButton, controlStrings.pageZoom);
+  setControlLabel(pageZoomSlider, controlStrings.pageZoom);
+  setControlLabel(qualitySelect, controlStrings.quality);
+  setControlLabel(screen, controlStrings.screenLabel);
+  setControlLabel(keyboardProxy, controlStrings.keyboardProxy);
+
+  if (secureWebButton) {
+    secureWebButton.textContent = controlStrings.secureWeb;
+  }
+  if (webFrame) {
+    webFrame.title = controlStrings.webFrameTitle;
+  }
+  if (remoteModeSelect?.options?.length) {
+    for (const option of remoteModeSelect.options) {
+      if (option.value === REMOTE_MODE_WEB) {
+        option.textContent = controlStrings.webMode;
+      }
+    }
+  }
+  if (qualitySelect?.options?.length) {
+    const labels = {
+      auto: controlStrings.qualityAuto,
+      good: controlStrings.qualityGood,
+      medium: controlStrings.qualityMedium,
+      bad: controlStrings.qualityBad,
+    };
+    for (const option of qualitySelect.options) {
+      option.textContent = labels[option.value] || option.textContent;
+    }
+  }
+  if (webAssetVersionSelect?.options?.length) {
+    for (const option of webAssetVersionSelect.options) {
+      if (option.value === "latest") {
+        option.textContent = controlStrings.latest;
+      }
+    }
+  }
+  if (passwordForm) {
+    setElementText(passwordForm.querySelector("h1"), controlStrings.passwordTitle);
+    setElementText(passwordForm.querySelector("p"), controlStrings.passwordDescription);
+    setElementText(passwordForm.querySelector("button[type='submit']"), controlStrings.connect);
+  }
+  if (passwordInput) {
+    passwordInput.placeholder = controlStrings.passwordPlaceholder;
+  }
+  if (emptyStateRetryButton) {
+    emptyStateRetryButton.textContent = controlStrings.retry;
+  }
+  if (emptyStateBackButton) {
+    emptyStateBackButton.textContent = controlStrings.backToInstances;
+  }
+}
+
+function setControlLabel(element, label) {
+  if (!element || !label) {
+    return;
+  }
+  element.setAttribute("aria-label", label);
+  if ("title" in element) {
+    element.title = label;
+  }
+}
+
+function setElementText(element, text) {
+  if (element) {
+    element.textContent = text;
+  }
+}
+
+function setEmptyStateText(text) {
+  setEmptyStateLoading(text);
+}
+
+function setEmptyStateLoading(message) {
+  setEmptyStateContent({
+    actions: false,
+    message,
+    title: controlStrings.loadingTitle,
+  });
+}
+
+function setEmptyStateIssue(message) {
+  setEmptyStateContent({
+    actions: true,
+    message: message || controlStrings.connectionIssueBody,
+    title: controlStrings.connectionIssueTitle,
+  });
+}
+
+function setEmptyStateContent({ actions = false, message = "", title = "" } = {}) {
+  if (!emptyState) {
+    return;
+  }
+
+  emptyState.classList.toggle("has-actions", actions);
+  if (emptyStateTitle || emptyStateMessage) {
+    setElementText(emptyStateTitle, title || message);
+    setElementText(emptyStateMessage, message && title !== message ? message : "");
+  } else {
+    emptyState.textContent = [title, message].filter(Boolean).join(" ");
+  }
+  if (emptyStateActions) {
+    emptyStateActions.hidden = !actions;
+  }
+}
+
+function detectControlLanguage() {
+  const requestedLanguage = new URLSearchParams(location.search).get("lang") ||
+    new URLSearchParams(location.search).get("language");
+  const normalized = normalizeControlLanguage(requestedLanguage);
+  if (normalized) {
+    return normalized;
+  }
+
+  const candidates = [navigator.language, ...(navigator.languages || [])]
+    .filter(Boolean)
+    .map((language) => language.toLowerCase());
+  return candidates.some((language) => language.startsWith("zh")) ? "zh" : "en";
+}
+
+function normalizeControlLanguage(value) {
+  const language = String(value || "").trim().toLowerCase();
+  if (!language) {
+    return null;
+  }
+  if (language.startsWith("zh")) {
+    return "zh";
+  }
+  if (language.startsWith("en")) {
+    return "en";
+  }
+  return null;
 }
 
 async function connectionFromRemoteInfoCookie() {
@@ -271,8 +545,8 @@ async function connectionFromRemoteInfoCookie() {
       workspaceName: remoteInfoField(info, "workspaceName", "workspace_name") || "",
     };
     return buildInstanceFromConnection(recovered, {
-      existing: { id: urlParams.get("id") || createInstanceId(), status: "Connecting" },
-      status: "Connecting",
+      existing: { id: urlParams.get("id") || createInstanceId(), status: controlStrings.status.connecting },
+      status: controlStrings.status.connecting,
     });
   } catch {
     return null;
@@ -473,6 +747,12 @@ function setupControlEventHandlers() {
   backButton?.addEventListener("click", () => {
     navigateToList();
   });
+  emptyStateBackButton?.addEventListener("click", () => {
+    navigateToList();
+  });
+  emptyStateRetryButton?.addEventListener("click", () => {
+    retryActiveControlConnection();
+  });
 
   passwordForm?.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -513,23 +793,23 @@ function setupControlEventHandlers() {
     }
     state.webFrameLoaded = true;
     applyRemoteModeLayout();
-    const nextStatus = state.connected ? "Web connected" : "Connecting web bridge";
+    const nextStatus = state.connected ? controlStrings.status.webConnected : controlStrings.status.connectingWebBridge;
     setStatus(nextStatus);
     if (activeInstanceId) {
       updateInstanceStatus(activeInstanceId, nextStatus, state.connected ? { lastConnectedAt: Date.now() } : {});
     }
     if (!state.connected) {
-      scheduleWebBridgeStaleReload("Web bridge disconnected, retrying");
+      scheduleWebBridgeStaleReload(controlStrings.status.webBridgeDisconnectedRetrying);
     }
   });
   webFrame?.addEventListener("error", () => {
-    handleWebBridgeDisconnect("Web bridge disconnected, retrying");
+    handleWebBridgeDisconnect(controlStrings.status.webBridgeDisconnectedRetrying);
   });
 
   window.addEventListener("message", handleWebBridgeStatusMessage);
   window.addEventListener("online", () => {
     if (state.remoteMode === REMOTE_MODE_WEB && !state.webFrameLoaded) {
-      scheduleWebReconnect("Web bridge disconnected, retrying", { immediate: true });
+      scheduleWebReconnect(controlStrings.status.webBridgeDisconnectedRetrying, { immediate: true });
     } else if (state.remoteMode === REMOTE_MODE_SCREENCAST && !state.connected) {
       scheduleRealtimeReconnect({ immediate: true });
     }
@@ -538,9 +818,13 @@ function setupControlEventHandlers() {
     if (state.remoteMode !== REMOTE_MODE_WEB && state.remoteMode !== REMOTE_MODE_SCREENCAST) {
       return;
     }
-    setStatus("Offline, waiting to reconnect");
+    setStatus(controlStrings.status.offlineWaiting);
+    if (emptyState && (state.remoteMode === REMOTE_MODE_WEB ? !state.webFrameLoaded : !state.frameConnected)) {
+      emptyState.hidden = false;
+      setEmptyStateIssue(controlStrings.status.offlineWaiting);
+    }
     if (activeInstanceId) {
-      updateInstanceStatus(activeInstanceId, "Offline, waiting to reconnect");
+      updateInstanceStatus(activeInstanceId, controlStrings.status.offlineWaiting);
     }
   });
 
@@ -824,7 +1108,7 @@ function connectionForControlPage() {
   }
 
   if (initialConnection) {
-    return upsertInstanceFromConnection(initialConnection, { status: "Connecting" }) || initialConnection;
+    return upsertInstanceFromConnection(initialConnection, { status: controlStrings.status.connecting }) || initialConnection;
   }
 
   return null;
@@ -919,6 +1203,37 @@ function navigateToList() {
   location.href = url.toString();
 }
 
+function retryActiveControlConnection() {
+  const remembered = pendingPasswordConnection || activeControlConnection;
+  const connection = remembered?.connection || connectionForControlPage();
+  const instanceId = remembered?.instanceId || activeInstanceId || urlParams.get("id") || connection?.id || "";
+  if (!connection) {
+    navigateToList();
+    return;
+  }
+
+  hidePasswordGate();
+  setStatus(controlStrings.status.connecting);
+  setEmptyStateLoading(controlStrings.status.connecting);
+  if (emptyState) {
+    emptyState.hidden = false;
+  }
+  void startConnection(connection, { instanceId });
+}
+
+function showControlConnectionIssue(message, { instanceId = activeInstanceId } = {}) {
+  const nextMessage = message || controlStrings.connectionIssueBody;
+  setScanStatus(nextMessage);
+  setStatus(nextMessage);
+  if (emptyState) {
+    emptyState.hidden = false;
+    setEmptyStateIssue(nextMessage);
+  }
+  if (instanceId) {
+    updateInstanceStatus(instanceId, nextMessage);
+  }
+}
+
 function showConnectView() {
   if (controlView) {
     controlView.hidden = true;
@@ -940,22 +1255,17 @@ async function startConnection(connection, { instanceId = connection.id || "" } 
   try {
     connectionUrl = normalizeConnectionUrl(connection.url);
   } catch {
-    setScanStatus("Connection URL is invalid.");
-    if (instanceId) {
-      updateInstanceStatus(instanceId, "Invalid URL");
-    }
+    showControlConnectionIssue(controlStrings.status.invalidUrl, { instanceId });
     return;
   }
 
   const nextToken = connection.token || connectionUrl.searchParams.get("token") || "";
   if (!nextToken) {
-    setScanStatus("Connection token is missing.");
-    if (instanceId) {
-      updateInstanceStatus(instanceId, "Missing token");
-    }
+    showControlConnectionIssue(controlStrings.status.missingToken, { instanceId });
     return;
   }
 
+  activeControlConnection = { connection, instanceId };
   token = nextToken;
   remoteAuthMode = connectionUrl.searchParams.get("auth") || "";
   remoteCloudUser = connection.cloudUser || connectionUrl.searchParams.get("cloudUser") || "";
@@ -967,15 +1277,8 @@ async function startConnection(connection, { instanceId = connection.id || "" } 
   try {
     remoteInfo = await fetchRemoteInfo();
   } catch (error) {
-    const message = error?.message || "Remote connection unavailable.";
-    setScanStatus(message);
-    setStatus(message);
-    if (emptyState) {
-      emptyState.textContent = message;
-    }
-    if (instanceId) {
-      updateInstanceStatus(instanceId, message);
-    }
+    const message = error?.message || controlStrings.status.remoteConnectionUnavailable;
+    showControlConnectionIssue(message, { instanceId });
     return;
   }
   const requiresPassword = connectionRequiresPassword(connection, connectionUrl, remoteInfo);
@@ -994,7 +1297,7 @@ async function startConnection(connection, { instanceId = connection.id || "" } 
   }
   activeInstanceId = instanceId;
   if (activeInstanceId) {
-    updateInstanceStatus(activeInstanceId, "Connecting");
+    updateInstanceStatus(activeInstanceId, controlStrings.status.connecting);
   }
   remoteRequiresPassword = requiresPassword;
   webAssetBaseUrl = connectionWebAssetBaseUrl(connection, connectionUrl, remoteInfo);
@@ -1022,7 +1325,7 @@ async function startConnection(connection, { instanceId = connection.id || "" } 
     remoteModeSelect.value = state.remoteMode;
   }
   if (activeInstanceId) {
-    updateInstanceStatus(activeInstanceId, "Connecting", {
+    updateInstanceStatus(activeInstanceId, controlStrings.status.connecting, {
       remoteMode: state.remoteMode,
       webAssetBaseUrl,
       webAssetVersion,
@@ -1056,7 +1359,7 @@ async function startConnection(connection, { instanceId = connection.id || "" } 
   if (controlView) {
     controlView.hidden = false;
   }
-  setStatus("Connecting");
+  setStatus(controlStrings.status.connecting);
   applyRemoteModeLayout();
   if (state.remoteMode === REMOTE_MODE_WEB) {
     if (shouldOpenRemoteControlPageDirectly()) {
@@ -1081,7 +1384,7 @@ function switchRemoteMode(mode, { remember = false } = {}) {
     remoteModeSelect.value = nextMode;
   }
   if (remember && activeInstanceId) {
-    updateInstanceStatus(activeInstanceId, "Connecting", { remoteMode: nextMode });
+    updateInstanceStatus(activeInstanceId, controlStrings.status.connecting, { remoteMode: nextMode });
   }
 
   closeRealtimeSession();
@@ -1151,7 +1454,9 @@ function applyRemoteModeLayout() {
   }
   if (emptyState) {
     emptyState.hidden = webMode ? state.webFrameLoaded : state.frameConnected;
-    emptyState.textContent = webMode ? "Loading web bridge" : "Loading remote screen";
+    setEmptyStateLoading(webMode
+      ? controlStrings.status.loadingWebBridge
+      : controlStrings.status.loadingRemoteScreen);
   }
   updateSecureWebButton();
 }
@@ -1161,10 +1466,7 @@ async function connectWebBridgeMode() {
     return;
   }
   if (!token) {
-    setStatus("Missing token");
-    if (activeInstanceId) {
-      updateInstanceStatus(activeInstanceId, "Missing token");
-    }
+    showControlConnectionIssue(controlStrings.status.missingToken);
     return;
   }
 
@@ -1176,26 +1478,29 @@ async function connectWebBridgeMode() {
   }
   const remoteFrameUrl = webBridgeUrl();
   if (!webFrame || !remoteFrameUrl) {
-    setStatus("Web bridge unavailable");
-    if (activeInstanceId) {
-      updateInstanceStatus(activeInstanceId, "Web bridge unavailable");
-    }
+    showControlConnectionIssue(controlStrings.status.webBridgeUnavailable);
     return;
   }
 
   state.connected = false;
   state.frameConnected = false;
   state.webFrameLoaded = false;
-  setStatus(registryMode ? `Loading app bundle (${webAssetVersion})` : "Preparing web cache");
+  const preparingStatus = registryMode
+    ? controlStrings.loadingAppBundle(webAssetVersion)
+    : controlStrings.status.preparingWebCache;
+  setStatus(preparingStatus);
   if (activeInstanceId) {
-    updateInstanceStatus(activeInstanceId, registryMode ? `Loading app bundle (${webAssetVersion})` : "Preparing web cache");
+    updateInstanceStatus(activeInstanceId, preparingStatus);
   }
   applyRemoteModeLayout();
 
   if (registryMode || canLoadWebFrameDirectly()) {
-    setStatus(registryMode ? `Loading app bundle (${webAssetVersion})` : "Loading web bridge");
+    const loadingStatus = registryMode
+      ? controlStrings.loadingAppBundle(webAssetVersion)
+      : controlStrings.status.loadingWebBridge;
+    setStatus(loadingStatus);
     if (activeInstanceId) {
-      updateInstanceStatus(activeInstanceId, registryMode ? `Loading app bundle (${webAssetVersion})` : "Loading web bridge");
+      updateInstanceStatus(activeInstanceId, loadingStatus);
     }
     loadWebFrame(remoteFrameUrl, attempt);
     return;
@@ -1209,23 +1514,23 @@ async function connectWebBridgeMode() {
     }
     frameUrl = result?.frameUrl || frameUrl;
     if (result?.updated) {
-      setStatus(`Web cache updated (${result.cached || 0})`);
+      setStatus(controlStrings.webCacheUpdated(result.cached || 0));
     }
   } catch (error) {
     console.warn("[web-cache] preparation failed", error);
     if (state.remoteMode !== REMOTE_MODE_WEB || state.webConnectAttempt !== attempt) {
       return;
     }
-    const message = error?.message || "Web cache failed";
+    const message = error?.message || controlStrings.status.webCacheFailed;
     handleWebBridgeDisconnect(message);
     return;
   }
   if (state.remoteMode !== REMOTE_MODE_WEB || state.webConnectAttempt !== attempt) {
     return;
   }
-  setStatus("Loading web bridge");
+  setStatus(controlStrings.status.loadingWebBridge);
   if (activeInstanceId) {
-    updateInstanceStatus(activeInstanceId, "Loading web bridge");
+    updateInstanceStatus(activeInstanceId, controlStrings.status.loadingWebBridge);
   }
   loadWebFrame(frameUrl, attempt);
 }
@@ -1305,7 +1610,7 @@ function booleanFlag(value) {
 
 function showPasswordGate() {
   if (!passwordGate || !passwordInput) {
-    setStatus("Remote password required");
+    setStatus(controlStrings.status.remotePasswordRequired);
     return;
   }
   passwordGate.hidden = false;
@@ -1313,7 +1618,7 @@ function showPasswordGate() {
   if (passwordStatus) {
     passwordStatus.textContent = "";
   }
-  setStatus("Remote password required");
+  setStatus(controlStrings.status.remotePasswordRequired);
   requestAnimationFrame(() => {
     if (!passwordGate.hidden) {
       passwordInput.focus();
@@ -1337,7 +1642,7 @@ async function unlockPendingPasswordConnection() {
   const password = passwordInput.value;
   if (!password) {
     if (passwordStatus) {
-      passwordStatus.textContent = "Enter the remote password.";
+      passwordStatus.textContent = controlStrings.status.enterPassword;
     }
     return;
   }
@@ -1351,7 +1656,7 @@ async function unlockPendingPasswordConnection() {
   const nextToken = connection.token || connectionUrl.searchParams.get("token") || "";
   try {
     if (passwordStatus) {
-      passwordStatus.textContent = "Unlocking";
+      passwordStatus.textContent = controlStrings.status.unlocking;
     }
     remoteCrypto = await createRemoteCrypto(password, nextToken);
     pendingPasswordConnection = null;
@@ -1360,7 +1665,7 @@ async function unlockPendingPasswordConnection() {
   } catch (error) {
     remoteCrypto = null;
     if (passwordStatus) {
-      passwordStatus.textContent = error?.message || "Unable to unlock remote control.";
+      passwordStatus.textContent = error?.message || controlStrings.status.unableUnlock;
     }
   }
 }
@@ -1401,7 +1706,7 @@ function instanceSearchText(instance) {
       hostFromConnectionUrl(instance.url),
       remoteModeLabel(instance.remoteMode),
       instance.webAssetVersion || "",
-      instance.status || "Not connected",
+      instance.status || controlStrings.status.notConnected,
     ].join(" "),
   );
 }
@@ -1435,7 +1740,7 @@ function createInstanceCard(instance) {
   const status = document.createElement("span");
   status.className = "status-badge";
   status.dataset.status = statusKind(instance.status);
-  status.textContent = instance.status || "Not connected";
+  status.textContent = instance.status || controlStrings.status.notConnected;
 
   const host = document.createElement("p");
   host.className = "instance-host";
@@ -1550,7 +1855,7 @@ function closeEditDialog() {
 function addInstanceFromConnection(connection, { connect = false, name = "" } = {}) {
   const instance = upsertInstanceFromConnection(connection, {
     name,
-    status: connect ? "Connecting" : "Not connected",
+    status: connect ? controlStrings.status.connecting : controlStrings.status.notConnected,
   });
   if (!instance) {
     setScanStatus("Paste a valid connection URL or QR payload.");
@@ -1705,9 +2010,9 @@ function refreshInstanceFromControlUrl(instanceId, stored, connection) {
     lastConnectedAt: 0,
     name: "",
     remoteMode: "",
-    status: "Connecting",
+    status: controlStrings.status.connecting,
   };
-  const refreshed = buildInstanceFromConnection(connection, { existing, status: "Connecting" });
+  const refreshed = buildInstanceFromConnection(connection, { existing, status: controlStrings.status.connecting });
   if (!refreshed) {
     return null;
   }
@@ -1718,7 +2023,7 @@ function refreshInstanceFromControlUrl(instanceId, stored, connection) {
     id: instanceId,
     lastConnectedAt: stored?.lastConnectedAt || refreshed.lastConnectedAt,
     name: stored?.name || refreshed.name,
-    status: "Connecting",
+    status: controlStrings.status.connecting,
   };
   const existingIndex = instances.findIndex((instance) => instance.id === instanceId);
   instances =
@@ -1783,7 +2088,7 @@ function buildInstanceFromConnection(connection, { existing = null, name = "", s
     name: displayName,
     remoteMode,
     requirePassword,
-    status: status || existing?.status || "Not connected",
+    status: status || existing?.status || controlStrings.status.notConnected,
     token: nextToken,
     updatedAt: now,
     url: connectionUrl.toString(),
@@ -1828,7 +2133,7 @@ function resetTransientInstanceStatuses() {
     changed = true;
     return {
       ...instance,
-      status: "Not connected",
+      status: controlStrings.status.notConnected,
       updatedAt: Date.now(),
     };
   });
@@ -1877,10 +2182,10 @@ function normalizeStoredInstance(instance) {
         lastConnectedAt: Number(instance.lastConnectedAt) || 0,
         name: typeof instance.name === "string" ? instance.name : "",
         remoteMode: typeof instance.remoteMode === "string" ? instance.remoteMode : "",
-        status: typeof instance.status === "string" && instance.status ? instance.status : "Not connected",
+        status: typeof instance.status === "string" && instance.status ? instance.status : controlStrings.status.notConnected,
       },
       name: typeof instance.name === "string" ? instance.name : "",
-      status: typeof instance.status === "string" && instance.status ? instance.status : "Not connected",
+      status: typeof instance.status === "string" && instance.status ? instance.status : controlStrings.status.notConnected,
     },
   );
 }
@@ -2534,18 +2839,15 @@ async function connectRealtime() {
     return;
   }
   if (!token) {
-    setStatus("Missing token");
-    if (activeInstanceId) {
-      updateInstanceStatus(activeInstanceId, "Missing token");
-    }
+    showControlConnectionIssue(controlStrings.status.missingToken);
     return;
   }
 
   const attempt = ++state.transportConnectAttempt;
   clearReconnectTimer();
-  setStatus("Connecting");
+  setStatus(controlStrings.status.connecting);
   if (activeInstanceId) {
-    updateInstanceStatus(activeInstanceId, "Connecting");
+    updateInstanceStatus(activeInstanceId, controlStrings.status.connecting);
   }
 
   let session;
@@ -2562,7 +2864,7 @@ async function connectRealtime() {
     });
   } catch {
     if (state.transportConnectAttempt === attempt) {
-      handleTransportDisconnect("Control disconnected, retrying");
+      handleTransportDisconnect(controlStrings.status.controlDisconnectedRetrying);
     }
     return;
   }
@@ -2599,7 +2901,7 @@ async function connectRealtime() {
       return;
     }
 
-    handleTransportDisconnect("Control disconnected, retrying");
+    handleTransportDisconnect(controlStrings.status.controlDisconnectedRetrying);
   });
 
   session.addEventListener("error", () => {
@@ -2616,9 +2918,9 @@ async function connectRealtime() {
   clearReconnectTimer();
   state.lastSentViewportKey = "";
   state.lastSentPageZoomKey = "";
-  setStatus("Connected");
+  setStatus(controlStrings.status.connected);
   if (activeInstanceId) {
-    updateInstanceStatus(activeInstanceId, "Connected", { lastConnectedAt: Date.now() });
+    updateInstanceStatus(activeInstanceId, controlStrings.status.connected, { lastConnectedAt: Date.now() });
   }
   sendViewport();
   sendPageZoom({ force: true });
@@ -2655,7 +2957,7 @@ async function fetchRemoteInfo() {
       window.clearTimeout(timeout);
     });
     if (response.status === 401 || response.status === 403) {
-      throw remoteInfoError(REMOTE_INFO_AUTH_ERROR, "Connection token expired. Scan the latest remote QR code.");
+      throw remoteInfoError(REMOTE_INFO_AUTH_ERROR, controlStrings.status.remoteTokenExpired);
     }
     if (!response.ok) {
       return null;
@@ -2667,9 +2969,9 @@ async function fetchRemoteInfo() {
       throw error;
     }
     if (error?.name === "AbortError") {
-      throw remoteInfoError(REMOTE_INFO_UNAVAILABLE_ERROR, "Remote metadata timed out.");
+      throw remoteInfoError(REMOTE_INFO_UNAVAILABLE_ERROR, controlStrings.status.remoteMetadataTimedOut);
     }
-    throw remoteInfoError(REMOTE_INFO_UNAVAILABLE_ERROR, "Remote service is unavailable.");
+    throw remoteInfoError(REMOTE_INFO_UNAVAILABLE_ERROR, controlStrings.status.remoteServiceUnavailable);
   }
 }
 
@@ -2787,7 +3089,12 @@ function configureWebAssetVersionSelect(versions = [], latest = "") {
 
   const labels = new Map();
   const latestVersion = normalizeWebAssetVersion(latest || "");
-  labels.set("latest", latest && latestVersion !== "latest" ? `Latest (${latestVersion})` : "Latest");
+  labels.set(
+    "latest",
+    latest && latestVersion !== "latest"
+      ? `${controlStrings.latest} (${latestVersion})`
+      : controlStrings.latest,
+  );
   labels.set(webAssetVersion, webAssetVersion === "latest" ? labels.get("latest") : webAssetVersion);
   for (const item of versions) {
     const version = normalizeWebAssetVersion(typeof item === "string" ? item : item?.version);
@@ -3180,7 +3487,7 @@ function updateSecureWebButton() {
 function openSecureRegistryWeb() {
   const nextBaseUrl = webAssetBaseUrl || defaultWebAssetRegistryUrl();
   if (!nextBaseUrl) {
-    setStatus("HTTPS app bundle unavailable");
+    setStatus(controlStrings.status.httpsBundleUnavailable);
     return;
   }
 
@@ -3350,17 +3657,18 @@ function openRemoteControlPageDirectly() {
   if (remoteJwt) {
     url.searchParams.set("jwt", remoteJwt);
   }
-  setStatus("Opening LAN remote");
+  setStatus(controlStrings.status.openingLanRemote);
   if (activeInstanceId) {
-    updateInstanceStatus(activeInstanceId, "Opening LAN remote");
+    updateInstanceStatus(activeInstanceId, controlStrings.status.openingLanRemote);
   }
   location.href = url.toString();
 }
 
 async function openRegistryStandalonePage() {
-  setStatus(`Opening HTTPS app bundle (${webAssetVersion})`);
+  const statusText = controlStrings.openingHttpsAppBundle(webAssetVersion);
+  setStatus(statusText);
   if (activeInstanceId) {
-    updateInstanceStatus(activeInstanceId, `Opening HTTPS app bundle (${webAssetVersion})`, {
+    updateInstanceStatus(activeInstanceId, statusText, {
       webAssetBaseUrl,
       webAssetVersion,
     });
@@ -3522,6 +3830,10 @@ function handleTransportDisconnect(statusText) {
   state.latestFrame = null;
   state.transportSession = null;
   setStatus(statusText);
+  if (emptyState && !state.frameConnected) {
+    emptyState.hidden = false;
+    setEmptyStateIssue(statusText);
+  }
   if (activeInstanceId) {
     updateInstanceStatus(activeInstanceId, statusText);
   }
@@ -3545,9 +3857,13 @@ function handleWebBridgeDisconnect(statusText) {
   if (state.remoteMode !== REMOTE_MODE_WEB) {
     return;
   }
-  const nextStatus = retryingStatus(statusText || "Web bridge disconnected");
+  const nextStatus = retryingStatus(statusText || controlStrings.status.webBridgeDisconnectedRetrying);
   state.connected = false;
   setStatus(nextStatus);
+  if (emptyState && !state.webFrameLoaded) {
+    emptyState.hidden = false;
+    setEmptyStateIssue(nextStatus);
+  }
   if (activeInstanceId) {
     updateInstanceStatus(activeInstanceId, nextStatus);
   }
@@ -3590,7 +3906,7 @@ function scheduleWebBridgeStaleReload(statusText) {
     if (
       state.remoteMode !== REMOTE_MODE_WEB ||
       state.webBridgeLastConnectedAt !== expectedLastConnectedAt ||
-      state.statusText === "Web connected"
+      state.statusText === controlStrings.status.webConnected
     ) {
       return;
     }
@@ -3609,9 +3925,12 @@ function clearWebBridgeStaleTimer() {
 function retryingStatus(text) {
   const value = String(text || "").trim();
   if (!value) {
-    return "Web bridge disconnected, retrying";
+    return controlStrings.status.webBridgeDisconnectedRetrying;
   }
-  return /\bretrying\b/i.test(value) ? value : `${value}, retrying`;
+  if (/\bretrying\b/i.test(value) || value.includes("重试")) {
+    return value;
+  }
+  return CONTROL_LANGUAGE === "zh" ? `${value}，正在重试` : `${value}, retrying`;
 }
 
 function markWebBridgeConnected(reason = "bridge") {
@@ -3627,12 +3946,12 @@ function markWebBridgeConnected(reason = "bridge") {
   clearReconnectTimer();
   clearWebBridgeStaleTimer();
   applyRemoteModeLayout();
-  setStatus("Web connected");
+  setStatus(controlStrings.status.webConnected);
   if (!wasConnected) {
     console.info("[remote-control] web bridge connected", { reason });
   }
   if (activeInstanceId) {
-    updateInstanceStatus(activeInstanceId, "Web connected", { lastConnectedAt: connectedAt });
+    updateInstanceStatus(activeInstanceId, controlStrings.status.webConnected, { lastConnectedAt: connectedAt });
   }
 }
 
@@ -3663,7 +3982,9 @@ function handleWebBridgeStatusMessage(event) {
   }
 
   if (status === "connecting" || status === "reconnecting" || status === "disconnected") {
-    const text = status === "connecting" ? "Connecting web bridge" : "Web bridge disconnected, retrying";
+    const text = status === "connecting"
+      ? controlStrings.status.connectingWebBridge
+      : controlStrings.status.webBridgeDisconnectedRetrying;
     state.connected = false;
     setStatus(text);
     if (activeInstanceId) {
@@ -3869,7 +4190,9 @@ function handleControlMessage(message) {
     if (message.status?.pageZoomScale && !state.hasStoredPageZoom && !state.pageZoomMenuOpen) {
       setPageZoomScale(message.status.pageZoomScale);
     }
-    const nextStatus = message.status?.connected ? "CDP connected" : "Waiting for CDP";
+    const nextStatus = message.status?.connected
+      ? controlStrings.status.cdpConnected
+      : controlStrings.status.waitingForCdp;
     setStatus(nextStatus);
     if (activeInstanceId) {
       updateInstanceStatus(activeInstanceId, nextStatus);
@@ -3927,7 +4250,7 @@ async function drawFrameBytes(frame) {
     const profile = state.frameProfile?.name ? ` · ${state.frameProfile.name}` : "";
     setStatus(`${title} · ${meta.metrics?.width || width}x${meta.metrics?.height || height}${profile}`);
   } catch {
-    setStatus("Frame decode failed");
+    setStatus(controlStrings.status.frameDecodeFailed);
   } finally {
     cleanupDecodedImage(image);
   }

@@ -951,14 +951,7 @@ impl AppConfig {
     where
         F: FnOnce() -> String,
     {
-        let token_key = self
-            .provider_profile(profile_selector)
-            .as_ref()
-            .map(provider_profile_key)
-            .unwrap_or_else(|| profile_selector.trim().to_string());
-        if token_key.is_empty() {
-            return Err("Remote control profile is missing.".to_string());
-        }
+        let token_key = self.remote_control_token_key_for_profile(profile_selector)?;
 
         if let Some(existing) = self
             .remote_control_tokens
@@ -975,6 +968,21 @@ impl AppConfig {
         }
         self.remote_control_tokens.insert(token_key, token.clone());
         Ok((token, true))
+    }
+
+    fn remote_control_token_key_for_profile(
+        &self,
+        profile_selector: &str,
+    ) -> Result<String, String> {
+        let token_key = self
+            .provider_profile(profile_selector)
+            .as_ref()
+            .map(provider_profile_key)
+            .unwrap_or_else(|| profile_selector.trim().to_string());
+        if token_key.is_empty() {
+            return Err("Remote control profile is missing.".to_string());
+        }
+        Ok(token_key)
     }
 
     fn normalize_remote_control_tokens(&mut self) {

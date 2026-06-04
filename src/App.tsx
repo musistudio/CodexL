@@ -64,7 +64,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   AlertDialog,
-  AlertDialogAction,
   AlertDialogCancel,
   AlertDialogContent,
   AlertDialogDescription,
@@ -815,18 +814,22 @@ type GatewayConfigForm = {
 type GatewayProviderDialogState = {
   mode: "add" | "edit";
   provider: GatewayProviderForm;
+  initialSignature: string;
 };
 type GatewayMcpServerDialogState = {
   mode: "add" | "edit";
   server: GatewayMcpServerForm;
+  initialSignature: string;
 };
 type GatewayVirtualProfileDialogState = {
   mode: "add" | "edit";
   profile: GatewayVirtualProfileForm;
+  initialSignature: string;
 };
 type DefaultProviderDialogState = {
   mode: "add" | "edit";
   profile: DefaultProviderProfile;
+  initialSignature: string;
 };
 type GatewaySettingsTab = "settings" | "providers" | "mcp" | "tools";
 
@@ -868,14 +871,26 @@ type ProviderForm = {
 type RemoteQrState = {
   profile: ProviderProfile;
   remote: RemoteControlInfo;
+  defaultUrlKind: RemoteQrUrlKind;
+};
+
+type RemoteQrUrlKind = "remote" | "lan";
+
+type RemoteQrUrlOption = {
+  kind: RemoteQrUrlKind;
   url: string;
-  qrUrl: string;
-  markup: string;
 };
 
 type RemoteLaunchOptions = {
   startRemote: boolean;
   startCloud: boolean;
+};
+
+type WorkspaceOperationKind = "start" | "stop" | "options";
+
+type WorkspaceOperation = {
+  key: string;
+  kind: WorkspaceOperationKind;
 };
 
 type RemotePasswordDialogState = {
@@ -926,11 +941,22 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     appTitle: t("app.title"),
     appSubtitle: t("app.subtitle"),
     searchPlaceholder: t("search.placeholder"),
+    loadingWorkspacesTitle: t("search.loadingTitle"),
+    loadingWorkspacesDescription: t("search.loadingDescription"),
     newInstance: t("actions.newInstance"),
     settings: t("settings.settings"),
     noInstancesTitle: t("search.emptyTitle"),
     noInstancesDescription: t("search.emptyDescription"),
+    emptyCreateTitle: t("search.emptyCreateTitle"),
+    emptyCreateDescription: t("search.emptyCreateDescription"),
+    emptyProfilesTitle: t("search.emptyProfilesTitle"),
+    emptyProfilesDescription: t("search.emptyProfilesDescription"),
+    emptyGatewayTitle: t("search.emptyGatewayTitle"),
+    emptyGatewayDescription: t("search.emptyGatewayDescription"),
+    desktopRuntimeUnavailableTitle: t("errors.desktopRuntimeUnavailableTitle"),
+    desktopRuntimeUnavailableDescription: t("errors.desktopRuntimeUnavailableDescription"),
     createInstance: t("actions.createInstance"),
+    clearSearch: t("actions.clearSearch"),
     downloadUpdate: t("actions.downloadUpdate"),
     revealInFileExplorer: t("tooltips.revealInFileExplorer"),
     settingsTooltip: t("tooltips.settings"),
@@ -939,7 +965,9 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     editProfile: (name: string) => t("actions.editProfile", { name }),
     deleteProfile: (name: string) => t("actions.deleteProfile", { name }),
     stop: t("actions.stop"),
+    stopping: t("actions.stopping"),
     start: t("actions.start"),
+    starting: t("actions.starting"),
     launchOptions: t("remote.launchOptions"),
     remote: t("remote.remote"),
     cloudRemoteConnectedTooltip: t("remote.cloudRemoteConnectedTooltip"),
@@ -956,8 +984,11 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     saving: t("actions.saving"),
     appSettingsTitle: t("settings.settings"),
     appSettingsDescription: t("settings.description"),
+    discardSettingsChangesDescription: t("settings.discardChangesDescription"),
+    discardSettingsChangesTitle: t("settings.discardChangesTitle"),
     general: t("settings.general"),
     profiles: t("settings.profiles"),
+    manageProfiles: t("settings.manageProfiles"),
     profileSettingsDescription: t("settings.profileSettingsDescription"),
     addProfileConfig: t("settings.addProfileConfig"),
     editProfileConfig: t("settings.editProfileConfig"),
@@ -1049,6 +1080,7 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     associatedWorkspace: t("bot.associatedWorkspace"),
     botLinkedToWorkspace: t("bot.linkedToWorkspace"),
     deleteBot: t("bot.deleteBot"),
+    deleteBotConfirm: (name: string) => t("bot.deleteBotConfirm", { name }),
     editBot: t("bot.editBot"),
     noSavedBots: t("bot.noSavedBots"),
     notConfigured: t("bot.notConfigured"),
@@ -1057,6 +1089,7 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     updatesDescription: t("settings.updatesDescription"),
     extensionSettingsDescription: t("settings.extensionSettingsDescription"),
     enableExtensions: t("settings.enableExtensions"),
+    configureExtensions: t("settings.configureExtensions"),
     botGatewayDescription: t("settings.botGatewayDescription"),
     nextAiGatewayDescription: t("settings.nextAiGatewayDescription"),
     ready: t("settings.ready"),
@@ -1078,6 +1111,8 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     installing: t("actions.installing"),
     save: t("actions.save"),
     saved: t("actions.saved"),
+    deleting: t("actions.deleting"),
+    discardChanges: t("actions.discardChanges"),
     manage: t("actions.manage"),
     createProfile: t("actions.createProfile"),
     newProfile: t("instanceDialog.newProfile"),
@@ -1123,6 +1158,7 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     savedBotConfig: t("bot.savedConfig"),
     customBotConfig: t("bot.customConfig"),
     enableBotIntegration: t("bot.enableIntegration"),
+    botOptionsDescription: t("bot.optionsDescription"),
     forwardAllCodexMessages: t("bot.forwardAllCodexMessages"),
     handoffMode: t("bot.handoffMode"),
     handoffIdleSeconds: t("bot.handoffIdleSeconds"),
@@ -1147,7 +1183,11 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     deleteInstanceConfirm: (name: string) => t("deleteDialog.confirm", { name }),
     alsoDeleteCodexHome: t("deleteDialog.removeCodexHome"),
     delete: t("actions.delete"),
+    deleteProfileConfig: t("settings.deleteProfileConfig"),
+    deleteProfileConfigConfirm: (name: string) => t("settings.deleteProfileConfigConfirm", { name }),
     remoteQr: t("remote.remoteQr"),
+    remoteQrStartRequired: t("remote.remoteQrStartRequired"),
+    remoteQrUnavailable: t("remote.remoteQrUnavailable"),
     remoteUrl: t("remote.remoteUrl"),
     remotePasswordPrompt: (name: string) => t("remote.passwordPrompt", { name }),
     lanUrl: t("remote.lanUrl"),
@@ -1192,6 +1232,7 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     registryVersionRequired: t("errors.registryVersionRequired"),
     registryVersionsUnavailable: t("errors.registryVersionsUnavailable"),
     botAuthRequired: (fields: string) => t("errors.botAuthRequired", { fields }),
+    fieldRequired: (field: string) => t("errors.fieldRequired", { field }),
     listen: t("gateway.listen"),
     port: t("gateway.port"),
     providers: t("gateway.providers"),
@@ -1236,6 +1277,7 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     baseModelMode: t("gateway.baseModelMode"),
     fixedModel: t("gateway.fixedModel"),
     matchMultimodal: t("gateway.matchMultimodal"),
+    gatewayMatchRequired: t("gateway.matchRequired"),
     matchWebSearch: t("gateway.matchWebSearch"),
     maxTurns: t("gateway.maxTurns"),
     maxToolCalls: t("gateway.maxToolCalls"),
@@ -1415,13 +1457,18 @@ async function loadProviderModelsProbe(key: string, baseUrl: string, apiKey: str
 
 function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
+  const [initializing, setInitializing] = useState(true);
+  const [runtimeUnsupported, setRuntimeUnsupported] = useState(false);
   const [instanceStatuses, setInstanceStatuses] = useState<Map<string, InstanceStatus>>(new Map());
   const [defaultProviders, setDefaultProviders] = useState<DefaultProviderProfile[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [appSettingsOpen, setAppSettingsOpen] = useState(false);
+  const [appSettingsInitialSection, setAppSettingsInitialSection] = useState<AppSettingsSection>("general");
   const [settingsError, setSettingsError] = useState("");
   const [saveDisabled, setSaveDisabled] = useState(false);
+  const [workspaceSavePending, setWorkspaceSavePending] = useState(false);
+  const [workspaceDeletePending, setWorkspaceDeletePending] = useState(false);
   const [providerMode, setProviderMode] = useState<ProviderMode>("existing");
   const [dialogMode, setDialogMode] = useState<DialogMode>("add");
   const [editingProfileName, setEditingProfileName] = useState<string | null>(null);
@@ -1432,6 +1479,7 @@ function App() {
   const [pendingDeleteProfile, setPendingDeleteProfile] = useState<ProviderProfile | null>(null);
   const [removeCodexHome, setRemoveCodexHome] = useState(false);
   const [remoteQr, setRemoteQr] = useState<RemoteQrState | null>(null);
+  const [workspaceOperation, setWorkspaceOperation] = useState<WorkspaceOperation | null>(null);
   const [remotePasswordDialog, setRemotePasswordDialog] = useState<RemotePasswordDialogState | null>(null);
   const [weixinBotQr, setWeixinBotQr] = useState<WeixinBotQrState | null>(null);
   const [accountLoginState, setAccountLoginState] = useState<AccountLoginState>("idle");
@@ -1453,6 +1501,8 @@ function App() {
   const newProviderApiKeyRef = useRef<HTMLInputElement>(null);
   const newProviderModelRef = useRef<HTMLInputElement>(null);
   const gatewayModelTriggerRef = useRef<HTMLButtonElement>(null);
+  const workspaceSavePendingRef = useRef(false);
+  const workspaceDeletePendingRef = useRef(false);
 
   const { i18n } = useTranslation();
   const strings = useAppStrings();
@@ -1482,14 +1532,14 @@ function App() {
   }, []);
 
   const showSettingsError = useCallback((error: unknown) => {
-    const message = errorMessage(error).replace(/^Error:\s*/, "");
+    const message = userFacingErrorMessage(error, strings);
     setSettingsError(message);
     console.error(error);
-  }, []);
+  }, [strings]);
 
   useEffect(() => {
     const showRuntimeError = (error: unknown) => {
-      setSettingsError(errorMessage(error).replace(/^Error:\s*/, ""));
+      setSettingsError(userFacingErrorMessage(error, strings));
     };
     const handleError = (event: ErrorEvent) => {
       showRuntimeError(event.error || event.message);
@@ -1503,9 +1553,13 @@ function App() {
       window.removeEventListener("error", handleError);
       window.removeEventListener("unhandledrejection", handleRejection);
     };
-  }, []);
+  }, [strings]);
 
   const checkForAppUpdate = useCallback(async () => {
+    if (!isTauriRuntime()) {
+      return;
+    }
+
     setAppUpdateState({
       status: "checking",
       update: null,
@@ -1610,6 +1664,11 @@ function App() {
   }, []);
 
   const detectCodexAppPath = useCallback(async () => {
+    if (!isTauriRuntime()) {
+      setCodexAppPath("");
+      return "";
+    }
+
     try {
       const path = await invoke<string>("find_codex");
       setCodexAppPath(path);
@@ -1632,7 +1691,8 @@ function App() {
     }
   }, []);
 
-  const openAppSettingsDialog = useCallback(() => {
+  const openAppSettingsDialog = useCallback((section: AppSettingsSection = "general") => {
+    setAppSettingsInitialSection(section);
     setAppSettingsOpen(true);
     loadDefaultProviders().catch(showSettingsError);
   }, [loadDefaultProviders, showSettingsError]);
@@ -1648,6 +1708,10 @@ function App() {
 
   const beginDesktopLogin = useCallback(async () => {
     if (accountLoginState === "polling") {
+      return;
+    }
+    if (!isTauriRuntime()) {
+      setAccountError(strings.desktopRuntimeUnavailableTitle);
       return;
     }
 
@@ -1696,7 +1760,15 @@ function App() {
     } finally {
       setAccountLoginState("idle");
     }
-  }, [accountLoginState, language, saveRemoteCloudAuth, showSettingsError, strings.loginExpired, strings.loginFailed]);
+  }, [
+    accountLoginState,
+    language,
+    saveRemoteCloudAuth,
+    showSettingsError,
+    strings.desktopRuntimeUnavailableTitle,
+    strings.loginExpired,
+    strings.loginFailed,
+  ]);
 
   const clearRemoteCloudAuth = useCallback(async () => {
     try {
@@ -1812,7 +1884,16 @@ function App() {
     let statusPoll: number | null = null;
 
     async function init() {
+      if (!isTauriRuntime()) {
+        if (!cancelled) {
+          setRuntimeUnsupported(true);
+          setInitializing(false);
+        }
+        return;
+      }
+
       try {
+        setRuntimeUnsupported(false);
         const nextConfig = await invoke<AppConfig>("get_config");
         const statuses = await invoke<InstanceStatus[]>("get_instance_statuses");
         if (cancelled) return;
@@ -1824,6 +1905,10 @@ function App() {
       } catch (error) {
         if (!cancelled) {
           showSettingsError(error);
+        }
+      } finally {
+        if (!cancelled) {
+          setInitializing(false);
         }
       }
     }
@@ -1858,6 +1943,13 @@ function App() {
         profile.proxy_url.toLowerCase().includes(query),
     );
   }, [profiles, searchQuery]);
+  const workspaceSearchDisabled = initializing || runtimeUnsupported || profiles.length === 0;
+  const headerActionsDisabled = initializing || runtimeUnsupported;
+  const headerDisabledReason = runtimeUnsupported
+    ? strings.desktopRuntimeUnavailableTitle
+    : initializing
+      ? strings.loadingWorkspacesTitle
+      : "";
 
   const syncExistingProviderFields = useCallback(
     (profileName: string, providers = workspaceDefaultProviders) => {
@@ -1879,6 +1971,8 @@ function App() {
     setEditingProfileKey(null);
     setSettingsError("");
     setSaveDisabled(false);
+    setWorkspaceSavePending(false);
+    workspaceSavePendingRef.current = false;
     const [providers, models, detectedCodexAppPath] = await Promise.all([
       loadDefaultProviders(),
       gatewayProfileEnabled ? loadGatewayModels() : Promise.resolve([]),
@@ -1914,6 +2008,8 @@ function App() {
       setEditingProfileKey(profile.name === "Default" ? profile.name : profileKey(profile));
       setSettingsError("");
       setSaveDisabled(false);
+      setWorkspaceSavePending(false);
+      workspaceSavePendingRef.current = false;
       setForm(emptyForm);
       const isGatewayProfile = gatewayProfileEnabled && isNextAiGatewayProvider(profile);
       const [providers, detectedCodexAppPath, models] = await Promise.all([
@@ -2018,6 +2114,8 @@ function App() {
     setEditingProfileKey(null);
     setDialogMode("add");
     setSaveDisabled(false);
+    setWorkspaceSavePending(false);
+    workspaceSavePendingRef.current = false;
   }, []);
 
   const selectProviderMode = useCallback(
@@ -2093,7 +2191,10 @@ function App() {
 
   const saveProvider = useCallback(async () => {
     if (!config) return;
+    if (workspaceSavePendingRef.current) return;
 
+    workspaceSavePendingRef.current = true;
+    setWorkspaceSavePending(true);
     try {
       setSettingsError("");
       let nextConfig: AppConfig;
@@ -2217,6 +2318,9 @@ function App() {
       }
     } catch (error) {
       showSettingsError(error);
+    } finally {
+      workspaceSavePendingRef.current = false;
+      setWorkspaceSavePending(false);
     }
   }, [
     config,
@@ -2316,6 +2420,7 @@ function App() {
       const startCloud = startRemote && options.startCloud === true;
       const requireE2ee = startCloud;
 
+      setWorkspaceOperation({ key, kind: "start" });
       try {
         const info = await invoke<LaunchInfo>("launch_codex", {
           cdpPort: config?.cdp_port || null,
@@ -2354,6 +2459,10 @@ function App() {
       } catch (error) {
         showSettingsError(error);
         await refreshStatus().catch(console.error);
+      } finally {
+        setWorkspaceOperation((current) =>
+          current?.key === key && current.kind === "start" ? null : current,
+        );
       }
     },
     [
@@ -2366,11 +2475,17 @@ function App() {
 
   const stopCodex = useCallback(
     async (profile: ProviderProfile) => {
+      const key = profileKey(profile);
+      setWorkspaceOperation({ key, kind: "stop" });
       try {
-        await invoke("stop_codex", { profileName: profileKey(profile) });
+        await invoke("stop_codex", { profileName: key });
         await refreshStatus();
       } catch (error) {
         showSettingsError(error);
+      } finally {
+        setWorkspaceOperation((current) =>
+          current?.key === key && current.kind === "stop" ? null : current,
+        );
       }
     },
     [refreshStatus, showSettingsError],
@@ -2378,7 +2493,11 @@ function App() {
 
   const toggleProfile = useCallback(
     async (profile: ProviderProfile, options: Partial<RemoteLaunchOptions> = {}) => {
-      const status = instanceStatuses.get(profileKey(profile));
+      const key = profileKey(profile);
+      if (workspaceOperation?.key === key) {
+        return;
+      }
+      const status = instanceStatuses.get(key);
       const isRunning = Boolean(status?.running || status?.remote_control?.running);
       if (isRunning) {
         await stopCodex(profile);
@@ -2386,7 +2505,7 @@ function App() {
       }
       await launchProfile(profile, options);
     },
-    [instanceStatuses, launchProfile, stopCodex],
+    [instanceStatuses, launchProfile, stopCodex, workspaceOperation],
   );
 
   const setRemoteLaunchOptions = useCallback(
@@ -2415,13 +2534,21 @@ function App() {
         remoteE2eePassword = password;
       }
 
-      const nextConfig = await invoke<AppConfig>("set_remote_launch_options", {
-        profileName,
-        startRemote,
-        startCloud,
-        remoteE2eePassword,
-      });
-      setConfig(nextConfig);
+      const key = profileKey(profile);
+      setWorkspaceOperation({ key, kind: "options" });
+      try {
+        const nextConfig = await invoke<AppConfig>("set_remote_launch_options", {
+          profileName,
+          startRemote,
+          startCloud,
+          remoteE2eePassword,
+        });
+        setConfig(nextConfig);
+      } finally {
+        setWorkspaceOperation((current) =>
+          current?.key === key && current.kind === "options" ? null : current,
+        );
+      }
     },
     [
       config?.provider_profiles,
@@ -2434,11 +2561,16 @@ function App() {
   const openDeleteDialog = useCallback((profile: ProviderProfile) => {
     setPendingDeleteProfile(profile);
     setRemoveCodexHome(false);
+    setWorkspaceDeletePending(false);
+    workspaceDeletePendingRef.current = false;
   }, []);
 
   const confirmDelete = useCallback(async () => {
     if (!pendingDeleteProfile) return;
+    if (workspaceDeletePendingRef.current) return;
 
+    workspaceDeletePendingRef.current = true;
+    setWorkspaceDeletePending(true);
     try {
       const nextConfig = await invoke<AppConfig>("delete_provider", {
         name: profileKey(pendingDeleteProfile),
@@ -2453,6 +2585,9 @@ function App() {
       setPendingDeleteProfile(null);
       setRemoveCodexHome(false);
       showSettingsError(error);
+    } finally {
+      workspaceDeletePendingRef.current = false;
+      setWorkspaceDeletePending(false);
     }
   }, [pendingDeleteProfile, refreshConfig, refreshStatus, removeCodexHome, showSettingsError]);
 
@@ -2462,14 +2597,14 @@ function App() {
         if (!remoteControlReadyForQr(remote)) {
           return;
         }
-        const url = remote.lan_url || remote.url;
-        const qrUrl = compactRemoteQrUrl(url);
+        const urlOptions = remoteQrUrlOptions(remote);
+        if (urlOptions.length === 0) {
+          return;
+        }
         setRemoteQr({
           profile,
           remote,
-          url,
-          qrUrl,
-          markup: createQrSvg(qrUrl, { moduleSize: 5, quietZone: 4 }),
+          defaultUrlKind: urlOptions[0].kind,
         });
       } catch (error) {
         showSettingsError(error);
@@ -2569,6 +2704,7 @@ function App() {
             placeholder={strings.searchPlaceholder}
             className="h-7 rounded-md border-border/60 bg-background/70 pl-8 pr-2 text-xs"
             value={searchQuery}
+            disabled={workspaceSearchDisabled}
             onChange={(event) => setSearchQuery(event.target.value)}
           />
         </div>
@@ -2581,6 +2717,7 @@ function App() {
             title={strings.newInstance}
             aria-label={strings.newInstance}
             className="h-8 w-8"
+            disabled={headerActionsDisabled}
             onClick={() => openAddProviderDialog().catch(showSettingsError)}
           >
             <Plus className="w-4 h-4" />
@@ -2611,7 +2748,8 @@ function App() {
               size="icon"
               aria-label={strings.settings}
               className="h-8 w-8"
-              onClick={openAppSettingsDialog}
+              disabled={headerActionsDisabled}
+              onClick={() => openAppSettingsDialog()}
             >
               <Settings className="w-4 h-4" />
             </Button>
@@ -2619,6 +2757,8 @@ function App() {
           <AccountMenu
             auth={config?.remote_cloud_auth ?? emptyRemoteCloudAuth()}
             busy={accountLoginState === "polling"}
+            disabled={headerActionsDisabled}
+            disabledReason={headerDisabledReason}
             error={accountError}
             language={language}
             strings={strings}
@@ -2639,7 +2779,7 @@ function App() {
             size="icon"
             className="-mr-1 -mt-1 h-7 w-7 shrink-0"
             onClick={() => setSettingsError("")}
-            aria-label="Dismiss"
+            aria-label={strings.close}
           >
             <X className="h-4 w-4" />
           </Button>
@@ -2647,16 +2787,22 @@ function App() {
       ) : null}
 
       <main className="min-h-0 flex-1 overflow-auto p-6 md:p-8">
-        {filteredProfiles.length > 0 ? (
+        {initializing ? (
+          <WorkspaceLoadingState strings={strings} />
+        ) : runtimeUnsupported ? (
+          <RuntimeUnsupportedState strings={strings} />
+        ) : filteredProfiles.length > 0 ? (
           <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
             {filteredProfiles.map((profile) => {
               const key = profileKey(profile);
               const status = instanceStatuses.get(key) || instanceStatuses.get(profile.name) || null;
+              const operationKind = workspaceOperation?.key === key ? workspaceOperation.kind : null;
               return (
                 <ProfileCard
                   key={key}
                   profile={profile}
                   status={status}
+                  operationKind={operationKind}
                   remoteLaunchOptions={{
                     startRemote: profile.start_remote_on_launch,
                     startCloud: profile.start_remote_cloud_on_launch,
@@ -2671,25 +2817,15 @@ function App() {
               );
             })}
           </div>
+        ) : profiles.length > 0 && searchQuery.trim() ? (
+          <WorkspaceSearchEmptyState strings={strings} onClearSearch={() => setSearchQuery("")} />
         ) : (
-          <div className="max-w-7xl mx-auto flex flex-col items-center justify-center text-center py-20">
-            <div className="w-16 h-16 bg-muted rounded-2xl flex items-center justify-center mb-4">
-              <Server className="w-8 h-8 text-muted-foreground opacity-50" />
-            </div>
-            <h2 className="text-lg font-medium">{strings.noInstancesTitle}</h2>
-            <p className="text-muted-foreground mt-1 max-w-sm">
-              {strings.noInstancesDescription}
-            </p>
-            <Button
-              type="button"
-              variant="outline"
-              className="mt-6"
-              onClick={() => openAddProviderDialog().catch(showSettingsError)}
-            >
-              <Plus className="w-4 h-4" />
-              {strings.createInstance}
-            </Button>
-          </div>
+          <WorkspaceEmptyState
+            strings={strings}
+            onCreate={() => openAddProviderDialog().catch(showSettingsError)}
+            onManageProfiles={() => openAppSettingsDialog("profiles")}
+            onConfigureExtensions={() => openAppSettingsDialog("extensions")}
+          />
         )}
       </main>
 
@@ -2711,6 +2847,7 @@ function App() {
           onSaveDefaultProvider={saveDefaultProviderProfile}
           onDeleteDefaultProvider={deleteDefaultProviderProfile}
           appUpdateState={appUpdateState}
+          initialSection={appSettingsInitialSection}
           onCheckForAppUpdate={checkForAppUpdate}
           onInstallAppUpdate={installAppUpdate}
         />
@@ -2726,6 +2863,7 @@ function App() {
           codexAppPath={codexAppPath}
           settingsError={settingsError}
           saveDisabled={saveDisabled}
+          saving={workspaceSavePending}
           editingProfileName={editingProfileName}
           existingProviderSelectRef={existingProviderSelectRef}
           workspaceNameInputRef={workspaceNameInputRef}
@@ -2749,8 +2887,10 @@ function App() {
         <DeleteDialog
           profile={pendingDeleteProfile}
           removeCodexHome={removeCodexHome}
+          busy={workspaceDeletePending}
           onRemoveCodexHomeChange={setRemoveCodexHome}
           onCancel={() => {
+            if (workspaceDeletePendingRef.current) return;
             setPendingDeleteProfile(null);
             setRemoveCodexHome(false);
           }}
@@ -2795,6 +2935,8 @@ function App() {
 function AccountMenu({
   auth,
   busy,
+  disabled,
+  disabledReason,
   error,
   language,
   strings,
@@ -2804,6 +2946,8 @@ function AccountMenu({
 }: {
   auth: RemoteCloudAuthConfig;
   busy: boolean;
+  disabled: boolean;
+  disabledReason: string;
   error: string;
   language: Language;
   strings: AppStrings;
@@ -2818,6 +2962,7 @@ function AccountMenu({
   const isPro = Boolean(auth.is_pro);
   const proExpiresAt = isPro ? remoteCloudSubscriptionExpiresAt(auth) : 0;
   const proExpiresAtText = proExpiresAt ? formatAccountDate(proExpiresAt, language) : "";
+  const accountTitle = disabled ? disabledReason : error || (busy ? strings.signingIn : strings.signIn);
 
   if (!signedIn) {
     return (
@@ -2825,10 +2970,10 @@ function AccountMenu({
         type="button"
         variant="outline"
         size="icon"
-        title={error || (busy ? strings.signingIn : strings.signIn)}
+        title={accountTitle}
         aria-label={busy ? strings.signingIn : strings.signIn}
         className="h-8 w-8 rounded-full"
-        disabled={busy}
+        disabled={busy || disabled}
         onClick={onSignIn}
       >
         {busy ? (
@@ -2844,13 +2989,14 @@ function AccountMenu({
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button
-          type="button"
-          variant="outline"
-          size="icon"
-          title={strings.signedInAs(label)}
-          aria-label={strings.account}
-          className="h-8 w-8 rounded-full p-0"
-        >
+            type="button"
+            variant="outline"
+            size="icon"
+            title={disabled ? disabledReason : strings.signedInAs(label)}
+            aria-label={strings.account}
+            className="h-8 w-8 rounded-full p-0"
+            disabled={disabled}
+          >
           <AccountAvatar label={label} avatarUrl={avatarUrl} premium={isPro} />
         </Button>
       </DropdownMenuTrigger>
@@ -2933,9 +3079,158 @@ function AccountAvatar({
   );
 }
 
+function WorkspaceLoadingState({ strings }: { strings: AppStrings }) {
+  return (
+    <div className="mx-auto flex max-w-7xl flex-col gap-6">
+      <div className="flex flex-col items-center justify-center py-20 text-center">
+        <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-muted">
+          <RefreshCw className="h-7 w-7 animate-spin text-muted-foreground" />
+        </div>
+        <h2 className="text-lg font-medium">{strings.loadingWorkspacesTitle}</h2>
+        <p className="mt-1 max-w-sm text-muted-foreground">{strings.loadingWorkspacesDescription}</p>
+      </div>
+      <div className="grid grid-cols-1 gap-6 opacity-60 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        {Array.from({ length: 4 }).map((_, index) => (
+          <div key={index} className="rounded-lg border border-border/60 bg-card p-5">
+            <div className="flex items-center gap-3">
+              <div className="h-10 w-10 rounded-xl bg-muted" />
+              <div className="min-w-0 flex-1 space-y-2">
+                <div className="h-4 w-2/3 rounded bg-muted" />
+                <div className="h-3 w-1/2 rounded bg-muted" />
+              </div>
+            </div>
+            <div className="mt-6 space-y-3">
+              <div className="h-3 w-3/4 rounded bg-muted" />
+              <div className="h-3 w-1/2 rounded bg-muted" />
+              <div className="h-8 w-full rounded bg-muted" />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RuntimeUnsupportedState({ strings }: { strings: AppStrings }) {
+  return (
+    <div className="mx-auto flex max-w-2xl flex-col items-center justify-center py-20 text-center">
+      <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-destructive/10">
+        <AlertCircle className="h-8 w-8 text-destructive" />
+      </div>
+      <h2 className="text-lg font-medium">{strings.desktopRuntimeUnavailableTitle}</h2>
+      <p className="mt-2 max-w-md text-sm leading-relaxed text-muted-foreground">
+        {strings.desktopRuntimeUnavailableDescription}
+      </p>
+    </div>
+  );
+}
+
+function WorkspaceSearchEmptyState({
+  strings,
+  onClearSearch,
+}: {
+  strings: AppStrings;
+  onClearSearch: () => void;
+}) {
+  return (
+    <div className="mx-auto flex max-w-2xl flex-col items-center justify-center py-20 text-center">
+      <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-muted">
+        <Search className="h-8 w-8 text-muted-foreground opacity-70" />
+      </div>
+      <h2 className="text-lg font-medium">{strings.noInstancesTitle}</h2>
+      <p className="mt-1 max-w-sm text-muted-foreground">{strings.noInstancesDescription}</p>
+      <Button type="button" variant="outline" className="mt-6" onClick={onClearSearch}>
+        <X className="h-4 w-4" />
+        {strings.clearSearch}
+      </Button>
+    </div>
+  );
+}
+
+function WorkspaceEmptyState({
+  strings,
+  onCreate,
+  onManageProfiles,
+  onConfigureExtensions,
+}: {
+  strings: AppStrings;
+  onCreate: () => void;
+  onManageProfiles: () => void;
+  onConfigureExtensions: () => void;
+}) {
+  const setupItems = [
+    {
+      icon: <Plus className="h-4 w-4" />,
+      title: strings.emptyCreateTitle,
+      description: strings.emptyCreateDescription,
+      action: strings.createInstance,
+      onClick: onCreate,
+      primary: true,
+    },
+    {
+      icon: <FileCog className="h-4 w-4" />,
+      title: strings.emptyProfilesTitle,
+      description: strings.emptyProfilesDescription,
+      action: strings.manageProfiles,
+      onClick: onManageProfiles,
+      primary: false,
+    },
+    {
+      icon: <Puzzle className="h-4 w-4" />,
+      title: strings.emptyGatewayTitle,
+      description: strings.emptyGatewayDescription,
+      action: strings.configureExtensions,
+      onClick: onConfigureExtensions,
+      primary: false,
+    },
+  ];
+
+  return (
+    <div className="mx-auto flex max-w-5xl flex-col items-center justify-center py-14">
+      <div className="mb-8 max-w-xl text-center">
+        <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-muted">
+          <Server className="h-8 w-8 text-muted-foreground opacity-70" />
+        </div>
+        <h2 className="text-xl font-semibold">{strings.noInstancesTitle}</h2>
+        <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{strings.noInstancesDescription}</p>
+      </div>
+
+      <div className="grid w-full gap-3 md:grid-cols-3">
+        {setupItems.map((item) => (
+          <button
+            key={item.title}
+            type="button"
+            className={cn(
+              "flex min-h-44 flex-col rounded-lg border p-4 text-left transition-colors hover:border-primary/40 hover:bg-muted/20",
+              item.primary ? "border-emerald/40 bg-emerald/5" : "border-border bg-card",
+            )}
+            onClick={item.onClick}
+          >
+            <span
+              className={cn(
+                "mb-4 flex h-9 w-9 items-center justify-center rounded-md border",
+                item.primary ? "border-emerald/30 bg-emerald/10 text-emerald" : "border-border bg-muted/40",
+              )}
+            >
+              {item.icon}
+            </span>
+            <span className="text-sm font-medium text-foreground">{item.title}</span>
+            <span className="mt-2 flex-1 text-sm leading-relaxed text-muted-foreground">{item.description}</span>
+            <span className="mt-4 inline-flex items-center gap-2 text-sm font-medium text-foreground">
+              {item.action}
+              <ChevronDown className="-rotate-90 h-3.5 w-3.5" />
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 type ProfileCardProps = {
   profile: ProviderProfile;
   status: InstanceStatus | null;
+  operationKind: WorkspaceOperationKind | null;
   remoteLaunchOptions: RemoteLaunchOptions;
   onToggleProfile: (profile: ProviderProfile, options?: Partial<RemoteLaunchOptions>) => Promise<void>;
   onRemoteLaunchOptionsChange: (profileName: string, options: Partial<RemoteLaunchOptions>) => Promise<void>;
@@ -2948,6 +3243,7 @@ type ProfileCardProps = {
 function ProfileCard({
   profile,
   status,
+  operationKind,
   remoteLaunchOptions,
   onToggleProfile,
   onRemoteLaunchOptionsChange,
@@ -2960,7 +3256,13 @@ function ProfileCard({
   const remote = status?.remote_control || null;
   const isRunning = Boolean(status?.running || remote?.running);
   const isRemoteRunning = Boolean(remote?.running);
+  const isBusy = operationKind !== null;
   const showRemoteActions = isRunning && remoteControlReadyForQr(remote);
+  const remoteQrDisabledTooltip = isBusy
+    ? strings.saving
+    : isRunning
+      ? strings.remoteQrUnavailable
+      : strings.remoteQrStartRequired;
   const codexProfileName =
     profile.provider_config_format === "top_level"
       ? profile.provider_name || profile.name
@@ -3071,6 +3373,7 @@ function ProfileCard({
       <CardFooter className="border-t border-border/50 bg-muted/10 pt-4 pb-4 justify-between">
         <LaunchMenuButton
           isRunning={isRunning}
+          operationKind={operationKind}
           options={remoteLaunchOptions}
           onToggleProfile={() => onToggleProfile(profile, remoteLaunchOptions)}
           onOptionsChange={(options) => {
@@ -3080,21 +3383,30 @@ function ProfileCard({
         />
 
         <div className="flex gap-2">
-          {showRemoteActions && remote?.url ? (
-            <>
-              <IconButton
-                title={strings.showRemoteQr}
-                onClick={() => onShowRemoteQr(profile, remote)}
-              >
-                <QrCode className="w-3.5 h-3.5" />
-              </IconButton>
-            </>
-          ) : null}
-          <IconButton title={strings.editProfile(profile.name)} onClick={() => onEdit(profile).catch(onError)}>
+          <IconButton
+            title={strings.showRemoteQr}
+            disabled={isBusy || !showRemoteActions || !(remote?.url || remote?.lan_url)}
+            tooltip={remoteQrDisabledTooltip}
+            onClick={() => {
+              if (remote) {
+                onShowRemoteQr(profile, remote);
+              }
+            }}
+          >
+            <QrCode className="w-3.5 h-3.5" />
+          </IconButton>
+          <IconButton
+            title={strings.editProfile(profile.name)}
+            disabled={isBusy}
+            tooltip={strings.saving}
+            onClick={() => onEdit(profile).catch(onError)}
+          >
             <Pencil className="w-3.5 h-3.5" />
           </IconButton>
           <IconButton
             title={strings.deleteProfile(profile.name)}
+            disabled={isBusy}
+            tooltip={strings.saving}
             className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
             onClick={() => onDelete(profile)}
           >
@@ -3108,6 +3420,7 @@ function ProfileCard({
 
 type LaunchMenuButtonProps = {
   isRunning: boolean;
+  operationKind: WorkspaceOperationKind | null;
   options: RemoteLaunchOptions;
   onToggleProfile: () => Promise<void>;
   onOptionsChange: (options: Partial<RemoteLaunchOptions>) => void;
@@ -3116,6 +3429,7 @@ type LaunchMenuButtonProps = {
 
 function LaunchMenuButton({
   isRunning,
+  operationKind,
   options,
   onToggleProfile,
   onOptionsChange,
@@ -3125,6 +3439,11 @@ function LaunchMenuButton({
   const variant = isRunning ? "dangerOutline" : "success";
   const startRemote = options.startRemote;
   const startCloud = startRemote && options.startCloud;
+  const isBusy = operationKind !== null;
+  const isStarting = operationKind === "start";
+  const isStopping = operationKind === "stop";
+  const isSavingOptions = operationKind === "options";
+  const busyFallbackLabel = operationKind === "options" ? strings.saving : "";
 
   if (isRunning) {
     return (
@@ -3132,10 +3451,11 @@ function LaunchMenuButton({
         type="button"
         variant="dangerOutline"
         size="sm"
+        disabled={isBusy}
         onClick={() => onToggleProfile().catch(onError)}
       >
-        <Square className="w-3.5 h-3.5" />
-        {strings.stop}
+        {isBusy ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />}
+        {isStopping ? strings.stopping : busyFallbackLabel || strings.stop}
       </Button>
     );
   }
@@ -3147,10 +3467,11 @@ function LaunchMenuButton({
         variant={variant}
         size="sm"
         className="rounded-r-none"
+        disabled={isBusy}
         onClick={() => onToggleProfile().catch(onError)}
       >
-        <Play className="w-3.5 h-3.5" />
-        {strings.start}
+        {isBusy ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+        {isStarting ? strings.starting : busyFallbackLabel || strings.start}
       </Button>
 
       <DropdownMenu>
@@ -3161,8 +3482,13 @@ function LaunchMenuButton({
             size="sm"
             className="rounded-l-none px-2"
             title={strings.launchOptions}
+            disabled={isBusy}
           >
-            <ChevronDown className="w-3.5 h-3.5" />
+            {isSavingOptions ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <ChevronDown className="w-3.5 h-3.5" />
+            )}
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="w-60">
@@ -3180,6 +3506,7 @@ function LaunchMenuButton({
             </div>
             <Switch
               checked={startRemote}
+              disabled={isBusy}
               aria-label={strings.startRemoteWithInstance}
               onCheckedChange={(checked) => onOptionsChange({ startRemote: checked === true })}
             />
@@ -3197,6 +3524,7 @@ function LaunchMenuButton({
               </div>
               <Switch
                 checked={startCloud}
+                disabled={isBusy}
                 aria-label={strings.connectCloudRelay}
                 onCheckedChange={(checked) => onOptionsChange({ startCloud: checked === true })}
               />
@@ -3288,6 +3616,7 @@ function AppSettingsDialog({
   defaultProviders,
   profiles,
   appUpdateState,
+  initialSection,
   onClose,
   onSave,
   onSaveBotConfigs,
@@ -3307,6 +3636,7 @@ function AppSettingsDialog({
   defaultProviders: DefaultProviderProfile[];
   profiles: ProviderProfile[];
   appUpdateState: AppUpdateState;
+  initialSection: AppSettingsSection;
   onClose: () => void;
   onSave: (settings: {
     language: Language;
@@ -3324,7 +3654,7 @@ function AppSettingsDialog({
   onInstallAppUpdate: () => Promise<void>;
 }) {
   const strings = useAppStrings();
-  const [activeSection, setActiveSection] = useState<AppSettingsSection>("general");
+  const [activeSection, setActiveSection] = useState<AppSettingsSection>(initialSection);
   const [draftLanguage, setDraftLanguage] = useState<Language>(language);
   const [draftAppearance, setDraftAppearance] = useState<Appearance>(appearance);
   const [draftExtensions, setDraftExtensions] = useState<ExtensionSettings>(normalizeExtensionSettings(extensions));
@@ -3333,13 +3663,16 @@ function AppSettingsDialog({
   const [draftTranscribeModel, setDraftTranscribeModel] = useState(transcribeModel || DEFAULT_TRANSCRIBE_MODEL);
   const [draftBotConfigs, setDraftBotConfigs] = useState<SavedBotConfig[]>(normalizeSavedBotConfigs(botConfigs));
   const [botEditor, setBotEditor] = useState<{ mode: "add" | "edit"; config: SavedBotConfig | null } | null>(null);
+  const [pendingDeleteBotConfig, setPendingDeleteBotConfig] = useState<SavedBotConfig | null>(null);
   const [botSaving, setBotSaving] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [preparingExtensions, setPreparingExtensions] = useState(false);
+  const [discardSettingsConfirmOpen, setDiscardSettingsConfirmOpen] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [extensionStatuses, setExtensionStatuses] = useState<BuiltinExtensionStatus[]>([]);
   const [extensionError, setExtensionError] = useState("");
   const [gatewayForm, setGatewayForm] = useState<GatewayConfigForm | null>(null);
+  const [savedGatewayConfigSignature, setSavedGatewayConfigSignature] = useState<string | null>(null);
   const [gatewayError, setGatewayError] = useState("");
   const [usageViewMode, setUsageViewMode] = useState<GatewayUsageViewMode>("overview");
   const [usageOverviewSummary, setUsageOverviewSummary] = useState<GatewayUsageSummary | null>(null);
@@ -3401,7 +3734,9 @@ function AppSettingsDialog({
     try {
       setGatewayError("");
       const result = await invoke<GatewayConfigFile>("get_gateway_config");
-      setGatewayForm(gatewayFormFromConfig(result));
+      const nextForm = gatewayFormFromConfig(result);
+      setGatewayForm(nextForm);
+      setSavedGatewayConfigSignature(gatewayConfigFormSignature(nextForm));
     } catch (error) {
       setGatewayError(errorMessage(error));
     }
@@ -3501,7 +3836,70 @@ function AppSettingsDialog({
     }
   };
 
+  const settingsDraftChanged = useMemo(() => {
+    const currentTranscribeSettings = normalizeTranscribeSettings({
+      transcribeBaseUrl,
+      transcribeApiKey,
+      transcribeModel,
+    });
+    const draftTranscribeSettings = normalizeTranscribeSettings({
+      transcribeBaseUrl: draftTranscribeBaseUrl,
+      transcribeApiKey: draftTranscribeApiKey,
+      transcribeModel: draftTranscribeModel,
+    });
+    const draftGatewayConfigSignature = gatewayForm ? gatewayConfigFormSignatureOrNull(gatewayForm) : null;
+    const gatewayChanged =
+      gatewayEnabled &&
+      gatewayForm !== null &&
+      (draftGatewayConfigSignature === null ||
+        savedGatewayConfigSignature === null ||
+        draftGatewayConfigSignature !== savedGatewayConfigSignature);
+
+    return (
+      draftLanguage !== language ||
+      draftAppearance !== appearance ||
+      !extensionSettingsEqual(draftExtensions, extensions) ||
+      !transcribeSettingsEqual(draftTranscribeSettings, currentTranscribeSettings) ||
+      !savedBotConfigsEqual(draftBotConfigs, botConfigs) ||
+      gatewayChanged
+    );
+  }, [
+    appearance,
+    botConfigs,
+    draftAppearance,
+    draftBotConfigs,
+    draftExtensions,
+    draftLanguage,
+    draftTranscribeApiKey,
+    draftTranscribeBaseUrl,
+    draftTranscribeModel,
+    extensions,
+    gatewayEnabled,
+    gatewayForm,
+    language,
+    savedGatewayConfigSignature,
+    transcribeApiKey,
+    transcribeBaseUrl,
+    transcribeModel,
+  ]);
+
+  const settingsBusy = savingSettings || preparingExtensions || botSaving;
+  const requestSettingsClose = () => {
+    if (settingsBusy) {
+      return;
+    }
+    if (settingsDraftChanged) {
+      setDiscardSettingsConfirmOpen(true);
+      return;
+    }
+    onClose();
+  };
+
   const saveDraft = async () => {
+    if (!settingsDraftChanged) {
+      return;
+    }
+
     setSavingSettings(true);
     showToast(
       "loading",
@@ -3517,10 +3915,13 @@ function AppSettingsDialog({
         showToast("error", strings.invalidTranscribeApiUrl);
         return;
       }
+      let nextSavedGatewayConfigSignature: string | null = null;
       if (gatewayForm && gatewayEnabled) {
+        const nextGatewayConfig = gatewayConfigFromForm(gatewayForm);
         await invoke<GatewayConfigFile>("update_gateway_config", {
-          config: gatewayConfigFromForm(gatewayForm),
+          config: nextGatewayConfig,
         });
+        nextSavedGatewayConfigSignature = jsonSignature(nextGatewayConfig);
       }
       await onSave({
         appearance: draftAppearance,
@@ -3531,6 +3932,9 @@ function AppSettingsDialog({
         transcribeModel: transcribeSettings.transcribeModel,
         botConfigs: draftBotConfigs,
       });
+      if (nextSavedGatewayConfigSignature !== null) {
+        setSavedGatewayConfigSignature(nextSavedGatewayConfigSignature);
+      }
       if (activeSection === "extensions") {
         await loadBuiltinExtensions();
       }
@@ -3571,11 +3975,13 @@ function AppSettingsDialog({
 
   const deleteBotConfig = async (botConfig: SavedBotConfig) => {
     if (associatedWorkspaceProfiles(botConfig, profiles).length > 0) {
+      setPendingDeleteBotConfig(null);
       return;
     }
     setBotSaving(true);
     try {
       await persistBotConfigs(draftBotConfigs.filter((item) => item.id !== botConfig.id));
+      setPendingDeleteBotConfig(null);
       showToast("success", strings.saved);
     } catch (error) {
       showToast("error", `${strings.failed}: ${errorMessage(error)}`);
@@ -3622,7 +4028,7 @@ function AppSettingsDialog({
       open
       onOpenChange={(open) => {
         if (!open) {
-          onClose();
+          requestSettingsClose();
         }
       }}
     >
@@ -3632,8 +4038,10 @@ function AppSettingsDialog({
           usageFullscreenActive
             ? "h-[100dvh] w-[100dvw] grid-cols-[1fr] rounded-none border-0"
             : "h-[calc(100dvh-24px)] w-[calc(100dvw-24px)] grid-cols-[56px_minmax(0,1fr)] sm:h-[88dvh] sm:w-[92dvw] sm:grid-cols-[180px_minmax(0,1fr)] lg:h-[80vh] lg:w-[80vw] lg:grid-cols-[220px_minmax(0,1fr)]",
-        )}
-      >
+	        )}
+	        closeLabel={strings.close}
+	        showCloseButton={!settingsBusy}
+	      >
         {!usageFullscreenActive ? (
         <aside className="flex min-h-0 flex-col border-r border-border bg-muted/20">
           <div className="border-b border-border px-2 py-4 sm:px-4 lg:px-5">
@@ -3702,17 +4110,17 @@ function AppSettingsDialog({
         ) : null}
 
         <section className="flex min-h-0 min-w-0 flex-col">
-          <DialogHeader className="flex-row items-start justify-between gap-3 border-b border-border px-3 py-3 pr-14 sm:items-center sm:px-6 sm:py-4 sm:pr-16">
-            <div className="min-w-0">
+          <DialogHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border px-3 py-3 pr-14 sm:items-center sm:px-6 sm:py-4 sm:pr-16">
+            <div className="min-w-0 flex-1 basis-full sm:basis-0">
               <DialogTitle className="text-base">{sectionTitle}</DialogTitle>
               <DialogDescription>{sectionDescription}</DialogDescription>
             </div>
             {activeSection === "extensions" ? (
-              <div className="flex shrink-0 items-center gap-2">
+              <div className="flex min-w-0 max-w-full items-center gap-2">
                 {preparingExtensions ? (
                   <RefreshCw className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
                 ) : null}
-                <span className="text-sm text-muted-foreground">{strings.enableExtensions}</span>
+                <span className="min-w-0 text-sm text-muted-foreground">{strings.enableExtensions}</span>
                 <Switch
                   checked={draftExtensions.enabled}
                   disabled={preparingExtensions || savingSettings}
@@ -3721,7 +4129,13 @@ function AppSettingsDialog({
                 />
               </div>
             ) : activeSection === "bot" ? (
-              <Button type="button" size="sm" onClick={() => setBotEditor({ mode: "add", config: null })}>
+              <Button
+                type="button"
+                size="sm"
+                className="max-w-full"
+                disabled={botSaving}
+                onClick={() => setBotEditor({ mode: "add", config: null })}
+              >
                 <Plus className="h-4 w-4" />
                 {strings.addBot}
               </Button>
@@ -3730,6 +4144,7 @@ function AppSettingsDialog({
                 type="button"
                 variant="outline"
                 size="sm"
+                className="max-w-full"
                 onClick={() =>
                   setUsageViewMode((current) => (current === "overview" ? "details" : "overview"))
                 }
@@ -3752,7 +4167,7 @@ function AppSettingsDialog({
           >
             {activeSection === "general" ? (
               <div className="max-w-2xl space-y-7">
-                <div className="grid grid-cols-[180px_1fr] items-start gap-6">
+                <div className="grid grid-cols-1 items-start gap-2 sm:grid-cols-[180px_minmax(0,1fr)] sm:gap-6">
                   <div className="flex items-center gap-2 pt-2 text-sm font-medium">
                     <Languages className="h-4 w-4 text-muted-foreground" />
                     {strings.language}
@@ -3770,7 +4185,7 @@ function AppSettingsDialog({
                   </div>
                 </div>
 
-                <div className="grid grid-cols-[180px_1fr] items-start gap-6">
+                <div className="grid grid-cols-1 items-start gap-2 sm:grid-cols-[180px_minmax(0,1fr)] sm:gap-6">
                   <div className="flex items-center gap-2 pt-2 text-sm font-medium">
                     <Palette className="h-4 w-4 text-muted-foreground" />
                     {strings.appearance}
@@ -3827,7 +4242,7 @@ function AppSettingsDialog({
               </div>
             ) : activeSection === "transcribe" ? (
               <div className="max-w-2xl space-y-7">
-                <div className="grid grid-cols-[180px_1fr] items-start gap-6">
+                <div className="grid grid-cols-1 items-start gap-2 sm:grid-cols-[180px_minmax(0,1fr)] sm:gap-6">
                   <div className="flex items-center gap-2 pt-2 text-sm font-medium">
                     <Server className="h-4 w-4 text-muted-foreground" />
                     {strings.transcribeApiUrl}
@@ -3845,7 +4260,7 @@ function AppSettingsDialog({
                   </div>
                 </div>
 
-                <div className="grid grid-cols-[180px_1fr] items-start gap-6">
+                <div className="grid grid-cols-1 items-start gap-2 sm:grid-cols-[180px_minmax(0,1fr)] sm:gap-6">
                   <div className="flex items-center gap-2 pt-2 text-sm font-medium">
                     <LockKeyhole className="h-4 w-4 text-muted-foreground" />
                     {strings.transcribeApiKey}
@@ -3864,7 +4279,7 @@ function AppSettingsDialog({
                   </div>
                 </div>
 
-                <div className="grid grid-cols-[180px_1fr] items-start gap-6">
+                <div className="grid grid-cols-1 items-start gap-2 sm:grid-cols-[180px_minmax(0,1fr)] sm:gap-6">
                   <div className="flex items-center gap-2 pt-2 text-sm font-medium">
                     <Mic className="h-4 w-4 text-muted-foreground" />
                     {strings.transcribeModel}
@@ -3894,9 +4309,10 @@ function AppSettingsDialog({
               <BotSettingsPanel
                 botConfigs={draftBotConfigs}
                 profiles={profiles}
+                saving={botSaving}
                 strings={strings}
                 onEditBotConfig={(config) => setBotEditor({ mode: "edit", config })}
-                onDeleteBotConfig={(config) => void deleteBotConfig(config)}
+                onDeleteBotConfig={(config) => setPendingDeleteBotConfig(config)}
               />
             ) : activeSection === "gateway" ? (
               <GatewaySettingsPanel
@@ -3945,16 +4361,16 @@ function AppSettingsDialog({
           </div>
 
           {!usageFullscreenActive ? (
-          <DialogFooter className="border-t border-border px-6 py-4">
-            <Button
-              type="button"
-              disabled={savingSettings || preparingExtensions}
-              onClick={saveDraft}
-            >
-              {savingSettings ? <RefreshCw className="h-4 w-4 animate-spin" /> : null}
-              {strings.save}
-            </Button>
-          </DialogFooter>
+            <DialogFooter className="border-t border-border px-6 py-4">
+              <Button
+                type="button"
+                disabled={settingsBusy || !settingsDraftChanged}
+                onClick={saveDraft}
+              >
+                {savingSettings ? <RefreshCw className="h-4 w-4 animate-spin" /> : null}
+                {strings.save}
+              </Button>
+            </DialogFooter>
           ) : null}
         </section>
         {toast ? <SettingsToast toast={toast} /> : null}
@@ -3968,6 +4384,60 @@ function AppSettingsDialog({
             onSave={(config) => saveBotConfig(config)}
           />
         ) : null}
+        {pendingDeleteBotConfig ? (
+          <AlertDialog
+            open
+            onOpenChange={(open) => {
+              if (!open && !botSaving) {
+                setPendingDeleteBotConfig(null);
+              }
+            }}
+          >
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>{strings.deleteBot}</AlertDialogTitle>
+                <AlertDialogDescription>
+                  {strings.deleteBotConfirm(pendingDeleteBotConfig.name || strings.bot)}
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel disabled={botSaving} onClick={() => setPendingDeleteBotConfig(null)}>
+                  {strings.cancel}
+                </AlertDialogCancel>
+                <Button
+                  type="button"
+                  variant="destructive"
+                  disabled={botSaving}
+                  onClick={() => deleteBotConfig(pendingDeleteBotConfig).catch(console.error)}
+                >
+                  {botSaving ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : null}
+                  {botSaving ? strings.deleting : strings.delete}
+                </Button>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        ) : null}
+        <AlertDialog open={discardSettingsConfirmOpen} onOpenChange={setDiscardSettingsConfirmOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{strings.discardSettingsChangesTitle}</AlertDialogTitle>
+              <AlertDialogDescription>{strings.discardSettingsChangesDescription}</AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>{strings.cancel}</AlertDialogCancel>
+              <Button
+                type="button"
+                variant="destructive"
+                onClick={() => {
+                  setDiscardSettingsConfirmOpen(false);
+                  onClose();
+                }}
+              >
+                {strings.discardChanges}
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </DialogContent>
     </Dialog>
   );
@@ -4043,15 +4513,63 @@ function ProfileSettingsPanel({
     [defaultProviders],
   );
   const [dialog, setDialog] = useState<DefaultProviderDialogState | null>(null);
+  const [pendingDeleteProfileConfig, setPendingDeleteProfileConfig] =
+    useState<DefaultProviderProfile | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
+  const [discardProfileDialogConfirmOpen, setDiscardProfileDialogConfirmOpen] = useState(false);
   const profileModelOptions = useProviderModelProbe(
     dialog?.profile.base_url ?? "",
     dialog?.profile.api_key ?? "",
     dialog !== null,
     dialog?.profile.provider_name ?? "",
   );
+  const profileDialogDirty =
+    dialog !== null &&
+    defaultProviderProfileDraftSignature(dialog.profile) !== dialog.initialSignature;
+
+  const openAddProfileDialog = () => {
+    const profile = createDefaultProviderProfileForm();
+    setError("");
+    setShowApiKey(false);
+    setDiscardProfileDialogConfirmOpen(false);
+    setDialog({
+      mode: "add",
+      profile,
+      initialSignature: defaultProviderProfileDraftSignature(profile),
+    });
+  };
+
+  const openEditProfileDialog = (profile: DefaultProviderProfile) => {
+    const nextProfile = cloneDefaultProviderProfile(profile);
+    setError("");
+    setShowApiKey(false);
+    setDiscardProfileDialogConfirmOpen(false);
+    setDialog({
+      mode: "edit",
+      profile: nextProfile,
+      initialSignature: defaultProviderProfileDraftSignature(nextProfile),
+    });
+  };
+
+  const closeProfileDialog = () => {
+    setShowApiKey(false);
+    setDiscardProfileDialogConfirmOpen(false);
+    setDialog(null);
+    setError("");
+  };
+
+  const requestCloseProfileDialog = () => {
+    if (saving) {
+      return;
+    }
+    if (profileDialogDirty) {
+      setDiscardProfileDialogConfirmOpen(true);
+      return;
+    }
+    closeProfileDialog();
+  };
 
   const updateDialogProfile = (patch: Partial<DefaultProviderProfile>) =>
     setDialog((current) =>
@@ -4069,7 +4587,7 @@ function ProfileSettingsPanel({
     setError("");
     try {
       await onSaveProfile(normalizeDefaultProviderProfileForm(dialog.profile));
-      setDialog(null);
+      closeProfileDialog();
     } catch (error) {
       setError(errorMessage(error));
     } finally {
@@ -4077,16 +4595,19 @@ function ProfileSettingsPanel({
     }
   };
 
-  const deleteProfile = async (profile: DefaultProviderProfile) => {
-    const linkedWorkspace = workspaceProfilesUsingDefaultProvider(profile, workspaceProfiles)[0];
+  const confirmDeleteProfileConfig = async () => {
+    if (!pendingDeleteProfileConfig) return;
+    const linkedWorkspace = workspaceProfilesUsingDefaultProvider(pendingDeleteProfileConfig, workspaceProfiles)[0];
     if (linkedWorkspace) {
       setError(strings.profileUsedByWorkspace(linkedWorkspace.name));
+      setPendingDeleteProfileConfig(null);
       return;
     }
     setSaving(true);
     setError("");
     try {
-      await onDeleteProfile(profile.name);
+      await onDeleteProfile(pendingDeleteProfileConfig.name);
+      setPendingDeleteProfileConfig(null);
     } catch (error) {
       setError(errorMessage(error));
     } finally {
@@ -4108,10 +4629,8 @@ function ProfileSettingsPanel({
           type="button"
           variant="outline"
           size="sm"
-          onClick={() => {
-            setShowApiKey(false);
-            setDialog({ mode: "add", profile: createDefaultProviderProfileForm() });
-          }}
+          disabled={saving}
+          onClick={openAddProfileDialog}
         >
           <Plus className="h-4 w-4" />
           {strings.addProfileConfig}
@@ -4139,10 +4658,8 @@ function ProfileSettingsPanel({
                   <div className="flex items-center justify-end gap-2">
                     <IconButton
                       title={strings.editProfileConfig}
-                      onClick={() => {
-                        setShowApiKey(false);
-                        setDialog({ mode: "edit", profile: cloneDefaultProviderProfile(profile) });
-                      }}
+                      disabled={saving}
+                      onClick={() => openEditProfileDialog(profile)}
                     >
                       <Pencil className="h-4 w-4" />
                     </IconButton>
@@ -4159,7 +4676,10 @@ function ProfileSettingsPanel({
                       }
                       disabled={deleteDisabled || saving}
                       className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
-                      onClick={() => deleteProfile(profile).catch(console.error)}
+                      onClick={() => {
+                        setError("");
+                        setPendingDeleteProfileConfig(profile);
+                      }}
                     >
                       <Trash2 className="h-4 w-4" />
                     </IconButton>
@@ -4179,20 +4699,19 @@ function ProfileSettingsPanel({
         open={dialog !== null}
         onOpenChange={(open) => {
           if (!open) {
-            setShowApiKey(false);
-            setDialog(null);
+            requestCloseProfileDialog();
           }
         }}
       >
         {dialog ? (
-          <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+          <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto" closeLabel={strings.close} showCloseButton={!saving}>
             <DialogHeader>
               <DialogTitle>
                 {dialog.mode === "add" ? strings.addProfileConfig : strings.editProfileConfig}
               </DialogTitle>
               <DialogDescription className="sr-only">{strings.profileSettingsDescription}</DialogDescription>
             </DialogHeader>
-            <div className="grid gap-4">
+            <fieldset className="grid gap-4" disabled={saving}>
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="flex flex-col gap-1.5">
                   <Label htmlFor="defaultProfileNameInput">{strings.providerProfileName}</Label>
@@ -4267,9 +4786,9 @@ function ProfileSettingsPanel({
                   />
                 </div>
               </div>
-            </div>
+            </fieldset>
             <DialogFooter>
-              <Button type="button" variant="outline" disabled={saving} onClick={() => setDialog(null)}>
+              <Button type="button" variant="outline" disabled={saving} onClick={requestCloseProfileDialog}>
                 {strings.cancel}
               </Button>
               <Button type="button" disabled={saving} onClick={() => saveDialogProfile().catch(console.error)}>
@@ -4280,6 +4799,65 @@ function ProfileSettingsPanel({
           </DialogContent>
         ) : null}
       </Dialog>
+      <AlertDialog open={discardProfileDialogConfirmOpen} onOpenChange={setDiscardProfileDialogConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{strings.discardSettingsChangesTitle}</AlertDialogTitle>
+            <AlertDialogDescription>{strings.discardSettingsChangesDescription}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{strings.cancel}</AlertDialogCancel>
+            <Button type="button" variant="destructive" onClick={closeProfileDialog}>
+              {strings.discardChanges}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      {pendingDeleteProfileConfig ? (
+        <AlertDialog
+          open
+          onOpenChange={(open) => {
+            if (!open && !saving) {
+              setPendingDeleteProfileConfig(null);
+              setError("");
+            }
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{strings.deleteProfileConfig}</AlertDialogTitle>
+              <AlertDialogDescription>
+                {strings.deleteProfileConfigConfirm(pendingDeleteProfileConfig.name)}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            {error ? (
+              <p className="rounded-md border border-destructive/50 bg-destructive/12 px-3 py-2.5 text-sm leading-relaxed text-red-300">
+                {error}
+              </p>
+            ) : null}
+            <AlertDialogFooter>
+              <AlertDialogCancel
+                disabled={saving}
+                onClick={() => {
+                  setPendingDeleteProfileConfig(null);
+                  setError("");
+                }}
+              >
+                {strings.cancel}
+              </AlertDialogCancel>
+              <Button
+                type="button"
+                variant="destructive"
+                disabled={saving}
+                onClick={() => confirmDeleteProfileConfig().catch(console.error)}
+              >
+                {saving ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : null}
+                {saving ? strings.deleting : strings.delete}
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      ) : null}
     </div>
   );
 }
@@ -4287,12 +4865,14 @@ function ProfileSettingsPanel({
 function BotSettingsPanel({
   botConfigs,
   profiles,
+  saving,
   strings,
   onEditBotConfig,
   onDeleteBotConfig,
 }: {
   botConfigs: SavedBotConfig[];
   profiles: ProviderProfile[];
+  saving: boolean;
   strings: AppStrings;
   onEditBotConfig: (config: SavedBotConfig) => void;
   onDeleteBotConfig: (config: SavedBotConfig) => void;
@@ -4330,13 +4910,13 @@ function BotSettingsPanel({
                     </div>
                   </div>
                   <div className="flex items-center justify-end gap-2">
-                    <IconButton title={strings.editBot} onClick={() => onEditBotConfig(config)}>
+                    <IconButton title={strings.editBot} disabled={saving} onClick={() => onEditBotConfig(config)}>
                       <Pencil className="h-4 w-4" />
                     </IconButton>
                     <IconButton
                       title={deleteDisabled ? strings.botLinkedToWorkspace : strings.deleteBot}
                       tooltip={deleteDisabled ? strings.botLinkedToWorkspace : undefined}
-                      disabled={deleteDisabled}
+                      disabled={saving || deleteDisabled}
                       className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
                       onClick={() => onDeleteBotConfig(config)}
                     >
@@ -4373,13 +4953,26 @@ function BotConfigDialog({
   onSave: (config: SavedBotConfig) => Promise<void>;
 }) {
   const nameRef = useRef<HTMLInputElement>(null);
+  const initialFormSignatureRef = useRef(botConfigDraftSignature(botConfigFormFields(config)));
   const [form, setForm] = useState<ProviderForm>(() => botConfigFormFields(config));
   const [error, setError] = useState("");
+  const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
   const botAuthType = normalizeBotAuthType(form.botPlatform, form.botAuthType);
   const botAuthSpecs = authSpecsForPlatform(form.botPlatform);
   const botAuthFields = fieldsForBotAuth(form.botPlatform, botAuthType);
+  const dirty = botConfigDraftSignature(form) !== initialFormSignatureRef.current;
 
   const showError = (nextError: unknown) => setError(errorMessage(nextError));
+  const requestClose = () => {
+    if (saving) {
+      return;
+    }
+    if (dirty) {
+      setDiscardConfirmOpen(true);
+      return;
+    }
+    onClose();
+  };
 
   const save = async () => {
     setError("");
@@ -4391,8 +4984,8 @@ function BotConfigDialog({
   };
 
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+    <Dialog open onOpenChange={(open) => !open && requestClose()}>
+      <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto" closeLabel={strings.close} showCloseButton={!saving}>
         <DialogHeader>
           <DialogTitle>{mode === "add" ? strings.addBot : strings.editBot}</DialogTitle>
           <DialogDescription className="sr-only">{strings.botSettingsDescription}</DialogDescription>
@@ -4402,7 +4995,7 @@ function BotConfigDialog({
             {error}
           </p>
         ) : null}
-        <div className="grid gap-4">
+        <fieldset className="grid gap-4" disabled={saving}>
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="botConfigNameInput">{strings.name}</Label>
             <Input
@@ -4419,6 +5012,7 @@ function BotConfigDialog({
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="botConfigPlatformSelect">{strings.platform}</Label>
               <Select
+                disabled={saving}
                 value={form.botPlatform}
                 onValueChange={(value) =>
                   setForm((current) => {
@@ -4453,6 +5047,7 @@ function BotConfigDialog({
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="botConfigAuthTypeSelect">{strings.authMethod}</Label>
                 <Select
+                  disabled={saving}
                   value={botAuthType}
                   onValueChange={(value) =>
                     setForm((current) => {
@@ -4519,15 +5114,37 @@ function BotConfigDialog({
               ))}
             </div>
           ) : null}
-        </div>
+        </fieldset>
         <DialogFooter>
-          <Button type="button" variant="outline" onClick={onClose}>
+          <Button type="button" variant="outline" disabled={saving} onClick={requestClose}>
             {strings.cancel}
           </Button>
           <Button type="button" disabled={saving} onClick={() => save().catch(showError)}>
+            {saving ? <RefreshCw className="h-4 w-4 animate-spin" /> : null}
             {strings.save}
           </Button>
         </DialogFooter>
+        <AlertDialog open={discardConfirmOpen} onOpenChange={setDiscardConfirmOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{strings.discardSettingsChangesTitle}</AlertDialogTitle>
+              <AlertDialogDescription>{strings.discardSettingsChangesDescription}</AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>{strings.cancel}</AlertDialogCancel>
+              <Button
+                type="button"
+                variant="destructive"
+                onClick={() => {
+                  setDiscardConfirmOpen(false);
+                  onClose();
+                }}
+              >
+                {strings.discardChanges}
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </DialogContent>
     </Dialog>
   );
@@ -4631,22 +5248,22 @@ function AppUpdatePanel({
 
         {update ? (
           <div className="mt-4 grid gap-3 border-t border-border pt-4 text-sm">
-            <div className="grid grid-cols-[140px_1fr] gap-3">
+            <div className="grid grid-cols-1 gap-1 sm:grid-cols-[140px_minmax(0,1fr)] sm:gap-3">
               <span className="text-muted-foreground">{strings.updateCurrentVersion}</span>
               <span className="font-medium">{update.currentVersion}</span>
             </div>
-            <div className="grid grid-cols-[140px_1fr] gap-3">
+            <div className="grid grid-cols-1 gap-1 sm:grid-cols-[140px_minmax(0,1fr)] sm:gap-3">
               <span className="text-muted-foreground">{strings.updateNewVersion}</span>
               <span className="font-medium">{update.version}</span>
             </div>
             {update.date ? (
-              <div className="grid grid-cols-[140px_1fr] gap-3">
+              <div className="grid grid-cols-1 gap-1 sm:grid-cols-[140px_minmax(0,1fr)] sm:gap-3">
                 <span className="text-muted-foreground">{strings.updatePublishedAt}</span>
                 <span>{update.date}</span>
               </div>
             ) : null}
             {update.body ? (
-              <div className="grid grid-cols-[140px_1fr] gap-3">
+              <div className="grid grid-cols-1 gap-1 sm:grid-cols-[140px_minmax(0,1fr)] sm:gap-3">
                 <span className="text-muted-foreground">{strings.updateReleaseNotes}</span>
                 <p className="whitespace-pre-wrap leading-relaxed">{update.body}</p>
               </div>
@@ -4710,6 +5327,8 @@ function GatewaySettingsPanel({
   const [mcpServerDialog, setMcpServerDialog] = useState<GatewayMcpServerDialogState | null>(null);
   const [virtualProfileDialog, setVirtualProfileDialog] =
     useState<GatewayVirtualProfileDialogState | null>(null);
+  const [pendingGatewayDialogClose, setPendingGatewayDialogClose] =
+    useState<null | "provider" | "mcp" | "virtual">(null);
   const [activeGatewayTab, setActiveGatewayTab] = useState<GatewaySettingsTab>("settings");
   const [availableTools, setAvailableTools] = useState<GatewayAvailableTool[]>([]);
   const [availableToolsLoading, setAvailableToolsLoading] = useState(false);
@@ -4757,16 +5376,22 @@ function GatewaySettingsPanel({
 
   const update = (patch: Partial<GatewayConfigForm>) =>
     onChange((current) => (current ? { ...current, ...patch } : current));
-  const openAddProviderDialog = () =>
+  const openAddProviderDialog = () => {
+    const provider = createGatewayProviderForm();
     setProviderDialog({
       mode: "add",
-      provider: createGatewayProviderForm(),
+      provider,
+      initialSignature: gatewayProviderDraftSignature(provider),
     });
-  const openEditProviderDialog = (provider: GatewayProviderForm) =>
+  };
+  const openEditProviderDialog = (provider: GatewayProviderForm) => {
+    const nextProvider = cloneGatewayProviderForm(provider);
     setProviderDialog({
       mode: "edit",
-      provider: cloneGatewayProviderForm(provider),
+      provider: nextProvider,
+      initialSignature: gatewayProviderDraftSignature(nextProvider),
     });
+  };
   const updateDialogProvider = (patch: Partial<GatewayProviderForm>) =>
     setProviderDialog((current) =>
       current
@@ -4776,16 +5401,25 @@ function GatewaySettingsPanel({
           }
         : current,
     );
-  const openAddMcpServerDialog = () =>
+  const requestDeleteProvider = (provider: GatewayProviderForm) => {
+    update({ providers: form.providers.filter((item) => item.id !== provider.id) });
+  };
+  const openAddMcpServerDialog = () => {
+    const server = createGatewayMcpServerForm();
     setMcpServerDialog({
       mode: "add",
-      server: createGatewayMcpServerForm(),
+      server,
+      initialSignature: gatewayMcpServerDraftSignature(server),
     });
-  const openEditMcpServerDialog = (server: GatewayMcpServerForm) =>
+  };
+  const openEditMcpServerDialog = (server: GatewayMcpServerForm) => {
+    const nextServer = cloneGatewayMcpServerForm(server);
     setMcpServerDialog({
       mode: "edit",
-      server: cloneGatewayMcpServerForm(server),
+      server: nextServer,
+      initialSignature: gatewayMcpServerDraftSignature(nextServer),
     });
+  };
   const updateDialogMcpServer = (patch: Partial<GatewayMcpServerForm>) =>
     setMcpServerDialog((current) =>
       current
@@ -4795,16 +5429,26 @@ function GatewaySettingsPanel({
           }
         : current,
     );
-  const openAddVirtualProfileDialog = () =>
+  const requestDeleteMcpServer = (server: GatewayMcpServerForm) => {
+    setAvailableToolsLoaded(false);
+    update({ mcpServers: form.mcpServers.filter((item) => item.id !== server.id) });
+  };
+  const openAddVirtualProfileDialog = () => {
+    const profile = createGatewayVirtualProfileForm(availableTools);
     setVirtualProfileDialog({
       mode: "add",
-      profile: createGatewayVirtualProfileForm(availableTools),
+      profile,
+      initialSignature: gatewayVirtualProfileDraftSignature(profile),
     });
-  const openEditVirtualProfileDialog = (profile: GatewayVirtualProfileForm) =>
+  };
+  const openEditVirtualProfileDialog = (profile: GatewayVirtualProfileForm) => {
+    const nextProfile = cloneGatewayVirtualProfileForm(profile);
     setVirtualProfileDialog({
       mode: "edit",
-      profile: cloneGatewayVirtualProfileForm(profile),
+      profile: nextProfile,
+      initialSignature: gatewayVirtualProfileDraftSignature(nextProfile),
     });
+  };
   const updateDialogVirtualProfile = (patch: Partial<GatewayVirtualProfileForm>) =>
     setVirtualProfileDialog((current) =>
       current
@@ -4814,8 +5458,64 @@ function GatewaySettingsPanel({
           }
         : current,
     );
+  const requestDeleteVirtualProfile = (profile: GatewayVirtualProfileForm) => {
+    update({
+      virtualModelProfiles: form.virtualModelProfiles.filter((item) => item.id !== profile.id),
+    });
+  };
+  const providerDialogError = providerDialog
+    ? gatewayProviderDialogError(providerDialog.provider, strings)
+    : "";
+  const mcpServerDialogError = mcpServerDialog
+    ? gatewayMcpServerDialogError(mcpServerDialog.server, strings)
+    : "";
+  const virtualProfileDialogError = virtualProfileDialog
+    ? gatewayVirtualProfileDialogError(virtualProfileDialog.profile, strings)
+    : "";
+  const providerDialogDirty =
+    providerDialog !== null &&
+    gatewayProviderDraftSignature(providerDialog.provider) !== providerDialog.initialSignature;
+  const mcpServerDialogDirty =
+    mcpServerDialog !== null &&
+    gatewayMcpServerDraftSignature(mcpServerDialog.server) !== mcpServerDialog.initialSignature;
+  const virtualProfileDialogDirty =
+    virtualProfileDialog !== null &&
+    gatewayVirtualProfileDraftSignature(virtualProfileDialog.profile) !==
+      virtualProfileDialog.initialSignature;
+  const requestCloseGatewayProviderDialog = () => {
+    if (providerDialogDirty) {
+      setPendingGatewayDialogClose("provider");
+      return;
+    }
+    setProviderDialog(null);
+  };
+  const requestCloseGatewayMcpServerDialog = () => {
+    if (mcpServerDialogDirty) {
+      setPendingGatewayDialogClose("mcp");
+      return;
+    }
+    setMcpServerDialog(null);
+  };
+  const requestCloseGatewayVirtualProfileDialog = () => {
+    if (virtualProfileDialogDirty) {
+      setPendingGatewayDialogClose("virtual");
+      return;
+    }
+    setVirtualProfileDialog(null);
+  };
+  const discardPendingGatewayDialogChanges = () => {
+    if (pendingGatewayDialogClose === "provider") {
+      setProviderDialog(null);
+    } else if (pendingGatewayDialogClose === "mcp") {
+      setMcpServerDialog(null);
+    } else if (pendingGatewayDialogClose === "virtual") {
+      setVirtualProfileDialog(null);
+    }
+    setPendingGatewayDialogClose(null);
+  };
   const saveProviderDialog = () => {
     if (!providerDialog) return;
+    if (providerDialogError) return;
 
     const nextProvider = cloneGatewayProviderForm(providerDialog.provider);
     onChange((current) => {
@@ -4839,6 +5539,7 @@ function GatewaySettingsPanel({
   };
   const saveMcpServerDialog = () => {
     if (!mcpServerDialog) return;
+    if (mcpServerDialogError) return;
 
     const nextServer = cloneGatewayMcpServerForm(mcpServerDialog.server);
     onChange((current) => {
@@ -4863,6 +5564,7 @@ function GatewaySettingsPanel({
   };
   const saveVirtualProfileDialog = () => {
     if (!virtualProfileDialog) return;
+    if (virtualProfileDialogError) return;
 
     const nextProfile = cloneGatewayVirtualProfileForm(virtualProfileDialog.profile);
     onChange((current) => {
@@ -5001,7 +5703,7 @@ function GatewaySettingsPanel({
                     <IconButton
                       title={strings.delete}
                       className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
-                      onClick={() => update({ providers: form.providers.filter((item) => item.id !== provider.id) })}
+                      onClick={() => requestDeleteProvider(provider)}
                     >
                       <Trash2 className="h-4 w-4" />
                     </IconButton>
@@ -5063,10 +5765,7 @@ function GatewaySettingsPanel({
                     <IconButton
                       title={strings.delete}
                       className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
-                      onClick={() => {
-                        setAvailableToolsLoaded(false);
-                        update({ mcpServers: form.mcpServers.filter((item) => item.id !== server.id) });
-                      }}
+                      onClick={() => requestDeleteMcpServer(server)}
                     >
                       <Trash2 className="h-4 w-4" />
                     </IconButton>
@@ -5121,11 +5820,7 @@ function GatewaySettingsPanel({
                     <IconButton
                       title={strings.delete}
                       className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
-                      onClick={() =>
-                        update({
-                          virtualModelProfiles: form.virtualModelProfiles.filter((item) => item.id !== profile.id),
-                        })
-                      }
+                      onClick={() => requestDeleteVirtualProfile(profile)}
                     >
                       <Trash2 className="h-4 w-4" />
                     </IconButton>
@@ -5142,9 +5837,9 @@ function GatewaySettingsPanel({
         </section>
       ) : null}
 
-      <Dialog open={providerDialog !== null} onOpenChange={(open) => !open && setProviderDialog(null)}>
+      <Dialog open={providerDialog !== null} onOpenChange={(open) => !open && requestCloseGatewayProviderDialog()}>
         {providerDialog ? (
-          <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+          <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto" closeLabel={strings.close}>
             <DialogHeader>
               <DialogTitle>{providerDialog.mode === "add" ? strings.addProvider : strings.editProvider}</DialogTitle>
               <DialogDescription className="sr-only">{strings.providerDialogDescription}</DialogDescription>
@@ -5154,11 +5849,12 @@ function GatewaySettingsPanel({
               strings={strings}
               onChange={updateDialogProvider}
             />
+            {providerDialogError ? <GatewayDialogValidationMessage message={providerDialogError} /> : null}
             <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setProviderDialog(null)}>
+              <Button type="button" variant="outline" onClick={requestCloseGatewayProviderDialog}>
                 {strings.cancel}
               </Button>
-              <Button type="button" onClick={saveProviderDialog}>
+              <Button type="button" disabled={Boolean(providerDialogError)} onClick={saveProviderDialog}>
                 {strings.save}
               </Button>
             </DialogFooter>
@@ -5166,9 +5862,9 @@ function GatewaySettingsPanel({
         ) : null}
       </Dialog>
 
-      <Dialog open={mcpServerDialog !== null} onOpenChange={(open) => !open && setMcpServerDialog(null)}>
+      <Dialog open={mcpServerDialog !== null} onOpenChange={(open) => !open && requestCloseGatewayMcpServerDialog()}>
         {mcpServerDialog ? (
-          <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+          <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto" closeLabel={strings.close}>
             <DialogHeader>
               <DialogTitle>
                 {mcpServerDialog.mode === "add" ? strings.addMcpServer : strings.editMcpServer}
@@ -5180,11 +5876,12 @@ function GatewaySettingsPanel({
               strings={strings}
               onChange={updateDialogMcpServer}
             />
+            {mcpServerDialogError ? <GatewayDialogValidationMessage message={mcpServerDialogError} /> : null}
             <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setMcpServerDialog(null)}>
+              <Button type="button" variant="outline" onClick={requestCloseGatewayMcpServerDialog}>
                 {strings.cancel}
               </Button>
-              <Button type="button" onClick={saveMcpServerDialog}>
+              <Button type="button" disabled={Boolean(mcpServerDialogError)} onClick={saveMcpServerDialog}>
                 {strings.save}
               </Button>
             </DialogFooter>
@@ -5194,10 +5891,10 @@ function GatewaySettingsPanel({
 
       <Dialog
         open={virtualProfileDialog !== null}
-        onOpenChange={(open) => !open && setVirtualProfileDialog(null)}
+        onOpenChange={(open) => !open && requestCloseGatewayVirtualProfileDialog()}
       >
         {virtualProfileDialog ? (
-          <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
+          <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto" closeLabel={strings.close}>
             <DialogHeader>
               <DialogTitle>
                 {virtualProfileDialog.mode === "add"
@@ -5215,17 +5912,39 @@ function GatewaySettingsPanel({
               onChange={updateDialogVirtualProfile}
               onRefreshTools={loadGatewayTools}
             />
+            {virtualProfileDialogError ? <GatewayDialogValidationMessage message={virtualProfileDialogError} /> : null}
             <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setVirtualProfileDialog(null)}>
+              <Button type="button" variant="outline" onClick={requestCloseGatewayVirtualProfileDialog}>
                 {strings.cancel}
               </Button>
-              <Button type="button" onClick={saveVirtualProfileDialog}>
+              <Button type="button" disabled={Boolean(virtualProfileDialogError)} onClick={saveVirtualProfileDialog}>
                 {strings.save}
               </Button>
             </DialogFooter>
           </DialogContent>
         ) : null}
       </Dialog>
+      <AlertDialog
+        open={pendingGatewayDialogClose !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPendingGatewayDialogClose(null);
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{strings.discardSettingsChangesTitle}</AlertDialogTitle>
+            <AlertDialogDescription>{strings.discardSettingsChangesDescription}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{strings.cancel}</AlertDialogCancel>
+            <Button type="button" variant="destructive" onClick={discardPendingGatewayDialogChanges}>
+              {strings.discardChanges}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -6093,6 +6812,130 @@ function GatewayProviderSummaryField({ label, value }: { label: string; value: s
   );
 }
 
+function GatewayDialogValidationMessage({ message }: { message: string }) {
+  return (
+    <p className="rounded-md border border-destructive/50 bg-destructive/12 px-3 py-2.5 text-sm leading-relaxed text-red-300">
+      {message}
+    </p>
+  );
+}
+
+function gatewayProviderDraftSignature(provider: GatewayProviderForm): string {
+  return jsonSignature({
+    name: provider.name.trim(),
+    type: provider.type,
+    apiKey: provider.apiKey.trim(),
+    baseUrl: provider.baseUrl.trim(),
+    models: commaList(provider.models),
+    thinkingEffortModels: normalizeModelOptions(provider.thinkingEffortModels),
+  });
+}
+
+function gatewayMcpServerDraftSignature(server: GatewayMcpServerForm): string {
+  return jsonSignature({
+    name: server.name.trim(),
+    enabled: server.enabled,
+    transport: server.transport,
+    stdioMessageMode: server.stdioMessageMode,
+    command: server.command.trim(),
+    args: server.args.trim(),
+    cwd: server.cwd.trim(),
+    url: server.url.trim(),
+    headersJson: server.headersJson.trim(),
+    envJson: server.envJson.trim(),
+    apiKey: server.apiKey.trim(),
+    apiKeyEnv: server.apiKeyEnv.trim(),
+    protocolVersion: server.protocolVersion.trim(),
+    startupTimeoutMs: server.startupTimeoutMs.trim(),
+    requestTimeoutMs: server.requestTimeoutMs.trim(),
+  });
+}
+
+function gatewayVirtualProfileDraftSignature(profile: GatewayVirtualProfileForm): string {
+  return jsonSignature({
+    profileId: profile.profileId.trim(),
+    key: profile.key.trim(),
+    displayName: profile.displayName.trim(),
+    description: profile.description.trim(),
+    enabled: profile.enabled,
+    exactAliases: profile.exactAliases.trim(),
+    prefixes: profile.prefixes.trim(),
+    suffixes: profile.suffixes.trim(),
+    baseModelMode: profile.baseModelMode,
+    fixedModel: profile.fixedModel.trim(),
+    matchMultimodal: profile.matchMultimodal,
+    matchWebSearch: profile.matchWebSearch,
+    maxTurns: profile.maxTurns.trim(),
+    maxToolCalls: profile.maxToolCalls.trim(),
+    clientToolsPolicy: profile.clientToolsPolicy,
+    includeInGatewayModels: profile.includeInGatewayModels,
+    tools: profile.tools.map(gatewayVirtualToolDraftSignature),
+  });
+}
+
+function gatewayVirtualToolDraftSignature(tool: GatewayVirtualToolForm) {
+  return {
+    name: tool.name.trim(),
+    description: tool.description.trim(),
+    visibility: tool.visibility,
+    inputSchemaJson: tool.inputSchemaJson.trim(),
+  };
+}
+
+function gatewayProviderDialogError(provider: GatewayProviderForm, strings: AppStrings): string {
+  if (!provider.name.trim()) {
+    return strings.fieldRequired(strings.name);
+  }
+  if (!provider.baseUrl.trim()) {
+    return strings.fieldRequired(strings.baseUrl);
+  }
+  return "";
+}
+
+function gatewayMcpServerDialogError(server: GatewayMcpServerForm, strings: AppStrings): string {
+  if (!server.name.trim()) {
+    return strings.fieldRequired(strings.name);
+  }
+  if (server.transport === "websocket") {
+    if (!server.url.trim()) {
+      return strings.fieldRequired(strings.url);
+    }
+    try {
+      jsonObjectFromText(server.headersJson, strings.headersJson);
+    } catch (error) {
+      return errorMessage(error);
+    }
+    return "";
+  }
+
+  if (!server.command.trim()) {
+    return strings.fieldRequired(strings.command);
+  }
+  try {
+    jsonObjectFromText(server.envJson, strings.envJson);
+  } catch (error) {
+    return errorMessage(error);
+  }
+  return "";
+}
+
+function gatewayVirtualProfileDialogError(profile: GatewayVirtualProfileForm, strings: AppStrings): string {
+  if (!profile.key.trim()) {
+    return strings.fieldRequired(strings.profileKey);
+  }
+  if (
+    !profile.exactAliases.trim() &&
+    !profile.prefixes.trim() &&
+    !profile.suffixes.trim()
+  ) {
+    return strings.gatewayMatchRequired;
+  }
+  if (profile.baseModelMode === "fixed" && !profile.fixedModel.trim()) {
+    return strings.fieldRequired(strings.fixedModel);
+  }
+  return "";
+}
+
 function GatewayProviderEditor({
   provider,
   strings,
@@ -6927,6 +7770,7 @@ type SettingsDialogProps = {
   codexAppPath: string;
   settingsError: string;
   saveDisabled: boolean;
+  saving: boolean;
   editingProfileName: string | null;
   existingProviderSelectRef: React.RefObject<HTMLButtonElement | null>;
   workspaceNameInputRef: React.RefObject<HTMLInputElement | null>;
@@ -6954,6 +7798,7 @@ function SettingsDialog({
   codexAppPath,
   settingsError,
   saveDisabled,
+  saving,
   editingProfileName,
   existingProviderSelectRef,
   workspaceNameInputRef,
@@ -7023,7 +7868,21 @@ function SettingsDialog({
       : option.description;
   const [wifiScan, setWifiScan] = useState<BotHandoffScanState>(emptyHandoffScanState);
   const [bluetoothScan, setBluetoothScan] = useState<BotHandoffScanState>(emptyHandoffScanState);
+  const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
+  const initialFormSignatureRef = useRef(workspaceDialogDraftSignature(form, providerMode));
   const autoHandoffScanRef = useRef(false);
+  const dirty = workspaceDialogDraftSignature(form, providerMode) !== initialFormSignatureRef.current;
+
+  const requestClose = () => {
+    if (saving) {
+      return;
+    }
+    if (dirty) {
+      setDiscardConfirmOpen(true);
+      return;
+    }
+    onClose();
+  };
 
   const scanHandoffTargets = useCallback(async (kind: "wifi" | "bluetooth") => {
     const setScan = kind === "wifi" ? setWifiScan : setBluetoothScan;
@@ -7099,17 +7958,13 @@ function SettingsDialog({
       .then((result) => {
         if (cancelled) return;
         const versions = result.versions.map((version) => version.trim()).filter(Boolean);
-        const latest = result.latest.trim() || versions[0] || DEFAULT_CODEX_WEB_ASSET_VERSION;
         onSetForm((current) => {
-          const currentVersion = current.remoteWebAssetVersion.trim();
-          const nextVersion =
-            currentVersion && versions.includes(currentVersion)
-              ? currentVersion
-              : latest;
           return {
             ...current,
-            remoteWebAssetVersions: versions,
-            remoteWebAssetVersion: nextVersion,
+            remoteWebAssetVersions: codexWebAssetVersionOptions(
+              versions,
+              current.remoteWebAssetVersion,
+            ),
             remoteWebAssetVersionsLoading: false,
             remoteWebAssetRegistryError: "",
           };
@@ -7135,11 +7990,15 @@ function SettingsDialog({
       open
       onOpenChange={(open) => {
         if (!open) {
-          onClose();
+          requestClose();
         }
       }}
     >
-      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto" showCloseButton={false}>
+      <DialogContent
+        className="max-h-[90vh] max-w-2xl overflow-y-auto"
+        closeLabel={strings.close}
+        showCloseButton={!saving}
+      >
         <DialogHeader>
           <DialogTitle>
             {dialogMode === "edit" && editingProfileName ? strings.editProfile(editingProfileName) : strings.newProfile}
@@ -7165,7 +8024,6 @@ function SettingsDialog({
             }
           />
         </div>
-
         <div className="flex flex-col gap-1.5">
           <Label htmlFor="workspaceProxyInput">{strings.proxyUrl}</Label>
           <Input
@@ -7435,43 +8293,41 @@ function SettingsDialog({
         ) : null}
 
         {extensionsEnabled ? (
-          <div className="border-t border-border pt-4 flex flex-col gap-3.5">
-            <div className="flex items-center justify-between gap-4">
-              <div className="min-w-0">
-                <Label className="text-sm">{strings.bot}</Label>
-              </div>
+          <div className="rounded-md border border-border bg-muted/10">
+            <div className="flex items-center justify-between gap-4 px-3 py-3">
+              <span className="min-w-0">
+                <span className="block text-sm font-medium text-foreground">{strings.bot}</span>
+                <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
+                  {strings.botOptionsDescription}
+                </span>
+              </span>
               <Switch
                 checked={form.botEnabled}
                 aria-label={strings.enableBotIntegration}
                 onCheckedChange={(checked) =>
                   onSetForm((current) => {
                     const enabled = checked === true;
-                    const nextPlatform = enabled && current.botPlatform === "none" ? "weixin-ilink" : current.botPlatform;
+                    if (!enabled) {
+                      return {
+                        ...current,
+                        botEnabled: false,
+                      };
+                    }
+                    const nextPlatform = current.botPlatform === "none" ? "weixin-ilink" : current.botPlatform;
                     const nextAuthType = normalizeBotAuthType(nextPlatform, current.botAuthType);
                     return {
                       ...current,
-                      botEnabled: enabled,
+                      botEnabled: true,
                       botPlatform: nextPlatform,
                       botAuthType: nextAuthType,
-                      botAuthFields: enabled
-                        ? pickBotAuthFields(current.botAuthFields, nextPlatform, nextAuthType)
-                        : {},
-                      botConfigId: enabled ? current.botConfigId : "",
-                      botTenantId: enabled ? current.botTenantId : "",
-                      botIntegrationId: enabled ? current.botIntegrationId : "",
-                      botStateDir: enabled ? current.botStateDir : "",
-                      botStatus: enabled ? current.botStatus : "",
-                      botLastLoginAt: enabled ? current.botLastLoginAt : "",
-                      botForwardAllCodexMessages: enabled ? current.botForwardAllCodexMessages : false,
-                      botHandoffEnabled: enabled ? current.botHandoffEnabled : false,
+                      botAuthFields: pickBotAuthFields(current.botAuthFields, nextPlatform, nextAuthType),
                     };
                   })
                 }
               />
             </div>
-
             {form.botEnabled ? (
-              <div className="flex flex-col gap-3.5">
+              <div className="border-t border-border px-3 py-3 flex flex-col gap-3.5">
                 {availableBotConfigs.length > 0 ? (
                   <div className="flex flex-col gap-1.5">
                     <Label htmlFor="botSavedConfigSelect">{strings.savedBotConfig}</Label>
@@ -7700,18 +8556,41 @@ function SettingsDialog({
           <Button
             type="button"
             variant="outline"
-            onClick={onClose}
+            disabled={saving}
+            onClick={requestClose}
           >
             {strings.cancel}
           </Button>
           <Button
             type="button"
-            disabled={saveDisabled}
+            disabled={saveDisabled || saving}
             onClick={() => onSave().catch(console.error)}
           >
-            {dialogMode === "edit" ? strings.save : strings.createProfile}
+            {saving ? <RefreshCw className="h-4 w-4 animate-spin" /> : null}
+            {saving ? strings.saving : dialogMode === "edit" ? strings.save : strings.createProfile}
           </Button>
         </DialogFooter>
+        <AlertDialog open={discardConfirmOpen} onOpenChange={setDiscardConfirmOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{strings.discardSettingsChangesTitle}</AlertDialogTitle>
+              <AlertDialogDescription>{strings.discardSettingsChangesDescription}</AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>{strings.cancel}</AlertDialogCancel>
+              <Button
+                type="button"
+                variant="destructive"
+                onClick={() => {
+                  setDiscardConfirmOpen(false);
+                  onClose();
+                }}
+              >
+                {strings.discardChanges}
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </DialogContent>
     </Dialog>
   );
@@ -7844,6 +8723,7 @@ function handoffTargetMatchesSavedValue(target: BotHandoffScanTarget, savedValue
 type DeleteDialogProps = {
   profile: ProviderProfile;
   removeCodexHome: boolean;
+  busy: boolean;
   onRemoveCodexHomeChange: (remove: boolean) => void;
   onCancel: () => void;
   onConfirm: () => void;
@@ -7852,6 +8732,7 @@ type DeleteDialogProps = {
 function DeleteDialog({
   profile,
   removeCodexHome,
+  busy,
   onRemoveCodexHomeChange,
   onCancel,
   onConfirm,
@@ -7861,7 +8742,7 @@ function DeleteDialog({
     <AlertDialog
       open
       onOpenChange={(open) => {
-        if (!open) {
+        if (!open && !busy) {
           onCancel();
         }
       }}
@@ -7878,27 +8759,33 @@ function DeleteDialog({
             <Label className="flex items-center gap-3 cursor-pointer select-none text-foreground">
               <Checkbox
                 checked={removeCodexHome}
+                disabled={busy}
                 onCheckedChange={(checked) => onRemoveCodexHomeChange(checked === true)}
               />
               <span className="text-sm">{strings.alsoDeleteCodexHome}</span>
             </Label>
             {removeCodexHome ? (
-              <p className="text-xs text-muted-foreground font-mono bg-muted/50 rounded-md px-3 py-2">
-                {profile.codex_home}
-              </p>
+              <div className="grid gap-3">
+                <p className="text-xs text-muted-foreground font-mono bg-muted/50 rounded-md px-3 py-2">
+                  {profile.codex_home}
+                </p>
+              </div>
             ) : null}
           </>
         ) : null}
         <AlertDialogFooter>
-          <AlertDialogCancel onClick={onCancel}>
+          <AlertDialogCancel disabled={busy} onClick={onCancel}>
             {strings.cancel}
           </AlertDialogCancel>
-          <AlertDialogAction
-            className="bg-destructive text-white hover:bg-destructive/90"
+          <Button
+            type="button"
+            variant="destructive"
+            disabled={busy}
             onClick={onConfirm}
           >
+            {busy ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : null}
             {strings.delete}
-          </AlertDialogAction>
+          </Button>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
@@ -7937,7 +8824,7 @@ function RemotePasswordDialog({
 
   return (
     <Dialog open onOpenChange={(open) => !open && onCancel()}>
-      <DialogContent className="max-w-sm">
+      <DialogContent className="max-w-sm" closeLabel={strings.close}>
         <DialogHeader>
           <DialogTitle>{strings.endToEndEncryption}</DialogTitle>
           <DialogDescription>{strings.encryptionPasswordPrompt(profileName)}</DialogDescription>
@@ -8007,6 +8894,28 @@ function RemoteQrDialog({
   const strings = useAppStrings();
   const [copySucceeded, setCopySucceeded] = useState(false);
   const copyResetTimerRef = useRef<number | null>(null);
+  const urlOptions = useMemo(() => remoteQrUrlOptions(remoteQr.remote), [remoteQr.remote]);
+  const [selectedUrlKind, setSelectedUrlKind] = useState<RemoteQrUrlKind>(remoteQr.defaultUrlKind);
+  const selectedOption =
+    urlOptions.find((option) => option.kind === selectedUrlKind) ?? urlOptions[0] ?? null;
+  const selectedUrl = selectedOption?.url ?? "";
+  const selectedUrlLabel = selectedOption ? remoteQrUrlLabel(selectedOption.kind, strings) : strings.remoteUrl;
+  const qrUrl = useMemo(() => compactRemoteQrUrl(selectedUrl), [selectedUrl]);
+  const qrMarkup = useMemo(() => createQrSvg(qrUrl, { moduleSize: 5, quietZone: 4 }), [qrUrl]);
+
+  useEffect(() => {
+    if (!selectedOption && urlOptions[0]) {
+      setSelectedUrlKind(urlOptions[0].kind);
+    }
+  }, [selectedOption, urlOptions]);
+
+  useEffect(() => {
+    setCopySucceeded(false);
+    if (copyResetTimerRef.current !== null) {
+      window.clearTimeout(copyResetTimerRef.current);
+      copyResetTimerRef.current = null;
+    }
+  }, [selectedUrl]);
 
   useEffect(() => {
     return () => {
@@ -8018,7 +8927,7 @@ function RemoteQrDialog({
 
   const handleCopyUrl = useCallback(async () => {
     try {
-      await copyText(remoteQr.url);
+      await copyText(selectedUrl, strings.clipboardUnavailable);
       setCopySucceeded(true);
       if (copyResetTimerRef.current !== null) {
         window.clearTimeout(copyResetTimerRef.current);
@@ -8030,7 +8939,7 @@ function RemoteQrDialog({
     } catch (error) {
       onError(error);
     }
-  }, [onError, remoteQr.url]);
+  }, [onError, selectedUrl, strings.clipboardUnavailable]);
 
   return (
     <Dialog
@@ -8041,7 +8950,7 @@ function RemoteQrDialog({
         }
       }}
     >
-      <DialogContent className="max-w-md overflow-hidden p-0">
+      <DialogContent className="max-w-md overflow-hidden p-0" closeLabel={strings.close}>
         <DialogHeader className="border-b border-border px-5 py-4">
           <DialogTitle className="text-base">{strings.remoteQr}</DialogTitle>
           <DialogDescription>{remoteQr.profile.name}</DialogDescription>
@@ -8049,18 +8958,42 @@ function RemoteQrDialog({
         <div className="px-5 py-5 flex flex-col gap-4">
           <div
             className="mx-auto rounded-lg bg-white p-3 shadow-sm"
-            dangerouslySetInnerHTML={{ __html: remoteQr.markup }}
+            dangerouslySetInnerHTML={{ __html: qrMarkup }}
           />
           <div className="space-y-2">
-            <div className="text-[11px] font-semibold uppercase text-muted-foreground">{strings.lanUrl}</div>
-            <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs font-mono break-all">
-              {remoteQr.url}
+            {urlOptions.length > 1 ? (
+              <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-muted/30 p-1">
+                {urlOptions.map((option) => {
+                  const selected = option.kind === selectedOption?.kind;
+                  return (
+                    <button
+                      key={option.kind}
+                      type="button"
+                      aria-pressed={selected}
+                      className={cn(
+                        "h-8 rounded-[5px] px-2 text-xs font-medium text-muted-foreground transition-colors",
+                        selected ? "bg-background text-foreground shadow-sm" : "hover:bg-background/70 hover:text-foreground",
+                      )}
+                      onClick={() => setSelectedUrlKind(option.kind)}
+                    >
+                      {remoteQrUrlLabel(option.kind, strings)}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+            <div className="text-[11px] font-semibold uppercase text-muted-foreground">{selectedUrlLabel}</div>
+            <div className="rounded-md border border-border bg-muted/30 px-3 py-2">
+              <div className="min-w-0 break-all font-mono text-xs">
+                {selectedUrl}
+              </div>
             </div>
           </div>
           <div className="grid grid-cols-2 gap-2">
             <Button
               variant="outline"
               type="button"
+              disabled={!selectedUrl}
               onClick={handleCopyUrl}
             >
               {copySucceeded ? <CheckCircle2 className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
@@ -8068,7 +9001,8 @@ function RemoteQrDialog({
             </Button>
             <Button
               type="button"
-              onClick={() => openUrl(remoteQr.url).catch(onError)}
+              disabled={!selectedUrl}
+              onClick={() => openUrl(selectedUrl).catch(onError)}
             >
               <ExternalLink className="w-3.5 h-3.5" />
               {strings.open}
@@ -8116,7 +9050,7 @@ function WeixinBotQrDialog({
         }
       }}
     >
-      <DialogContent className="max-w-md overflow-hidden p-0">
+      <DialogContent className="max-w-md overflow-hidden p-0" closeLabel={strings.close}>
         <DialogHeader className="border-b border-border px-5 py-4">
           <DialogTitle className="text-base">{strings.weixinBotLogin}</DialogTitle>
           <DialogDescription>{login.profileName}</DialogDescription>
@@ -8581,11 +9515,51 @@ function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-async function copyText(text: string) {
-  if (!navigator.clipboard?.writeText) {
-    throw new Error("clipboard is not available");
+async function copyText(text: string, unavailableMessage = "clipboard is not available") {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall back to execCommand below for embedded WebViews and non-secure contexts.
+    }
   }
-  await navigator.clipboard.writeText(text);
+
+  if (copyTextWithHiddenSelection(text)) {
+    return;
+  }
+
+  throw new Error(unavailableMessage);
+}
+
+function copyTextWithHiddenSelection(text: string) {
+  if (!document?.body || typeof document.execCommand !== "function") {
+    return false;
+  }
+
+  const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.readOnly = true;
+  textarea.setAttribute("aria-hidden", "true");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  textarea.style.opacity = "0";
+
+  document.body.appendChild(textarea);
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch {
+    copied = false;
+  } finally {
+    document.body.removeChild(textarea);
+    activeElement?.focus();
+  }
+  return copied;
 }
 
 function normalizeRemoteFrontendMode(value: unknown): RemoteFrontendMode {
@@ -8610,10 +9584,43 @@ function remoteFrontendModeUsesCli(mode: RemoteFrontendMode | string) {
 }
 
 function remoteControlReadyForQr(remote: RemoteControlInfo | null) {
-  if (!remote?.running || !remote.url) {
+  if (!remote?.running || (!remote.url && !remote.lan_url)) {
     return false;
   }
   return remote.cdp_ready === true;
+}
+
+function remoteQrUrlOptions(remote: RemoteControlInfo): RemoteQrUrlOption[] {
+  const remoteUrl = typeof remote.url === "string" ? remote.url.trim() : "";
+  const lanUrl = typeof remote.lan_url === "string" ? remote.lan_url.trim() : "";
+  const preferredKind: RemoteQrUrlKind =
+    remote.connection_mode === "cloud" && remoteUrl ? "remote" : "lan";
+  const preferredFirst: RemoteQrUrlOption[] =
+    preferredKind === "remote"
+      ? [
+          { kind: "remote", url: remoteUrl },
+          { kind: "lan", url: lanUrl },
+        ]
+      : [
+          { kind: "lan", url: lanUrl },
+          { kind: "remote", url: remoteUrl },
+        ];
+  const seenUrls = new Set<string>();
+  const options: RemoteQrUrlOption[] = [];
+
+  for (const option of preferredFirst) {
+    if (!option.url || seenUrls.has(option.url)) {
+      continue;
+    }
+    seenUrls.add(option.url);
+    options.push(option);
+  }
+
+  return options;
+}
+
+function remoteQrUrlLabel(kind: RemoteQrUrlKind, strings: AppStrings) {
+  return kind === "remote" ? strings.remoteUrl : strings.lanUrl;
 }
 
 function compactRemoteQrUrl(value: string) {
@@ -8637,6 +9644,23 @@ function compactRemoteQrUrl(value: string) {
 
 function normalizeRegistryUrl(value: string) {
   return value.trim().replace(/\/+$/, "");
+}
+
+function codexWebAssetVersionOptions(versions: string[], currentVersion: string) {
+  const seen = new Set<string>();
+  const options: string[] = [];
+  for (const version of [
+    currentVersion.trim(),
+    DEFAULT_CODEX_WEB_ASSET_VERSION,
+    ...versions.map((item) => item.trim()),
+  ]) {
+    if (!version || seen.has(version)) {
+      continue;
+    }
+    seen.add(version);
+    options.push(version);
+  }
+  return options;
 }
 
 function defaultRemoteFrontendFormFields(codexAppPath: string): Partial<ProviderForm> {
@@ -9077,6 +10101,62 @@ function botConfigFormFields(config: SavedBotConfig | null): ProviderForm {
     botHandoffPhoneWifiTargets: "",
     botHandoffPhoneBluetoothTargets: "",
   };
+}
+
+function botConfigDraftSignature(form: ProviderForm): string {
+  const platform = normalizeBotPlatform(form.botPlatform);
+  const authType = normalizeBotAuthType(platform, form.botAuthType);
+  return jsonSignature({
+    name: form.workspaceName.trim(),
+    platform,
+    authType,
+    authFields: pickBotAuthFields(form.botAuthFields, platform, authType),
+  });
+}
+
+function workspaceDialogDraftSignature(form: ProviderForm, providerMode: ProviderMode): string {
+  const remoteFrontendMode = normalizeRemoteFrontendMode(form.remoteFrontendMode);
+  const botPlatform = form.botEnabled ? normalizeBotPlatform(form.botPlatform) : "none";
+  const botAuthType = normalizeBotAuthType(botPlatform, form.botAuthType);
+  return jsonSignature({
+    providerMode: remoteFrontendMode === "claude-code" ? "none" : providerMode,
+    workspaceName: form.workspaceName.trim(),
+    existingProfileName: form.existingProfileName.trim(),
+    existingBaseUrl: form.existingBaseUrl.trim(),
+    existingApiKey: form.existingApiKey.trim(),
+    existingModel: form.existingModel.trim(),
+    providerName: form.providerName.trim(),
+    providerBaseUrl: form.providerBaseUrl.trim(),
+    providerApiKey: form.providerApiKey.trim(),
+    providerModel: form.providerModel.trim(),
+    gatewayModel: form.gatewayModel.trim(),
+    proxyUrl: form.proxyUrl.trim(),
+    remoteFrontendMode,
+    remoteWebAssetRegistryUrl: normalizeRegistryUrl(form.remoteWebAssetRegistryUrl),
+    remoteWebAssetVersion: form.remoteWebAssetVersion.trim() || DEFAULT_CODEX_WEB_ASSET_VERSION,
+    botEnabled: form.botEnabled && botPlatform !== "none",
+    botPlatform,
+    botAuthType,
+    botAuthFields: pickBotAuthFields(form.botAuthFields, botPlatform, botAuthType),
+    botConfigId: form.botEnabled ? form.botConfigId.trim() : "",
+    botTenantId: form.botEnabled ? form.botTenantId.trim() : "",
+    botIntegrationId: form.botEnabled ? form.botIntegrationId.trim() : "",
+    botStateDir: form.botEnabled ? form.botStateDir.trim() : "",
+    botForwardAllCodexMessages: form.botEnabled && botPlatform !== "none" && form.botForwardAllCodexMessages,
+    botHandoffEnabled: form.botEnabled && botPlatform !== "none" && form.botHandoffEnabled,
+    botHandoffIdleSeconds:
+      form.botEnabled && botPlatform !== "none" && form.botHandoffEnabled
+        ? form.botHandoffIdleSeconds.trim()
+        : "",
+    botHandoffPhoneWifiTargets:
+      form.botEnabled && botPlatform !== "none" && form.botHandoffEnabled
+        ? firstTarget(form.botHandoffPhoneWifiTargets)
+        : "",
+    botHandoffPhoneBluetoothTargets:
+      form.botEnabled && botPlatform !== "none" && form.botHandoffEnabled
+        ? firstTarget(form.botHandoffPhoneBluetoothTargets)
+        : "",
+  });
 }
 
 function readSavedBotConfigForm(
@@ -9619,6 +10699,18 @@ function gatewayConfigFromForm(form: GatewayConfigForm): JsonObject {
   config.virtualModelProfiles = form.virtualModelProfiles.map(gatewayVirtualProfileConfigFromForm);
 
   return config;
+}
+
+function gatewayConfigFormSignature(form: GatewayConfigForm): string {
+  return jsonSignature(gatewayConfigFromForm(form));
+}
+
+function gatewayConfigFormSignatureOrNull(form: GatewayConfigForm): string | null {
+  try {
+    return gatewayConfigFormSignature(form);
+  } catch {
+    return null;
+  }
 }
 
 function gatewayProviderConfigFromForm(provider: GatewayProviderForm): JsonObject {
@@ -10238,6 +11330,10 @@ function cloneJsonObject(value: JsonObject): JsonObject {
   return JSON.parse(JSON.stringify(value || {})) as JsonObject;
 }
 
+function jsonSignature(value: unknown): string {
+  return JSON.stringify(value);
+}
+
 function newLocalId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
@@ -10322,6 +11418,18 @@ function normalizeDefaultProviderProfileForm(profile: DefaultProviderProfile): D
   };
 }
 
+function defaultProviderProfileDraftSignature(profile: DefaultProviderProfile): string {
+  const normalized = normalizeDefaultProviderProfileForm(profile);
+  return jsonSignature({
+    name: normalized.name,
+    provider_name: normalized.provider_name,
+    base_url: normalized.base_url,
+    api_key: normalized.api_key,
+    model: normalized.model,
+    config_format: normalized.config_format || "profile",
+  });
+}
+
 function profileManagementDefaultProviders(providers: DefaultProviderProfile[]) {
   return providers.filter((profile) => {
     const name = profile.name.trim();
@@ -10363,6 +11471,27 @@ function errorMessage(error: unknown) {
     return error.message;
   }
   return String(error);
+}
+
+function userFacingErrorMessage(error: unknown, strings: AppStrings) {
+  if (isMissingTauriRuntimeError(error)) {
+    return strings.desktopRuntimeUnavailableDescription;
+  }
+  return errorMessage(error).replace(/^Error:\s*/, "");
+}
+
+function isMissingTauriRuntimeError(error: unknown) {
+  const message = errorMessage(error);
+  return (
+    message.includes("reading 'invoke'") ||
+    message.includes('reading "invoke"') ||
+    message.includes("__TAURI_INTERNALS__") ||
+    message.includes("window.__TAURI__")
+  );
+}
+
+function isTauriRuntime() {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
 function gatewayUsageOverviewMetrics(summary: GatewayUsageSummary | null) {
@@ -10904,6 +12033,34 @@ function normalizeExtensionSettings(value: Partial<ExtensionSettings> | undefine
     bot_gateway_enabled: raw?.bot_gateway_enabled ?? raw?.botGatewayEnabled ?? false,
     next_ai_gateway_enabled: raw?.next_ai_gateway_enabled ?? raw?.nextAiGatewayEnabled ?? false,
   };
+}
+
+function extensionSettingsEqual(
+  left: Partial<ExtensionSettings> | undefined | null,
+  right: Partial<ExtensionSettings> | undefined | null,
+): boolean {
+  const normalizedLeft = normalizeExtensionSettings(left);
+  const normalizedRight = normalizeExtensionSettings(right);
+  return (
+    normalizedLeft.enabled === normalizedRight.enabled &&
+    normalizedLeft.bot_gateway_enabled === normalizedRight.bot_gateway_enabled &&
+    normalizedLeft.next_ai_gateway_enabled === normalizedRight.next_ai_gateway_enabled
+  );
+}
+
+function transcribeSettingsEqual(
+  left: ReturnType<typeof normalizeTranscribeSettings>,
+  right: ReturnType<typeof normalizeTranscribeSettings>,
+): boolean {
+  return (
+    left.transcribeBaseUrl === right.transcribeBaseUrl &&
+    left.transcribeApiKey === right.transcribeApiKey &&
+    left.transcribeModel === right.transcribeModel
+  );
+}
+
+function savedBotConfigsEqual(left: SavedBotConfig[], right: SavedBotConfig[]): boolean {
+  return jsonSignature(normalizeSavedBotConfigs(left)) === jsonSignature(normalizeSavedBotConfigs(right));
 }
 
 function botExtensionsEnabled(value: Partial<ExtensionSettings> | undefined | null): boolean {
