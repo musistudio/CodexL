@@ -55,6 +55,10 @@ const MIN_NATIVE_CLAUDE_BYTES: u64 = 5 * 1024 * 1024;
 const CLAUDE_THREAD_NAMES_FILE: &str = "codex-app-thread-names.json";
 const CLAUDE_THREAD_GOALS_FILE: &str = "codex-app-thread-goals.json";
 const CLAUDE_THREAD_ARCHIVED_FILE: &str = "codex-app-thread-archived.json";
+const CLAUDE_THREAD_PINNED_FILE: &str = "codex-app-thread-pinned.json";
+const CLAUDE_THREAD_MEMORY_MODES_FILE: &str = "codex-app-thread-memory-modes.json";
+const CLAUDE_PLUGIN_STATE_FILE: &str = "codex-app-plugin-state.json";
+const CLAUDE_MCP_SERVER_STATE_FILE: &str = "codex-app-mcp-server-state.json";
 const CLAUDE_TITLE_MATCH_MAX_DELTA_SECONDS: u64 = 6 * 60 * 60;
 const CLAUDE_THREAD_LIST_CACHE_TTL_MS: i64 = 5_000;
 const CLAUDE_THREAD_LIST_MIN_SCAN_LIMIT: usize = 120;
@@ -950,6 +954,9 @@ type SharedState = Arc<Mutex<ClaudeAppServerState>>;
 static CLAUDE_CODE_LOG_LOCK: Mutex<()> = Mutex::new(());
 static CLAUDE_THREAD_LIST_CACHE: OnceLock<Mutex<Option<ClaudeThreadListCacheEntry>>> =
     OnceLock::new();
+static CLAUDE_ACTIVE_STEER_SENDERS: OnceLock<
+    Mutex<BTreeMap<(String, String), mpsc::Sender<Value>>>,
+> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct ClaudeThreadListSnapshot {
@@ -2408,6 +2415,71 @@ where
                 write_notification(&output, notification)?;
             }
         }
+        "thread/pin" => {
+            let (response, notification) = {
+                let mut state = lock_state(&state)?;
+                state.thread_pinned_set(&params, true)?
+            };
+            write_response(&output, id, response)?;
+            if let Some(notification) = notification {
+                write_notification(&output, notification)?;
+            }
+        }
+        "thread/unpin" => {
+            let (response, notification) = {
+                let mut state = lock_state(&state)?;
+                state.thread_pinned_set(&params, false)?
+            };
+            write_response(&output, id, response)?;
+            if let Some(notification) = notification {
+                write_notification(&output, notification)?;
+            }
+        }
+        "thread/pinned/list" | "thread/pins/list" => {
+            let response = {
+                let state = lock_state(&state)?;
+                state.thread_pinned_list()
+            };
+            write_response(&output, id, response)?;
+        }
+        "thread/memoryMode/get" | "thread/memory/get" => {
+            let response = {
+                let state = lock_state(&state)?;
+                state.thread_memory_mode_get(&params)?
+            };
+            write_response(&output, id, response)?;
+        }
+        "thread/memoryMode/set" | "thread/memory/set" => {
+            let (response, notification) = {
+                let mut state = lock_state(&state)?;
+                state.thread_memory_mode_set(&params)?
+            };
+            write_response(&output, id, response)?;
+            if let Some(notification) = notification {
+                write_notification(&output, notification)?;
+            }
+        }
+        "thread/memoryMode/clear" | "thread/memory/clear" => {
+            let (response, notification) = {
+                let mut state = lock_state(&state)?;
+                state.thread_memory_mode_clear(&params)?
+            };
+            write_response(&output, id, response)?;
+            if let Some(notification) = notification {
+                write_notification(&output, notification)?;
+            }
+        }
+        "thread/prewarm" | "thread/prewarm/start" => {
+            let (response, notification) = {
+                let mut state = lock_state(&state)?;
+                state.prewarm_thread(&params)
+            };
+            write_response(&output, id, response)?;
+            write_notification(&output, notification)?;
+        }
+        "thread/prewarm/clear" | "thread/prewarm/clearAll" => {
+            write_response(&output, id, json!({}))?;
+        }
         "thread/goal/get" => {
             let response = {
                 let state = lock_state(&state)?;
@@ -2493,6 +2565,13 @@ where
                     }),
                 );
             }
+        }
+        "turn/steer" => {
+            let response = {
+                let state = lock_state(&state)?;
+                state.steer_turn(&params)?
+            };
+            write_response(&output, id, response)?;
         }
         "model/list" => {
             write_response(&output, id, claude_code_model_list_response(&params))?;
@@ -2642,11 +2721,26 @@ fn is_claude_code_owned_method(method: &str) -> bool {
             | "thread/unsubscribe"
             | "thread/name/set"
             | "thread/metadata/update"
+            | "thread/pin"
+            | "thread/unpin"
+            | "thread/pinned/list"
+            | "thread/pins/list"
+            | "thread/memoryMode/get"
+            | "thread/memoryMode/set"
+            | "thread/memoryMode/clear"
+            | "thread/memory/get"
+            | "thread/memory/set"
+            | "thread/memory/clear"
+            | "thread/prewarm"
+            | "thread/prewarm/start"
+            | "thread/prewarm/clear"
+            | "thread/prewarm/clearAll"
             | "thread/goal/get"
             | "thread/goal/set"
             | "thread/goal/clear"
             | "turn/start"
             | "turn/interrupt"
+            | "turn/steer"
             | "account/read"
             | "getAuthStatus"
             | "config/read"
@@ -2685,8 +2779,8 @@ fn standalone_codex_app_result(method: &str, params: &Value) -> Option<Value> {
 
 fn fast_standalone_codex_app_result(method: &str, params: &Value) -> Option<Value> {
     match method {
-        "config/mcpServer/reload"
-        | "memory/reset"
+        "config/mcpServer/reload" => Some(standalone_mcp_server_lifecycle_result(method, params)),
+        "memory/reset"
         | "experimentalFeature/enablement/set"
         | "marketplace/add"
         | "marketplace/remove"
@@ -2720,7 +2814,7 @@ fn fast_standalone_codex_app_result(method: &str, params: &Value) -> Option<Valu
         })),
         "plugin/list" => Some(standalone_plugin_list_result()),
         "plugin/uninstall" | "plugin/remove" | "plugin/delete" | "plugin/enable"
-        | "plugin/disable" => Some(json!({})),
+        | "plugin/disable" => Some(standalone_plugin_lifecycle_result(method, params)),
         method
             if method.starts_with("plugin/")
                 && !matches!(method, "plugin/read" | "plugin/install") =>
@@ -2736,6 +2830,9 @@ fn fast_standalone_codex_app_result(method: &str, params: &Value) -> Option<Valu
             "data": standalone_mcp_server_status_list(),
             "nextCursor": Value::Null,
         })),
+        method if method.starts_with("mcpServer/") => {
+            Some(standalone_mcp_server_lifecycle_result(method, params))
+        }
         "model/list" => Some(claude_code_model_list_response(params)),
         "permissionProfile/list" | "experimentalFeature/list" => Some(json!({
             "data": [],
@@ -3813,7 +3910,7 @@ fn plugin_entry_from_manifest_path(path: &Path) -> Option<StandalonePluginEntry>
         .filter(|value| value.is_array())
         .cloned()
         .unwrap_or_else(|| json!([]));
-    let plugin = json!({
+    let mut plugin = json!({
         "id": id,
         "name": name,
         "shareContext": object.get("shareContext").cloned().unwrap_or(Value::Null),
@@ -3846,6 +3943,7 @@ fn plugin_entry_from_manifest_path(path: &Path) -> Option<StandalonePluginEntry>
         "keywords": keywords,
         "path": path.to_string_lossy().to_string(),
     });
+    apply_standalone_plugin_state(&mut plugin);
     Some(StandalonePluginEntry {
         marketplace_name,
         marketplace_path,
@@ -3897,6 +3995,11 @@ fn standalone_plugin_read_result(params: &Value) -> Value {
 }
 
 fn standalone_plugin_install_result(params: &Value) -> Value {
+    if let Some(entry) = find_standalone_plugin_entry(params) {
+        persist_standalone_plugin_lifecycle(&entry.plugin, true, true);
+    } else if let Some(plugin_name) = plugin_request_name(params) {
+        persist_named_plugin_lifecycle(plugin_name, true, true);
+    }
     let auth_policy = find_standalone_plugin_entry(params)
         .and_then(|entry| {
             entry
@@ -3910,6 +4013,25 @@ fn standalone_plugin_install_result(params: &Value) -> Value {
         "authPolicy": auth_policy,
         "appsNeedingAuth": [],
     })
+}
+
+fn standalone_plugin_lifecycle_result(method: &str, params: &Value) -> Value {
+    let (installed, enabled) = match method {
+        "plugin/enable" => (true, true),
+        "plugin/disable" => (true, false),
+        "plugin/uninstall" | "plugin/remove" | "plugin/delete" => (false, false),
+        _ => (true, true),
+    };
+    if let Some(entry) = find_standalone_plugin_entry(params) {
+        persist_standalone_plugin_lifecycle(&entry.plugin, installed, enabled);
+        return json!({
+            "plugin": apply_standalone_plugin_lifecycle_json(entry.plugin, installed, enabled),
+        });
+    }
+    if let Some(plugin_name) = plugin_request_name(params) {
+        persist_named_plugin_lifecycle(plugin_name, installed, enabled);
+    }
+    json!({})
 }
 
 fn find_standalone_plugin_entry(params: &Value) -> Option<StandalonePluginEntry> {
@@ -4010,6 +4132,128 @@ fn standalone_plugin_detail(entry: &StandalonePluginEntry) -> Value {
         "apps": plugin_app_details(entry, &manifest),
         "mcpServers": plugin_mcp_server_names(entry, &manifest),
     })
+}
+
+fn apply_standalone_plugin_state(plugin: &mut Value) {
+    let Some(state) = standalone_plugin_state_for_plugin(plugin) else {
+        return;
+    };
+    let installed = state
+        .get("installed")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            plugin
+                .get("installed")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        });
+    let enabled = state
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            plugin
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
+        && installed;
+    if let Some(object) = plugin.as_object_mut() {
+        object.insert("installed".to_string(), json!(installed));
+        object.insert("enabled".to_string(), json!(enabled));
+    }
+}
+
+fn apply_standalone_plugin_lifecycle_json(
+    mut plugin: Value,
+    installed: bool,
+    enabled: bool,
+) -> Value {
+    if let Some(object) = plugin.as_object_mut() {
+        object.insert("installed".to_string(), json!(installed));
+        object.insert("enabled".to_string(), json!(enabled && installed));
+    }
+    plugin
+}
+
+fn persist_standalone_plugin_lifecycle(plugin: &Value, installed: bool, enabled: bool) {
+    for key in plugin_state_keys_for_plugin(plugin) {
+        persist_named_plugin_lifecycle(&key, installed, enabled);
+    }
+}
+
+fn persist_named_plugin_lifecycle(plugin_name: &str, installed: bool, enabled: bool) {
+    let plugin_name = plugin_name.trim();
+    if plugin_name.is_empty() {
+        return;
+    }
+    let mut state = load_standalone_lifecycle_state(claude_plugin_state_path);
+    state.insert(
+        plugin_name.to_string(),
+        json!({
+            "installed": installed,
+            "enabled": enabled && installed,
+        }),
+    );
+    persist_standalone_lifecycle_state(claude_plugin_state_path, &state);
+}
+
+fn standalone_plugin_state_for_plugin(plugin: &Value) -> Option<Value> {
+    let state = load_standalone_lifecycle_state(claude_plugin_state_path);
+    plugin_state_keys_for_plugin(plugin)
+        .into_iter()
+        .find_map(|key| state.get(&key).cloned())
+}
+
+fn plugin_state_keys_for_plugin(plugin: &Value) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut seen = BTreeSet::new();
+    for pointer in ["/id", "/name", "/source/path", "/path"] {
+        if let Some(value) = plugin
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .and_then(non_empty_string)
+        {
+            if seen.insert(value.clone()) {
+                keys.push(value);
+            }
+        }
+    }
+    if let Some(path) = plugin.pointer("/source/path").and_then(Value::as_str) {
+        if let Some(name) = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(non_empty_string)
+        {
+            if seen.insert(name.clone()) {
+                keys.push(name);
+            }
+        }
+    }
+    keys
+}
+
+fn plugin_mcp_config_path_enabled(config_path: &Path) -> bool {
+    let config_key = canonical_key(config_path);
+    for entry in standalone_plugin_entries() {
+        let Some(mcp_path) = plugin_manifest_mcp_config_path(&entry.manifest_path) else {
+            continue;
+        };
+        if canonical_key(&mcp_path) != config_key {
+            continue;
+        }
+        let installed = entry
+            .plugin
+            .get("installed")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let enabled = entry
+            .plugin
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        return installed && enabled;
+    }
+    true
 }
 
 fn plugin_skill_details(entry: &StandalonePluginEntry, manifest: &Value) -> Vec<Value> {
@@ -4394,7 +4638,11 @@ fn standalone_mcp_server_status_list() -> Vec<Value> {
         let Ok(content) = std::fs::read_to_string(&config_path) else {
             continue;
         };
-        for server in parse_mcp_servers_from_config(&content, &config_path) {
+        for mut server in parse_mcp_servers_from_config(&content, &config_path) {
+            apply_standalone_mcp_server_state(&mut server);
+            if standalone_mcp_server_removed(&server) {
+                continue;
+            }
             servers.entry(server.name.clone()).or_insert(server);
         }
     }
@@ -4406,7 +4654,15 @@ fn standalone_mcp_server_status_list() -> Vec<Value> {
             continue;
         };
         let base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
-        for server in parse_mcp_servers_from_json(&value, &config_path, base_dir, "plugin") {
+        let plugin_enabled = plugin_mcp_config_path_enabled(&config_path);
+        for mut server in parse_mcp_servers_from_json(&value, &config_path, base_dir, "plugin") {
+            apply_standalone_mcp_server_state(&mut server);
+            if !plugin_enabled {
+                server.enabled = false;
+            }
+            if standalone_mcp_server_removed(&server) {
+                continue;
+            }
             servers.entry(server.name.clone()).or_insert(server);
         }
     }
@@ -4760,6 +5016,86 @@ impl StandaloneMcpServer {
             "error": Value::Null,
         })
     }
+}
+
+fn standalone_mcp_server_lifecycle_result(method: &str, params: &Value) -> Value {
+    if matches!(method, "config/mcpServer/reload") {
+        return json!({
+            "data": standalone_mcp_server_status_list(),
+            "nextCursor": Value::Null,
+        });
+    }
+    let Some(server_name) = mcp_server_request_name(params) else {
+        return json!({});
+    };
+    let (enabled, removed) = match method {
+        "mcpServer/enable" => (true, false),
+        "mcpServer/disable" => (false, false),
+        "mcpServer/remove" | "mcpServer/delete" | "mcpServer/uninstall" => (false, true),
+        _ => (true, false),
+    };
+    persist_named_mcp_server_lifecycle(&server_name, enabled, removed);
+    json!({
+        "serverName": server_name,
+        "enabled": enabled,
+        "removed": removed,
+    })
+}
+
+fn mcp_server_request_name(params: &Value) -> Option<String> {
+    [
+        "serverName",
+        "server_name",
+        "name",
+        "id",
+        "mcpServerName",
+        "mcp_server_name",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(non_empty_string)
+    })
+}
+
+fn persist_named_mcp_server_lifecycle(server_name: &str, enabled: bool, removed: bool) {
+    let server_name = server_name.trim();
+    if server_name.is_empty() {
+        return;
+    }
+    let mut state = load_standalone_lifecycle_state(claude_mcp_server_state_path);
+    state.insert(
+        server_name.to_string(),
+        json!({
+            "enabled": enabled,
+            "removed": removed,
+        }),
+    );
+    persist_standalone_lifecycle_state(claude_mcp_server_state_path, &state);
+}
+
+fn apply_standalone_mcp_server_state(server: &mut StandaloneMcpServer) {
+    let state = load_standalone_lifecycle_state(claude_mcp_server_state_path);
+    if let Some(value) = state
+        .get(&server.name)
+        .or_else(|| state.get(&server.config_path))
+    {
+        if let Some(enabled) = value.get("enabled").and_then(Value::as_bool) {
+            server.enabled = enabled;
+        }
+    }
+}
+
+fn standalone_mcp_server_removed(server: &StandaloneMcpServer) -> bool {
+    let state = load_standalone_lifecycle_state(claude_mcp_server_state_path);
+    state
+        .get(&server.name)
+        .or_else(|| state.get(&server.config_path))
+        .and_then(|value| value.get("removed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn parse_mcp_servers_from_config(content: &str, config_path: &Path) -> Vec<StandaloneMcpServer> {
@@ -5251,6 +5587,7 @@ impl ClaudeAppServerState {
             goal: None,
             latest_token_usage_info: None,
         };
+        apply_new_thread_persisted_overlays(&thread.id, params);
         let response = thread_runtime_response(&thread, false);
         let notification = json!({
             "method": "thread/started",
@@ -5829,6 +6166,22 @@ impl ClaudeAppServerState {
             }
             persist_claude_thread_archived(&thread_archive_id, archived);
         }
+        if let Some(pinned) = thread_metadata_bool(params, &["pinned"]) {
+            let thread_pin_id = thread.id.clone();
+            persist_claude_thread_pinned(&thread_pin_id, pinned);
+            changed = true;
+        }
+        if let Some(memory_mode) =
+            thread_metadata_value(params, &["memoryMode", "memory_mode"]).cloned()
+        {
+            let thread_memory_id = thread.id.clone();
+            if memory_mode.is_null() {
+                persist_claude_thread_memory_mode(&thread_memory_id, None);
+            } else {
+                persist_claude_thread_memory_mode(&thread_memory_id, Some(&memory_mode));
+            }
+            changed = true;
+        }
         if changed {
             thread.updated_at = now_seconds();
         }
@@ -5840,6 +6193,85 @@ impl ClaudeAppServerState {
         let response = json!({ "thread": thread.to_json(include_turns) });
         let notification = changed.then(|| claude_thread_stream_state_changed_notification(thread));
         Ok((response, notification))
+    }
+
+    fn thread_pinned_list(&self) -> Value {
+        let mut ids = load_claude_thread_pinned();
+        for thread in self.threads.values() {
+            if persisted_claude_thread_pinned(&thread.id) {
+                ids.insert(strip_local_thread_prefix(&thread.id).to_string());
+            }
+        }
+        let thread_ids = ids.into_iter().collect::<Vec<_>>();
+        json!({
+            "threadIds": thread_ids,
+            "data": thread_ids,
+            "nextCursor": Value::Null,
+        })
+    }
+
+    fn thread_pinned_set(
+        &mut self,
+        params: &Value,
+        pinned: bool,
+    ) -> Result<(Value, Option<Value>), String> {
+        let thread_id = required_param(params, "threadId")?;
+        persist_claude_thread_pinned(thread_id, pinned);
+        let notification = self.thread_stream_state_notification_for_id(thread_id);
+        Ok((
+            json!({
+                "threadId": thread_id,
+                "pinned": pinned,
+            }),
+            notification,
+        ))
+    }
+
+    fn thread_memory_mode_get(&self, params: &Value) -> Result<Value, String> {
+        let thread_id = required_param(params, "threadId")?;
+        let memory_mode = persisted_claude_thread_memory_mode(thread_id).unwrap_or(Value::Null);
+        Ok(json!({
+            "threadId": thread_id,
+            "memoryMode": memory_mode,
+        }))
+    }
+
+    fn thread_memory_mode_set(&mut self, params: &Value) -> Result<(Value, Option<Value>), String> {
+        let thread_id = required_param(params, "threadId")?;
+        let memory_mode = thread_memory_mode_from_params(params);
+        persist_claude_thread_memory_mode(thread_id, Some(&memory_mode));
+        let notification = self.thread_stream_state_notification_for_id(thread_id);
+        Ok((
+            json!({
+                "threadId": thread_id,
+                "memoryMode": memory_mode,
+            }),
+            notification,
+        ))
+    }
+
+    fn thread_memory_mode_clear(
+        &mut self,
+        params: &Value,
+    ) -> Result<(Value, Option<Value>), String> {
+        let thread_id = required_param(params, "threadId")?;
+        persist_claude_thread_memory_mode(thread_id, None);
+        let notification = self.thread_stream_state_notification_for_id(thread_id);
+        Ok((
+            json!({
+                "threadId": thread_id,
+                "memoryMode": Value::Null,
+            }),
+            notification,
+        ))
+    }
+
+    fn prewarm_thread(&mut self, params: &Value) -> (Value, Value) {
+        let (mut response, notification) = self.start_thread(params);
+        if let Some(object) = response.as_object_mut() {
+            object.insert("prewarmed".to_string(), json!(true));
+        }
+        (response, notification)
     }
 
     fn start_turn(
@@ -6018,6 +6450,7 @@ impl ClaudeAppServerState {
         for key in stale_keys {
             if let Some(pid) = self.active_processes.remove(&key) {
                 self.interrupted_turns.insert(key.clone());
+                unregister_active_steer_sender(&key.0, &key.1);
                 stale_processes.push(StaleActiveProcess {
                     thread_id: key.0,
                     turn_id: key.1,
@@ -6071,6 +6504,7 @@ impl ClaudeAppServerState {
         let key = (thread_id.to_string(), turn_id.clone());
         self.interrupted_turns.insert(key.clone());
         let pid = self.active_processes.get(&key).copied();
+        unregister_active_steer_sender(thread_id, &turn_id);
         claude_code_log_event(
             "turn_interrupt_registered",
             json!({
@@ -6081,6 +6515,55 @@ impl ClaudeAppServerState {
             }),
         );
         pid
+    }
+
+    fn steer_turn(&self, params: &Value) -> Result<Value, String> {
+        let thread_id = required_param(params, "threadId")?;
+        let turn_id = params
+            .get("turnId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                self.thread_for_request(thread_id).ok().and_then(|thread| {
+                    thread
+                        .turns
+                        .iter()
+                        .rev()
+                        .find(|turn| turn.status == TurnStatus::InProgress)
+                        .map(|turn| turn.id.clone())
+                })
+            })
+            .ok_or_else(|| steer_turn_inactive_error(thread_id))?;
+        let input = steer_turn_input_from_params(params);
+        let key = (thread_id.to_string(), turn_id.clone());
+        let sender = active_steer_senders()
+            .lock()
+            .ok()
+            .and_then(|senders| senders.get(&key).cloned())
+            .or_else(|| {
+                let lookup_thread_id = strip_local_thread_prefix(thread_id).to_string();
+                active_steer_senders()
+                    .lock()
+                    .ok()
+                    .and_then(|senders| senders.get(&(lookup_thread_id, turn_id.clone())).cloned())
+            })
+            .ok_or_else(|| steer_turn_inactive_error(thread_id))?;
+        sender
+            .send(input)
+            .map_err(|_| steer_turn_inactive_error(thread_id))?;
+        Ok(json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "status": "sent",
+        }))
+    }
+
+    fn thread_stream_state_notification_for_id(&self, thread_id: &str) -> Option<Value> {
+        let lookup_thread_id = strip_local_thread_prefix(thread_id);
+        self.threads
+            .get(thread_id)
+            .or_else(|| self.threads.get(lookup_thread_id))
+            .map(claude_thread_stream_state_changed_notification)
     }
 
     fn generated_titles(&self) -> Vec<ClaudeGeneratedTitle> {
@@ -6129,6 +6612,7 @@ impl ClaudeAppServerState {
     ) -> Option<FinishTurnNotifications> {
         let key = (thread_id.to_string(), turn_id.to_string());
         self.active_processes.remove(&key);
+        unregister_active_steer_sender(thread_id, turn_id);
         let (
             item,
             turn_json,
@@ -7052,6 +7536,7 @@ fn claude_thread_stream_state_changed_notification(thread: &ClaudeThread) -> Val
 }
 
 fn claude_conversation_state(thread: &ClaudeThread) -> Value {
+    let memory_mode = persisted_claude_thread_memory_mode(&thread.id).unwrap_or(Value::Null);
     json!({
         "id": thread.id,
         "requests": [],
@@ -7080,6 +7565,8 @@ fn claude_conversation_state(thread: &ClaudeThread) -> Value {
         "personality": thread.personality.clone(),
         "persistExtendedHistory": thread.persist_extended_history.clone(),
         "hasUnreadTurn": false,
+        "pinned": persisted_claude_thread_pinned(&thread.id),
+        "memoryMode": memory_mode,
         "threadGoal": thread.goal.clone().unwrap_or(Value::Null),
         "threadGoalResumeConfirmation": Value::Null,
         "completedThreadGoal": Value::Null,
@@ -7198,6 +7685,7 @@ impl ClaudeThread {
     fn to_json(&self, include_turns: bool) -> Value {
         let display_title = self.display_title();
         let serialized_name = self.serialized_name();
+        let memory_mode = persisted_claude_thread_memory_mode(&self.id).unwrap_or(Value::Null);
         json!({
             "id": self.id,
             "sessionId": self.session_id,
@@ -7249,6 +7737,8 @@ impl ClaudeThread {
             "persistExtendedHistory": self.persist_extended_history.clone(),
             "approvalPolicy": self.approval_policy,
             "approvalsReviewer": self.approvals_reviewer,
+            "pinned": persisted_claude_thread_pinned(&self.id),
+            "memoryMode": memory_mode,
             "name": serialized_name.map(Value::String).unwrap_or(Value::Null),
             "title": display_title.map(Value::String).unwrap_or(Value::Null),
             "threadGoal": self.goal.clone().unwrap_or(Value::Null),
@@ -8901,6 +9391,190 @@ fn claude_thread_archived_path() -> Option<PathBuf> {
     )
 }
 
+fn persisted_claude_thread_pinned(thread_id: &str) -> bool {
+    let thread_id = strip_local_thread_prefix(thread_id);
+    load_claude_thread_pinned().contains(thread_id)
+}
+
+fn persist_claude_thread_pinned(thread_id: &str, pinned: bool) {
+    let thread_id = strip_local_thread_prefix(thread_id).trim();
+    if thread_id.is_empty() {
+        return;
+    }
+    let mut pinned_ids = load_claude_thread_pinned();
+    if pinned {
+        pinned_ids.insert(thread_id.to_string());
+    } else {
+        pinned_ids.remove(thread_id);
+    }
+    let Some(path) = claude_thread_pinned_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let values = pinned_ids.into_iter().collect::<Vec<_>>();
+    if let Ok(content) = serde_json::to_string_pretty(&values) {
+        let _ = std::fs::write(path, content);
+    }
+    clear_claude_thread_list_cache();
+}
+
+fn load_claude_thread_pinned() -> BTreeSet<String> {
+    let Some(path) = claude_thread_pinned_path() else {
+        return BTreeSet::new();
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return BTreeSet::new();
+    };
+    load_string_set_json(&content)
+}
+
+fn claude_thread_pinned_path() -> Option<PathBuf> {
+    Some(
+        user_home_dir()?
+            .join(".claude")
+            .join(CLAUDE_THREAD_PINNED_FILE),
+    )
+}
+
+fn persisted_claude_thread_memory_mode(thread_id: &str) -> Option<Value> {
+    let thread_id = strip_local_thread_prefix(thread_id);
+    load_claude_thread_memory_modes().get(thread_id).cloned()
+}
+
+fn persist_claude_thread_memory_mode(thread_id: &str, memory_mode: Option<&Value>) {
+    let thread_id = strip_local_thread_prefix(thread_id).trim();
+    if thread_id.is_empty() {
+        return;
+    }
+    let mut modes = load_claude_thread_memory_modes();
+    if let Some(memory_mode) = memory_mode.filter(|value| !value.is_null()) {
+        modes.insert(thread_id.to_string(), memory_mode.clone());
+    } else {
+        modes.remove(thread_id);
+    }
+    let Some(path) = claude_thread_memory_modes_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(content) = serde_json::to_string_pretty(&modes) {
+        let _ = std::fs::write(path, content);
+    }
+    clear_claude_thread_list_cache();
+}
+
+fn load_claude_thread_memory_modes() -> BTreeMap<String, Value> {
+    let Some(path) = claude_thread_memory_modes_path() else {
+        return BTreeMap::new();
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content) else {
+        return BTreeMap::new();
+    };
+    map.into_iter()
+        .filter(|(key, value)| !key.trim().is_empty() && !value.is_null())
+        .collect()
+}
+
+fn claude_thread_memory_modes_path() -> Option<PathBuf> {
+    Some(
+        user_home_dir()?
+            .join(".claude")
+            .join(CLAUDE_THREAD_MEMORY_MODES_FILE),
+    )
+}
+
+fn load_string_set_json(content: &str) -> BTreeSet<String> {
+    let Ok(value) = serde_json::from_str::<Value>(content) else {
+        return BTreeSet::new();
+    };
+    match value {
+        Value::Array(values) => values
+            .into_iter()
+            .filter_map(|value| value.as_str().and_then(non_empty_string))
+            .collect(),
+        Value::Object(map) => map
+            .into_iter()
+            .filter_map(|(key, value)| {
+                (!key.trim().is_empty() && value.as_bool().unwrap_or(false)).then_some(key)
+            })
+            .collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
+fn load_standalone_lifecycle_state(path_fn: fn() -> Option<PathBuf>) -> BTreeMap<String, Value> {
+    let Some(path) = path_fn() else {
+        return BTreeMap::new();
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content) else {
+        return BTreeMap::new();
+    };
+    map.into_iter()
+        .filter(|(key, value)| !key.trim().is_empty() && value.is_object())
+        .collect()
+}
+
+fn persist_standalone_lifecycle_state(
+    path_fn: fn() -> Option<PathBuf>,
+    state: &BTreeMap<String, Value>,
+) {
+    let Some(path) = path_fn() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(content) = serde_json::to_string_pretty(state) {
+        let _ = std::fs::write(path, content);
+    }
+}
+
+fn claude_plugin_state_path() -> Option<PathBuf> {
+    Some(
+        user_home_dir()?
+            .join(".claude")
+            .join(CLAUDE_PLUGIN_STATE_FILE),
+    )
+}
+
+fn claude_mcp_server_state_path() -> Option<PathBuf> {
+    Some(
+        user_home_dir()?
+            .join(".claude")
+            .join(CLAUDE_MCP_SERVER_STATE_FILE),
+    )
+}
+
+fn thread_memory_mode_from_params(params: &Value) -> Value {
+    for key in ["memoryMode", "memory_mode", "mode", "value"] {
+        if let Some(value) = params.get(key).filter(|value| !value.is_null()) {
+            return value.clone();
+        }
+    }
+    json!("auto")
+}
+
+fn apply_new_thread_persisted_overlays(thread_id: &str, params: &Value) {
+    if let Some(pinned) = params.get("pinned").and_then(Value::as_bool) {
+        persist_claude_thread_pinned(thread_id, pinned);
+    }
+    for key in ["memoryMode", "memory_mode"] {
+        if let Some(memory_mode) = params.get(key).filter(|value| !value.is_null()) {
+            persist_claude_thread_memory_mode(thread_id, Some(memory_mode));
+            break;
+        }
+    }
+}
+
 fn thread_goal_from_params(params: &Value) -> Value {
     if let Some(goal) = params.get("goal").filter(|goal| !goal.is_null()) {
         return goal.clone();
@@ -9498,6 +10172,8 @@ where
         .take()
         .map(|stderr| spawn_claude_child_line_reader(stderr, event_tx.clone(), false));
     drop(event_tx);
+    let (steer_tx, steer_rx) = mpsc::channel();
+    register_active_steer_sender(work, steer_tx);
 
     let stdin_payload = claude_stream_json_input(work);
     if let Err(err) = child_stdin
@@ -9554,6 +10230,20 @@ where
     let mut last_thread_stream_state_heartbeat = Instant::now();
 
     while child_status.is_none() || !stdout_done || !stderr_done {
+        if child_status.is_none() {
+            match drain_steer_messages(work, &mut child_stdin, &steer_rx) {
+                Ok(sent_count) if sent_count > 0 => {
+                    last_child_event = Instant::now();
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    command_output.push_str(&format!("[steer]\n{}\n", err.trim()));
+                    terminate_process_group(child.id());
+                    child_status = Some(child.wait());
+                }
+            }
+        }
+
         match event_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(event) => {
                 last_child_event = Instant::now();
@@ -10900,6 +11590,96 @@ fn claude_stream_json_input(work: &TurnWork) -> String {
     )
 }
 
+fn claude_stream_json_steer_message(input: &Value) -> Value {
+    json!({
+        "type": "user",
+        "session_id": "",
+        "message": {
+            "role": "user",
+            "content": claude_stream_json_content_from_input_value(input),
+        },
+        "parent_tool_use_id": Value::Null,
+    })
+}
+
+fn claude_stream_json_content_from_input_value(input: &Value) -> Vec<Value> {
+    let mut content = Vec::new();
+    let values = input
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| vec![input.clone()]);
+    let mut has_user_content = false;
+    for item in values {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    content.push(json!({ "type": "text", "text": text }));
+                    has_user_content = true;
+                }
+            }
+            Some("localImage") | Some("image") => {
+                if let Some(image) = claude_stream_json_image_content(&item) {
+                    content.push(image);
+                    has_user_content = true;
+                } else if let Some(text) = prompt_text_for_single_input_item(&item) {
+                    content.push(json!({ "type": "text", "text": text }));
+                    has_user_content = true;
+                }
+            }
+            Some("mention") | Some("skill") => {
+                if let Some(text) = prompt_text_for_single_input_item(&item) {
+                    content.push(json!({ "type": "text", "text": text }));
+                    has_user_content = true;
+                }
+            }
+            _ => {
+                if let Some(text) = item.as_str().and_then(non_empty_string).or_else(|| {
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .and_then(non_empty_string)
+                }) {
+                    content.push(json!({ "type": "text", "text": text }));
+                    has_user_content = true;
+                }
+            }
+        }
+    }
+    if !has_user_content {
+        content.push(json!({ "type": "text", "text": compact_json(input) }));
+    }
+    content
+}
+
+fn drain_steer_messages<W>(
+    work: &TurnWork,
+    child_stdin: &mut W,
+    steer_rx: &mpsc::Receiver<Value>,
+) -> Result<usize, String>
+where
+    W: Write,
+{
+    let mut sent_count = 0;
+    loop {
+        match steer_rx.try_recv() {
+            Ok(input) => {
+                let message = claude_stream_json_steer_message(&input);
+                write_claude_child_json_line(child_stdin, &message)?;
+                sent_count += 1;
+                claude_code_log_event(
+                    "claude_steer_sent",
+                    json!({
+                        "threadId": &work.thread_id,
+                        "turnId": &work.turn_id,
+                        "input": log_request_params_summary(&input),
+                    }),
+                );
+            }
+            Err(mpsc::TryRecvError::Empty) => return Ok(sent_count),
+            Err(mpsc::TryRecvError::Disconnected) => return Ok(sent_count),
+        }
+    }
+}
+
 fn claude_stream_json_user_content(work: &TurnWork) -> Vec<Value> {
     let mut content = Vec::new();
     if let Some(instruction_context) = work
@@ -12131,7 +12911,9 @@ fn claude_tool_item_kind(tool_name: &str) -> ClaudeToolItemKind {
     match tool_name {
         "Agent" | "Task" => ClaudeToolItemKind::CollabAgentToolCall,
         "Bash" => ClaudeToolItemKind::CommandExecution,
-        "Edit" => ClaudeToolItemKind::FileChange,
+        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "NotebookWrite" => {
+            ClaudeToolItemKind::FileChange
+        }
         _ => ClaudeToolItemKind::McpToolCall,
     }
 }
@@ -12304,9 +13086,7 @@ fn file_change_item_for_tool(
     result: Option<&str>,
 ) -> Option<Value> {
     let path = file_change_path_from_arguments(&state.arguments)?;
-    let old_string = state.arguments.get("old_string").and_then(Value::as_str)?;
-    let new_string = state.arguments.get("new_string").and_then(Value::as_str)?;
-    let diff = unified_diff_for_edit(cwd, &path, old_string, new_string);
+    let (kind, diff) = file_change_diff_for_tool(cwd, &path, &state.name, &state.arguments)?;
     let failed = status == "failed";
     Some(json!({
         "type": "fileChange",
@@ -12315,10 +13095,7 @@ fn file_change_item_for_tool(
         "changes": [
             {
                 "path": path,
-                "kind": {
-                    "type": "update",
-                    "move_path": Value::Null,
-                },
+                "kind": kind,
                 "diff": diff,
             }
         ],
@@ -12332,10 +13109,61 @@ fn file_change_item_for_tool(
 }
 
 fn file_change_path_from_arguments(arguments: &Value) -> Option<String> {
-    ["file_path", "path"]
+    ["file_path", "path", "notebook_path", "notebookPath"]
         .into_iter()
         .find_map(|key| arguments.get(key).and_then(Value::as_str))
         .and_then(non_empty_string)
+}
+
+fn file_change_diff_for_tool(
+    cwd: &str,
+    path: &str,
+    tool_name: &str,
+    arguments: &Value,
+) -> Option<(Value, String)> {
+    match tool_name {
+        "Write" | "NotebookWrite" => {
+            let new_content = arguments
+                .get("content")
+                .or_else(|| arguments.get("new_content"))
+                .or_else(|| arguments.get("text"))
+                .and_then(Value::as_str)?;
+            let file_path = resolve_tool_file_path(cwd, path);
+            let old_content = std::fs::read_to_string(&file_path).unwrap_or_default();
+            let kind = if file_path.is_file() {
+                file_change_kind("update")
+            } else {
+                file_change_kind("create")
+            };
+            Some((kind, unified_diff_for_content(&old_content, new_content)))
+        }
+        "MultiEdit" => {
+            let edits = arguments.get("edits").and_then(Value::as_array)?;
+            let file_path = resolve_tool_file_path(cwd, path);
+            let original = std::fs::read_to_string(&file_path).unwrap_or_default();
+            let updated = apply_multi_edit_preview(&original, edits)?;
+            Some((
+                file_change_kind("update"),
+                unified_diff_for_content(&original, &updated),
+            ))
+        }
+        "Edit" | "NotebookEdit" => {
+            let old_string = arguments.get("old_string").and_then(Value::as_str)?;
+            let new_string = arguments.get("new_string").and_then(Value::as_str)?;
+            Some((
+                file_change_kind("update"),
+                unified_diff_for_edit(cwd, path, old_string, new_string),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn file_change_kind(kind: &str) -> Value {
+    json!({
+        "type": kind,
+        "move_path": Value::Null,
+    })
 }
 
 fn unified_diff_for_edit(cwd: &str, path: &str, old_string: &str, new_string: &str) -> String {
@@ -12360,6 +13188,45 @@ fn unified_diff_for_edit(cwd: &str, path: &str, old_string: &str, new_string: &s
         diff.push('\n');
     }
     truncate_for_protocol(&diff, 200_000)
+}
+
+fn unified_diff_for_content(old_content: &str, new_content: &str) -> String {
+    let old_lines = diff_lines(old_content);
+    let new_lines = diff_lines(new_content);
+    let mut diff = format!("@@ -1,{} +1,{} @@\n", old_lines.len(), new_lines.len());
+    for line in &old_lines {
+        diff.push('-');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    for line in &new_lines {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    truncate_for_protocol(&diff, 200_000)
+}
+
+fn apply_multi_edit_preview(original: &str, edits: &[Value]) -> Option<String> {
+    let mut content = original.to_string();
+    for edit in edits {
+        let old_string = edit.get("old_string").and_then(Value::as_str)?;
+        let new_string = edit.get("new_string").and_then(Value::as_str)?;
+        let replace_all = edit
+            .get("replace_all")
+            .or_else(|| edit.get("replaceAll"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if replace_all {
+            content = content.replace(old_string, new_string);
+        } else if let Some(index) = content.find(old_string) {
+            content.replace_range(index..index + old_string.len(), new_string);
+        } else {
+            content.push_str("\n");
+            content.push_str(new_string);
+        }
+    }
+    Some(content)
 }
 
 fn diff_lines(value: &str) -> Vec<&str> {
@@ -13611,6 +14478,7 @@ fn remove_active_process(state: &SharedState, work: &TurnWork) {
             .active_processes
             .remove(&(work.thread_id.clone(), work.turn_id.clone()));
     }
+    unregister_active_steer_sender(&work.thread_id, &work.turn_id);
 }
 
 fn turn_was_interrupted(state: &SharedState, work: &TurnWork) -> bool {
@@ -13621,6 +14489,55 @@ fn turn_was_interrupted(state: &SharedState, work: &TurnWork) -> bool {
                 .contains(&(work.thread_id.clone(), work.turn_id.clone()))
         })
         .unwrap_or(false)
+}
+
+fn active_steer_senders() -> &'static Mutex<BTreeMap<(String, String), mpsc::Sender<Value>>> {
+    CLAUDE_ACTIVE_STEER_SENDERS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn register_active_steer_sender(work: &TurnWork, sender: mpsc::Sender<Value>) {
+    if let Ok(mut senders) = active_steer_senders().lock() {
+        senders.insert((work.thread_id.clone(), work.turn_id.clone()), sender);
+    }
+}
+
+fn unregister_active_steer_sender(thread_id: &str, turn_id: &str) {
+    if let Ok(mut senders) = active_steer_senders().lock() {
+        senders.remove(&(thread_id.to_string(), turn_id.to_string()));
+        senders.remove(&(
+            strip_local_thread_prefix(thread_id).to_string(),
+            turn_id.to_string(),
+        ));
+    }
+}
+
+fn steer_turn_input_from_params(params: &Value) -> Value {
+    for key in ["input", "message", "content", "delta"] {
+        if let Some(value) = params.get(key).filter(|value| !value.is_null()) {
+            return value.clone();
+        }
+    }
+    for key in ["text", "prompt"] {
+        if let Some(text) = params
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(non_empty_string)
+        {
+            return json!([{ "type": "text", "text": text }]);
+        }
+    }
+    json!([{ "type": "text", "text": "" }])
+}
+
+fn steer_turn_inactive_error(thread_id: &str) -> String {
+    if thread_id.trim().is_empty() {
+        "SteerTurnInactiveError: cannot steer inactive local turn".to_string()
+    } else {
+        format!(
+            "SteerTurnInactiveError: cannot steer inactive local turn for conversation {}",
+            thread_id
+        )
+    }
 }
 
 fn claude_turn_idle_timeout() -> Duration {
@@ -16778,6 +17695,109 @@ args = ["server.js", "--stdio"]
     }
 
     #[test]
+    fn plugin_and_mcp_lifecycle_overlay_updates_standalone_lists() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("plugin-mcp-lifecycle");
+        let codex_home = root.join(".codex");
+        let plugin_package_dir = codex_home.join("plugins").join("demo-plugin");
+        let plugin_dir = plugin_package_dir.join(".codex-plugin");
+        std::fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{
+  "id": "demo-plugin",
+  "name": "Demo Plugin",
+  "version": "1.0.0",
+  "mcpServers": "./.mcp.json"
+}"#,
+        )
+        .expect("write plugin");
+        std::fs::write(
+            plugin_package_dir.join(".mcp.json"),
+            r#"{
+  "mcpServers": {
+    "demo-server": {
+      "command": "node",
+      "args": ["server.js"]
+    }
+  }
+}"#,
+        )
+        .expect("write mcp config");
+
+        let old_home = std::env::var_os("HOME");
+        let old_codex_home = std::env::var_os("CODEX_HOME");
+        std::env::set_var("HOME", &root);
+        std::env::set_var("CODEX_HOME", &codex_home);
+
+        standalone_plugin_lifecycle_result("plugin/disable", &json!({ "pluginId": "demo-plugin" }));
+        let plugins = standalone_plugin_list_result();
+        let demo_plugin = plugins
+            .get("data")
+            .and_then(Value::as_array)
+            .and_then(|plugins| {
+                plugins
+                    .iter()
+                    .find(|plugin| plugin.get("id").and_then(Value::as_str) == Some("demo-plugin"))
+            })
+            .expect("demo plugin");
+        assert_eq!(
+            demo_plugin.get("enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+        let mcp_servers = standalone_mcp_server_status_list();
+        let demo_server = mcp_servers
+            .iter()
+            .find(|server| server.get("name").and_then(Value::as_str) == Some("demo-server"))
+            .expect("demo mcp server");
+        assert_eq!(
+            demo_server.get("enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        standalone_plugin_lifecycle_result("plugin/enable", &json!({ "pluginId": "demo-plugin" }));
+        standalone_mcp_server_lifecycle_result(
+            "mcpServer/disable",
+            &json!({ "serverName": "demo-server" }),
+        );
+        let demo_server = standalone_mcp_server_status_list()
+            .into_iter()
+            .find(|server| server.get("name").and_then(Value::as_str) == Some("demo-server"))
+            .expect("demo mcp server after disable");
+        assert_eq!(
+            demo_server.get("enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        standalone_plugin_lifecycle_result(
+            "plugin/uninstall",
+            &json!({ "pluginId": "demo-plugin" }),
+        );
+        let plugins = standalone_plugin_list_result();
+        let demo_plugin = plugins
+            .get("data")
+            .and_then(Value::as_array)
+            .and_then(|plugins| {
+                plugins
+                    .iter()
+                    .find(|plugin| plugin.get("id").and_then(Value::as_str) == Some("demo-plugin"))
+            })
+            .expect("demo plugin after uninstall");
+        assert_eq!(
+            demo_plugin.get("installed").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            demo_plugin.get("enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        restore_env("HOME", old_home);
+        restore_env("CODEX_HOME", old_codex_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn claude_command_removes_env_vars_that_break_computer_use_mcp() {
         let _guard = ENV_TEST_LOCK.lock().expect("env lock poisoned");
         let old_env = CLAUDE_CHILD_ENV_REMOVALS
@@ -17358,6 +18378,77 @@ args = ["server.js", "--stdio"]
             .expect("get cleared goal")
             .get("goal")
             .is_some_and(Value::is_null));
+
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_pinned_memory_prewarm_and_steer_adapters() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("thread-pinned-memory");
+        std::fs::create_dir_all(&root).expect("create temp home");
+        std::env::set_var("HOME", &root);
+
+        let mut state = test_state(Some("workspace"));
+        let (prewarm_response, _) =
+            state.prewarm_thread(&json!({ "cwd": root, "pinned": true, "memoryMode": "off" }));
+        let thread_id = prewarm_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        assert_eq!(
+            prewarm_response.get("prewarmed").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            prewarm_response
+                .pointer("/thread/pinned")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            prewarm_response
+                .pointer("/thread/memoryMode")
+                .and_then(Value::as_str),
+            Some("off")
+        );
+
+        let list = state.thread_pinned_list();
+        assert!(list
+            .get("threadIds")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&thread_id))));
+
+        state
+            .thread_pinned_set(&json!({ "threadId": thread_id }), false)
+            .expect("unpin");
+        assert_eq!(
+            state
+                .thread_read(&json!({ "threadId": thread_id }))
+                .expect("thread read")
+                .pointer("/thread/pinned")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        state
+            .thread_memory_mode_set(&json!({ "threadId": thread_id, "memoryMode": "auto" }))
+            .expect("set memory mode");
+        assert_eq!(
+            state
+                .thread_memory_mode_get(&json!({ "threadId": thread_id }))
+                .expect("get memory mode")
+                .get("memoryMode")
+                .and_then(Value::as_str),
+            Some("auto")
+        );
+        let err = state
+            .steer_turn(&json!({ "threadId": thread_id, "text": "continue" }))
+            .expect_err("inactive steer fails");
+        assert!(err.contains("SteerTurnInactiveError"));
 
         restore_env("HOME", old_home);
         let _ = std::fs::remove_dir_all(root);
@@ -21602,6 +22693,72 @@ sleep 60
         assert!(diff.contains("@@ -2,1 +2,1 @@"), "{diff}");
         assert!(diff.contains("-old line"), "{diff}");
         assert!(diff.contains("+new line"), "{diff}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn maps_write_and_multiedit_tools_to_file_change_items() {
+        let root = test_dir("write-multiedit-file-change");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        std::fs::write(root.join("notes.txt"), "alpha\nbeta\n").expect("write fixture");
+        let cwd = root.to_string_lossy().to_string();
+
+        let write_state = ClaudeToolCallState {
+            name: "Write".to_string(),
+            arguments: json!({
+                "file_path": "new.txt",
+                "content": "hello\nworld\n",
+            }),
+            started_at_ms: 0,
+            started_emitted: true,
+            kind: claude_tool_item_kind("Write"),
+        };
+        let write_item = file_change_item_for_tool("write", &cwd, &write_state, "completed", None)
+            .expect("write file change item");
+        assert_eq!(
+            write_item
+                .pointer("/changes/0/kind/type")
+                .and_then(Value::as_str),
+            Some("create")
+        );
+        let write_diff = write_item
+            .pointer("/changes/0/diff")
+            .and_then(Value::as_str)
+            .expect("write diff");
+        assert!(write_diff.contains("+hello"), "{write_diff}");
+        assert!(write_diff.contains("+world"), "{write_diff}");
+
+        let multiedit_state = ClaudeToolCallState {
+            name: "MultiEdit".to_string(),
+            arguments: json!({
+                "file_path": "notes.txt",
+                "edits": [
+                    { "old_string": "alpha", "new_string": "ALPHA" },
+                    { "old_string": "beta", "new_string": "BETA" }
+                ],
+            }),
+            started_at_ms: 0,
+            started_emitted: true,
+            kind: claude_tool_item_kind("MultiEdit"),
+        };
+        let multiedit_item =
+            file_change_item_for_tool("multiedit", &cwd, &multiedit_state, "completed", None)
+                .expect("multiedit file change item");
+        assert_eq!(
+            multiedit_item
+                .pointer("/changes/0/kind/type")
+                .and_then(Value::as_str),
+            Some("update")
+        );
+        let multiedit_diff = multiedit_item
+            .pointer("/changes/0/diff")
+            .and_then(Value::as_str)
+            .expect("multiedit diff");
+        assert!(multiedit_diff.contains("-alpha"), "{multiedit_diff}");
+        assert!(multiedit_diff.contains("+ALPHA"), "{multiedit_diff}");
+        assert!(multiedit_diff.contains("-beta"), "{multiedit_diff}");
+        assert!(multiedit_diff.contains("+BETA"), "{multiedit_diff}");
 
         let _ = std::fs::remove_dir_all(root);
     }

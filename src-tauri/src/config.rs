@@ -607,14 +607,87 @@ impl Default for AppConfig {
     }
 }
 
+fn read_app_config(path: &Path) -> Result<Option<AppConfig>, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    };
+    serde_json::from_str::<AppConfig>(&content)
+        .map(Some)
+        .map_err(|err| err.to_string())
+}
+
+fn write_app_config(path: &Path, content: &str) -> Result<(), String> {
+    let temp_path = app_config_temp_path(path);
+    std::fs::write(&temp_path, content).map_err(|err| err.to_string())?;
+
+    if !path.exists() {
+        return std::fs::rename(&temp_path, path).map_err(|err| {
+            let _ = std::fs::remove_file(&temp_path);
+            err.to_string()
+        });
+    }
+
+    let backup_path = app_config_backup_path(path);
+    let _ = std::fs::remove_file(&backup_path);
+    std::fs::rename(path, &backup_path).map_err(|err| {
+        let _ = std::fs::remove_file(&temp_path);
+        err.to_string()
+    })?;
+
+    match std::fs::rename(&temp_path, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::rename(&backup_path, path);
+            let _ = std::fs::remove_file(&temp_path);
+            Err(err.to_string())
+        }
+    }
+}
+
+fn app_config_backup_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!("{}.bak", app_config_file_name(path)))
+}
+
+fn app_config_temp_path(path: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        app_config_file_name(path),
+        std::process::id(),
+        nanos
+    ))
+}
+
+fn app_config_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json")
+        .to_string()
+}
+
 impl AppConfig {
     pub fn load() -> Self {
         let path = config_path();
         let first_launch = !path.exists();
-        let mut config = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<AppConfig>(&content).ok())
-            .unwrap_or_default();
+        let mut config = match read_app_config(&path) {
+            Ok(Some(config)) => config,
+            Ok(None) => AppConfig::default(),
+            Err(err) => {
+                eprintln!(
+                    "Failed to load CodexL config from {}: {}. Using defaults without overwriting the config file.",
+                    path.display(),
+                    err
+                );
+                let mut config = AppConfig::default();
+                config.normalize();
+                return config;
+            }
+        };
         if first_launch {
             config.apply_initial_extension_defaults();
         }
@@ -638,7 +711,7 @@ impl AppConfig {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let content = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, content).map_err(|e| e.to_string())
+        write_app_config(&path, &content)
     }
 
     pub fn normalize(&mut self) {
@@ -4193,6 +4266,99 @@ requires_openai_auth = true
             std::env::set_var("CODEXL_CODEX_PATH", value);
         } else {
             std::env::remove_var("CODEXL_CODEX_PATH");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_config_load_does_not_overwrite_unparseable_config() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("invalid-app-config");
+        let old_home = std::env::var("HOME").ok();
+        let old_config_path = std::env::var("CODEXL_CONFIG_PATH").ok();
+        let config_path = root.join("config.json");
+
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(&config_path, "{").expect("write invalid config");
+        std::env::set_var("HOME", &root);
+        std::env::set_var("CODEXL_CONFIG_PATH", &config_path);
+
+        let config = AppConfig::load();
+        assert_eq!(config.provider_profiles.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read invalid config"),
+            "{"
+        );
+        assert!(!app_config_backup_path(&config_path).exists());
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_config_path {
+            std::env::set_var("CODEXL_CONFIG_PATH", value);
+        } else {
+            std::env::remove_var("CODEXL_CONFIG_PATH");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_config_save_preserves_previous_config_backup() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("app-config-backup");
+        let old_home = std::env::var("HOME").ok();
+        let old_config_path = std::env::var("CODEXL_CONFIG_PATH").ok();
+        let config_path = root.join("config.json");
+
+        std::fs::create_dir_all(&root).expect("create root");
+        std::env::set_var("HOME", &root);
+        std::env::set_var("CODEXL_CONFIG_PATH", &config_path);
+
+        let old_config = AppConfig {
+            active_provider: "old-workspace".to_string(),
+            ..AppConfig::default()
+        };
+        old_config.save().expect("save old config");
+
+        let new_config = AppConfig {
+            active_provider: "new-workspace".to_string(),
+            ..AppConfig::default()
+        };
+        new_config.save().expect("save new config");
+
+        let current: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&config_path).expect("read current config"),
+        )
+        .expect("parse current config");
+        let backup: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(app_config_backup_path(&config_path))
+                .expect("read backup config"),
+        )
+        .expect("parse backup config");
+        assert_eq!(
+            current
+                .get("active_provider")
+                .and_then(serde_json::Value::as_str),
+            Some("new-workspace")
+        );
+        assert_eq!(
+            backup
+                .get("active_provider")
+                .and_then(serde_json::Value::as_str),
+            Some("old-workspace")
+        );
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_config_path {
+            std::env::set_var("CODEXL_CONFIG_PATH", value);
+        } else {
+            std::env::remove_var("CODEXL_CONFIG_PATH");
         }
         let _ = std::fs::remove_dir_all(root);
     }

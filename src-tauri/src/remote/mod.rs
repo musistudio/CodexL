@@ -396,7 +396,11 @@ pub async fn start_remote_control(
         cdp_port,
     };
     let raw_lan_url = remote_url(&server_config.host, server_config.port, &token);
-    let lan_url = append_remote_connection_params(raw_lan_url.clone(), &server_config, false)?;
+    let lan_url = append_remote_connection_params(
+        raw_lan_url.clone(),
+        &server_config,
+        remote_requires_crypto(&server_config),
+    )?;
     let raw_url = if let Some(relay_url) = relay_url.as_deref() {
         remote_relay_url(
             relay_url,
@@ -422,7 +426,9 @@ pub async fn start_remote_control(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server_runtime = runtime.clone();
     tokio::spawn(async move {
-        if let Err(err) = serve_remote(listener, server_runtime, shutdown_rx).await {
+        let result = serve_remote(listener, server_runtime.clone(), shutdown_rx).await;
+        server_runtime.stopped.store(true, Ordering::Relaxed);
+        if let Err(err) = result {
             eprintln!("Remote control server failed: {}", err);
         }
     });
@@ -628,7 +634,14 @@ async fn serve_remote(
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             accepted = listener.accept() => {
-                let (stream, _) = accepted.map_err(|e| e.to_string())?;
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(err) => {
+                        eprintln!("Remote control HTTP accept failed: {}", err);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 let io = TokioIo::new(stream);
                 let request_runtime = runtime.clone();
                 tokio::spawn(async move {
@@ -1182,11 +1195,15 @@ impl RemoteRuntimeState {
         }
     }
 
-    fn remote_connection_info(&self, cloud_context: bool) -> Result<Value, String> {
+    fn remote_connection_info(&self, _cloud_context: bool) -> Result<Value, String> {
         let device_name = local_device_name();
         let instance_name = mobile_instance_item_name(&device_name, &self.config.workspace_name);
         let raw_lan_url = remote_url(&self.config.host, self.config.port, &self.config.token);
-        let lan_url = append_remote_connection_params(raw_lan_url.clone(), &self.config, false)?;
+        let lan_url = append_remote_connection_params(
+            raw_lan_url.clone(),
+            &self.config,
+            remote_requires_crypto(&self.config),
+        )?;
         let raw_url = if let Some(relay_url) = self.config.relay_url.as_deref() {
             remote_relay_url(
                 relay_url,
@@ -1233,7 +1250,7 @@ impl RemoteRuntimeState {
             .as_ref()
             .map(RemoteCloudAuthConfig::display_label);
 
-        let require_password = cloud_context && remote_requires_crypto(&self.config);
+        let require_password = remote_requires_crypto(&self.config);
 
         Ok(json!({
             "url": url,
@@ -1287,7 +1304,11 @@ impl RemoteRuntimeState {
         }
 
         let raw_lan_url = remote_url(&self.config.host, self.config.port, &self.config.token);
-        let lan_url = append_remote_connection_params(raw_lan_url, &self.config, false)?;
+        let lan_url = append_remote_connection_params(
+            raw_lan_url,
+            &self.config,
+            remote_requires_crypto(&self.config),
+        )?;
         let mut start_url =
             reqwest::Url::parse("http://codexl.invalid/").map_err(|e| e.to_string())?;
         start_url
@@ -3328,6 +3349,16 @@ impl CliAppBridge {
                 let store = self.global_state.lock().await;
                 return Ok((cli_workspace_root_options_response(&store), Vec::new()));
             }
+            "list-pinned-threads" => {
+                let response = self
+                    .request_cli_method_response(
+                        "thread/pinned/list",
+                        Value::Null,
+                        CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+                    )
+                    .await?;
+                return Ok((json_response_result(response)?, Vec::new()));
+            }
             _ => {}
         }
         if let Some(response) = cli_frontend_compat_endpoint_response(
@@ -3381,9 +3412,27 @@ impl CliAppBridge {
                 let messages = self.thread_started_messages_from_response(&response);
                 Ok((json_response_result(response)?, messages))
             }
-            "prewarm-thread-start-for-host"
-            | "prewarm-conversation-for-host"
-            | "clear-prewarmed-threads-for-host" => Ok((Value::Null, Vec::new())),
+            "prewarm-thread-start-for-host" | "prewarm-conversation-for-host" => {
+                let response = self
+                    .request_cli_method_response(
+                        "thread/prewarm",
+                        cli_thread_start_params(strip_host_id(params)),
+                        CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+                    )
+                    .await?;
+                let messages = self.thread_started_messages_from_response(&response);
+                Ok((json_response_result(response)?, messages))
+            }
+            "clear-prewarmed-threads-for-host" => {
+                let response = self
+                    .request_cli_method_response(
+                        "thread/prewarm/clear",
+                        Value::Null,
+                        CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+                    )
+                    .await?;
+                Ok((json_response_result(response)?, Vec::new()))
+            }
             "projectless-thread-cwd" => {
                 let endpoint_params = codex_fetch_endpoint_params(&params);
                 let prompt = endpoint_params
@@ -3406,7 +3455,22 @@ impl CliAppBridge {
                 cli_upload_local_file_attachments_response(&params),
                 Vec::new(),
             )),
-            "steer-turn-for-host" => Err(cli_steer_turn_inactive_error(&params)),
+            "steer-turn-for-host" => {
+                let response = self
+                    .request_cli_method_response(
+                        "turn/steer",
+                        cli_turn_steer_params(&params)?,
+                        CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+                    )
+                    .await?;
+                match json_response_result(response) {
+                    Ok(result) => Ok((result, Vec::new())),
+                    Err(err) if err.contains("SteerTurnInactiveError") => {
+                        Err(cli_steer_turn_inactive_error(&params))
+                    }
+                    Err(err) => Err(err),
+                }
+            }
             "interrupt-conversation" => {
                 let response = self
                     .request_cli_method_response(
@@ -3448,10 +3512,20 @@ impl CliAppBridge {
                     .await?;
                 Ok((json_response_result(response)?, Vec::new()))
             }
-            "clear-thread-goal-resume-confirmation"
-            | "ensure-conversation-history-loaded"
-            | "hydrate-pinned-threads"
-            | "set-thread-memory-mode-for-host" => Ok((json!({}), Vec::new())),
+            "clear-thread-goal-resume-confirmation" | "ensure-conversation-history-loaded" => {
+                Ok((json!({}), Vec::new()))
+            }
+            "hydrate-pinned-threads" => self.hydrate_cli_pinned_threads().await,
+            "set-thread-memory-mode-for-host" => {
+                let response = self
+                    .request_cli_method_response(
+                        "thread/memoryMode/set",
+                        cli_thread_memory_mode_set_params(&params)?,
+                        CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+                    )
+                    .await?;
+                Ok((json_response_result(response)?, Vec::new()))
+            }
             "start-turn-for-host" => {
                 let endpoint_params = cli_thread_action_endpoint_params(&params);
                 let conversation_id =
@@ -3787,6 +3861,46 @@ impl CliAppBridge {
             })
             .into_iter()
             .collect()
+    }
+
+    async fn hydrate_cli_pinned_threads(&self) -> Result<(Value, Vec<Value>), String> {
+        let response = self
+            .request_cli_method_response(
+                "thread/pinned/list",
+                Value::Null,
+                CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+            )
+            .await?;
+        let result = json_response_result(response)?;
+        let thread_ids = result
+            .get("threadIds")
+            .or_else(|| result.get("data"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        let mut messages = Vec::new();
+        for thread_id in &thread_ids {
+            let response = self
+                .request_cli_method_response(
+                    "thread/read",
+                    json!({
+                        "threadId": thread_id,
+                        "includeTurns": false,
+                    }),
+                    CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+                )
+                .await?;
+            messages.extend(self.thread_started_messages_from_response(&response));
+        }
+        Ok((
+            json!({
+                "threadIds": thread_ids,
+            }),
+            messages,
+        ))
     }
 
     async fn dispatch_socket_payload_with_emitter<F>(&self, raw: &str, emit: F) -> Value
@@ -6202,6 +6316,37 @@ fn cli_turn_interrupt_params(params: &Value) -> Result<Value, String> {
     Ok(Value::Object(output))
 }
 
+fn cli_turn_steer_params(params: &Value) -> Result<Value, String> {
+    let endpoint_params = codex_fetch_endpoint_params(params);
+    let thread_id = cli_conversation_id_from_params_for(endpoint_params, "steer-turn-for-host")?;
+    let mut output = Map::new();
+    output.insert("threadId".to_string(), json!(thread_id));
+    for key in [
+        "turnId", "input", "message", "content", "delta", "text", "prompt",
+    ] {
+        if let Some(value) = endpoint_params.get(key).filter(|value| !value.is_null()) {
+            output.insert(key.to_string(), value.clone());
+        }
+    }
+    Ok(Value::Object(output))
+}
+
+fn cli_thread_memory_mode_set_params(params: &Value) -> Result<Value, String> {
+    let endpoint_params = codex_fetch_endpoint_params(params);
+    let thread_id =
+        cli_conversation_id_from_params_for(endpoint_params, "set-thread-memory-mode-for-host")?;
+    let mut output = Map::new();
+    output.insert("threadId".to_string(), json!(thread_id));
+    for key in ["memoryMode", "memory_mode", "mode", "value"] {
+        if let Some(value) = endpoint_params.get(key).filter(|value| !value.is_null()) {
+            output.insert("memoryMode".to_string(), value.clone());
+            return Ok(Value::Object(output));
+        }
+    }
+    output.insert("memoryMode".to_string(), json!("auto"));
+    Ok(Value::Object(output))
+}
+
 fn cli_thread_name_set_params(params: &Value) -> Result<Value, String> {
     let endpoint_params = codex_fetch_endpoint_params(params);
     let thread_id = cli_conversation_id_from_params_for(endpoint_params, "set-thread-title")?;
@@ -8408,7 +8553,7 @@ mod tests {
     }
 
     #[test]
-    fn lan_remote_url_omits_cloud_relay_crypto_params() {
+    fn lan_remote_url_includes_crypto_params_when_remote_requires_password() {
         let crypto = RemoteCrypto::from_password(Some("secret"), "connection-1")
             .expect("remote crypto")
             .map(Arc::new);
@@ -8434,7 +8579,7 @@ mod tests {
         let lan_url = append_remote_connection_params(
             "http://127.0.0.1:3147/?token=remote-token".to_string(),
             &config,
-            false,
+            remote_requires_crypto(&config),
         )
         .expect("lan url");
         let lan_pairs = reqwest::Url::parse(&lan_url)
@@ -8443,8 +8588,11 @@ mod tests {
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect::<HashMap<_, _>>();
 
-        assert_eq!(lan_pairs.get("requirePassword"), None);
-        assert_eq!(lan_pairs.get("e2ee"), None);
+        assert_eq!(
+            lan_pairs.get("requirePassword").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(lan_pairs.get("e2ee").map(String::as_str), Some("v1"));
 
         let cloud_url = append_remote_connection_params(
             "https://relay.example.com/?auth=cloud&token=connection-1".to_string(),

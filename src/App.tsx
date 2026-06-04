@@ -871,14 +871,6 @@ type ProviderForm = {
 type RemoteQrState = {
   profile: ProviderProfile;
   remote: RemoteControlInfo;
-  defaultUrlKind: RemoteQrUrlKind;
-};
-
-type RemoteQrUrlKind = "remote" | "lan";
-
-type RemoteQrUrlOption = {
-  kind: RemoteQrUrlKind;
-  url: string;
 };
 
 type RemoteLaunchOptions = {
@@ -2597,14 +2589,9 @@ function App() {
         if (!remoteControlReadyForQr(remote)) {
           return;
         }
-        const urlOptions = remoteQrUrlOptions(remote);
-        if (urlOptions.length === 0) {
-          return;
-        }
         setRemoteQr({
           profile,
           remote,
-          defaultUrlKind: urlOptions[0].kind,
         });
       } catch (error) {
         showSettingsError(error);
@@ -3385,7 +3372,7 @@ function ProfileCard({
         <div className="flex gap-2">
           <IconButton
             title={strings.showRemoteQr}
-            disabled={isBusy || !showRemoteActions || !(remote?.url || remote?.lan_url)}
+            disabled={isBusy || !showRemoteActions || !remote?.lan_url}
             tooltip={remoteQrDisabledTooltip}
             onClick={() => {
               if (remote) {
@@ -8894,20 +8881,11 @@ function RemoteQrDialog({
   const strings = useAppStrings();
   const [copySucceeded, setCopySucceeded] = useState(false);
   const copyResetTimerRef = useRef<number | null>(null);
-  const urlOptions = useMemo(() => remoteQrUrlOptions(remoteQr.remote), [remoteQr.remote]);
-  const [selectedUrlKind, setSelectedUrlKind] = useState<RemoteQrUrlKind>(remoteQr.defaultUrlKind);
-  const selectedOption =
-    urlOptions.find((option) => option.kind === selectedUrlKind) ?? urlOptions[0] ?? null;
-  const selectedUrl = selectedOption?.url ?? "";
-  const selectedUrlLabel = selectedOption ? remoteQrUrlLabel(selectedOption.kind, strings) : strings.remoteUrl;
-  const qrUrl = useMemo(() => compactRemoteQrUrl(selectedUrl), [selectedUrl]);
-  const qrMarkup = useMemo(() => createQrSvg(qrUrl, { moduleSize: 5, quietZone: 4 }), [qrUrl]);
-
-  useEffect(() => {
-    if (!selectedOption && urlOptions[0]) {
-      setSelectedUrlKind(urlOptions[0].kind);
-    }
-  }, [selectedOption, urlOptions]);
+  const selectedUrl = remoteQrLanUrl(remoteQr.remote);
+  const qrMarkup = useMemo(
+    () => createQrSvg(selectedUrl, { moduleSize: 5, quietZone: 4, maxPixelSize: 320 }),
+    [selectedUrl],
+  );
 
   useEffect(() => {
     setCopySucceeded(false);
@@ -8957,32 +8935,11 @@ function RemoteQrDialog({
         </DialogHeader>
         <div className="px-5 py-5 flex flex-col gap-4">
           <div
-            className="mx-auto max-w-full rounded-lg bg-white p-3 shadow-sm [&_svg]:h-auto [&_svg]:max-w-full"
+            className="mx-auto rounded-lg bg-white p-3 shadow-sm"
             dangerouslySetInnerHTML={{ __html: qrMarkup }}
           />
           <div className="space-y-2">
-            {urlOptions.length > 1 ? (
-              <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-muted/30 p-1">
-                {urlOptions.map((option) => {
-                  const selected = option.kind === selectedOption?.kind;
-                  return (
-                    <button
-                      key={option.kind}
-                      type="button"
-                      aria-pressed={selected}
-                      className={cn(
-                        "h-8 rounded-[5px] px-2 text-xs font-medium text-muted-foreground transition-colors",
-                        selected ? "bg-background text-foreground shadow-sm" : "hover:bg-background/70 hover:text-foreground",
-                      )}
-                      onClick={() => setSelectedUrlKind(option.kind)}
-                    >
-                      {remoteQrUrlLabel(option.kind, strings)}
-                    </button>
-                  );
-                })}
-              </div>
-            ) : null}
-            <div className="text-[11px] font-semibold uppercase text-muted-foreground">{selectedUrlLabel}</div>
+            <div className="text-[11px] font-semibold uppercase text-muted-foreground">{strings.lanUrl}</div>
             <div className="rounded-md border border-border bg-muted/30 px-3 py-2">
               <div className="min-w-0 break-all font-mono text-xs">
                 {selectedUrl}
@@ -9584,73 +9541,14 @@ function remoteFrontendModeUsesCli(mode: RemoteFrontendMode | string) {
 }
 
 function remoteControlReadyForQr(remote: RemoteControlInfo | null) {
-  if (!remote?.running || (!remote.url && !remote.lan_url)) {
+  if (!remote?.running || !remoteQrLanUrl(remote)) {
     return false;
   }
   return remote.cdp_ready === true;
 }
 
-function remoteQrUrlOptions(remote: RemoteControlInfo): RemoteQrUrlOption[] {
-  const remoteUrl = typeof remote.url === "string" ? remote.url.trim() : "";
-  const lanUrl = typeof remote.lan_url === "string" ? remote.lan_url.trim() : "";
-  const preferredKind: RemoteQrUrlKind =
-    remote.connection_mode === "cloud" && remoteUrl ? "remote" : "lan";
-  const preferredFirst: RemoteQrUrlOption[] =
-    preferredKind === "remote"
-      ? [
-          { kind: "remote", url: remoteUrl },
-          { kind: "lan", url: lanUrl },
-        ]
-      : [
-          { kind: "lan", url: lanUrl },
-          { kind: "remote", url: remoteUrl },
-        ];
-  const seenUrls = new Set<string>();
-  const options: RemoteQrUrlOption[] = [];
-
-  for (const option of preferredFirst) {
-    if (!option.url || seenUrls.has(option.url)) {
-      continue;
-    }
-    seenUrls.add(option.url);
-    options.push(option);
-  }
-
-  return options;
-}
-
-function remoteQrUrlLabel(kind: RemoteQrUrlKind, strings: AppStrings) {
-  return kind === "remote" ? strings.remoteUrl : strings.lanUrl;
-}
-
-function compactRemoteQrUrl(value: string) {
-  try {
-    const url = new URL(value);
-    for (const key of [
-      "deviceName",
-      "device_name",
-      "itemName",
-      "item_name",
-      "name",
-      "remoteFrontendMode",
-      "remoteMode",
-      "remote_frontend_mode",
-      "remote_mode",
-      "webAssetMode",
-      "webAssetBaseUrl",
-      "webAssetVersion",
-      "web_asset_mode",
-      "web_asset_base_url",
-      "web_asset_version",
-      "workspaceName",
-      "workspace_name",
-    ]) {
-      url.searchParams.delete(key);
-    }
-    return url.toString();
-  } catch {
-    return value;
-  }
+function remoteQrLanUrl(remote: RemoteControlInfo | null) {
+  return typeof remote?.lan_url === "string" ? remote.lan_url.trim() : "";
 }
 
 function normalizeRegistryUrl(value: string) {
