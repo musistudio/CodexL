@@ -78,11 +78,6 @@ extractAsarDirectory(asar, "webview", versionDir, (assetPath, content) => {
       prepareIndexHtml(content.toString("utf8"), runtimeScripts),
       "utf8",
     );
-  } else if (assetPath.endsWith(".js")) {
-    nextContent = Buffer.from(
-      patchCodexAppWebJavascript(assetPath, content.toString("utf8")),
-      "utf8",
-    );
   } else if (assetPath.endsWith(".css")) {
     nextContent = Buffer.from(rewriteCssAssetUrls(assetPath, content.toString("utf8")), "utf8");
   }
@@ -413,9 +408,6 @@ function prepareIndexHtml(raw, runtimeScripts) {
   );
 
   const tags = [];
-  if (!html.includes("codexl-mobile-touch-fix")) {
-    tags.push(codexAppMobileTouchFixTag());
-  }
   if (!html.includes("_codexl_bridge.js")) {
     tags.push(`    <script src="${escapeHtml(runtimeScripts.bridge)}"></script>`);
   }
@@ -432,166 +424,6 @@ function prepareIndexHtml(raw, runtimeScripts) {
     return html.replace("</head>", `${tag}</head>`);
   }
   return `${tag}${html}`;
-}
-
-function codexAppMobileTouchFixTag() {
-  return `    <script id="codexl-mobile-touch-fix">(() => {
-      const root = document.documentElement;
-      const attr = "data-codexl-touch-device";
-      const styleId = "codexl-mobile-touch-style";
-      const touchQuery = "(hover: none), (pointer: coarse), (any-pointer: coarse)";
-      const selectors = [
-        '[data-app-action-sidebar-thread-row]',
-        '[role="button"]:has([data-thread-title-trigger])'
-      ].join(", ");
-      const style = document.createElement("style");
-      style.id = styleId;
-      style.textContent = \`
-        @media \${touchQuery} {
-          [data-testid="app-shell-floating-left-panel"],
-          div:has(> [data-testid="app-shell-floating-left-panel"]) {
-            display: none !important;
-            pointer-events: none !important;
-          }
-          \${selectors} [class*="group-hover:opacity-100"],
-          \${selectors} [class*="group-focus-within:opacity-100"],
-          \${selectors} [class*="group-hover:opacity-50"] {
-            opacity: 1 !important;
-          }
-          \${selectors} [class*="group-hover:pointer-events-auto"],
-          \${selectors} [class*="group-focus-within:pointer-events-auto"] {
-            pointer-events: auto !important;
-          }
-          \${selectors} [class*="group-hover:opacity-0"],
-          \${selectors} [class*="group-focus-within:opacity-0"] {
-            opacity: 0 !important;
-          }
-          \${selectors} [class*="group-hover:min-w-5"],
-          \${selectors} [class*="group-has-"][class*="min-w-5"] {
-            min-width: 1.25rem !important;
-          }
-          \${selectors} [class*="group-hover:min-w-12"],
-          \${selectors} [class*="group-has-"][class*="min-w-12"] {
-            min-width: 3rem !important;
-          }
-          \${selectors} [class*="group-hover:min-w-20"],
-          \${selectors} [class*="group-has-"][class*="min-w-20"] {
-            min-width: 5rem !important;
-          }
-          [data-tab-id] [class*="group-hover/tab:flex"] {
-            display: flex !important;
-            opacity: 1 !important;
-            pointer-events: auto !important;
-          }
-          [role="button"]:has([data-thread-title-trigger]) button,
-          [data-tab-id] [role="button"],
-          [data-tab-id] button {
-            touch-action: manipulation;
-          }
-        }
-        html[\${attr}="1"] [data-testid="app-shell-floating-left-panel"],
-        html[\${attr}="1"] div:has(> [data-testid="app-shell-floating-left-panel"]) {
-          display: none !important;
-          pointer-events: none !important;
-        }
-        html[\${attr}="1"] \${selectors} [class*="group-hover:opacity-100"],
-        html[\${attr}="1"] \${selectors} [class*="group-focus-within:opacity-100"],
-        html[\${attr}="1"] \${selectors} [class*="group-hover:opacity-50"] {
-          opacity: 1 !important;
-        }
-        html[\${attr}="1"] \${selectors} [class*="group-hover:pointer-events-auto"],
-        html[\${attr}="1"] \${selectors} [class*="group-focus-within:pointer-events-auto"] {
-          pointer-events: auto !important;
-        }
-        html[\${attr}="1"] \${selectors} [class*="group-hover:opacity-0"],
-        html[\${attr}="1"] \${selectors} [class*="group-focus-within:opacity-0"] {
-          opacity: 0 !important;
-        }
-        html[\${attr}="1"] \${selectors} [class*="group-hover:min-w-5"],
-        html[\${attr}="1"] \${selectors} [class*="group-has-"][class*="min-w-5"] {
-          min-width: 1.25rem !important;
-        }
-        html[\${attr}="1"] \${selectors} [class*="group-hover:min-w-12"],
-        html[\${attr}="1"] \${selectors} [class*="group-has-"][class*="min-w-12"] {
-          min-width: 3rem !important;
-        }
-        html[\${attr}="1"] \${selectors} [class*="group-hover:min-w-20"],
-        html[\${attr}="1"] \${selectors} [class*="group-has-"][class*="min-w-20"] {
-          min-width: 5rem !important;
-        }
-        html[\${attr}="1"] [data-tab-id] [class*="group-hover/tab:flex"] {
-          display: flex !important;
-          opacity: 1 !important;
-          pointer-events: auto !important;
-        }
-        html[\${attr}="1"] [role="button"]:has([data-thread-title-trigger]) button,
-        html[\${attr}="1"] [data-tab-id] [role="button"],
-        html[\${attr}="1"] [data-tab-id] button {
-          touch-action: manipulation;
-        }
-      \`;
-      if (!document.getElementById(styleId)) {
-        (document.head || root).appendChild(style);
-      }
-      const mark = () => {
-        root.setAttribute(attr, "1");
-      };
-      const isTouchDevice = () => {
-        try {
-          return navigator.maxTouchPoints > 0 || window.matchMedia?.(touchQuery)?.matches === true;
-        } catch {
-          return false;
-        }
-      };
-      if (isTouchDevice()) {
-        mark();
-      }
-      window.addEventListener("touchstart", mark, { capture: true, passive: true });
-      window.addEventListener("pointerdown", (event) => {
-        if (event?.pointerType === "touch" || event?.pointerType === "pen") {
-          mark();
-        }
-      }, { capture: true, passive: true });
-    })();</script>`;
-}
-
-function patchCodexAppWebJavascript(assetPath, raw) {
-  if (!assetPath.startsWith("assets/app-shell-") || !assetPath.endsWith(".js")) {
-    return raw;
-  }
-
-  const floatingPanelMarker = "app-shell-floating-left-panel";
-  if (!raw.includes(floatingPanelMarker)) {
-    return raw;
-  }
-
-  let patched = raw;
-  patched = replaceOnce(
-    patched,
-    "let a=t.watch(({get:a})=>{if(a(Ze)){n=!1,r=void 0,i=void 0,e(!1);return}",
-    'let a=t.watch(({get:a})=>{if((()=>{try{return navigator.maxTouchPoints>0||window.matchMedia?.("(hover: none), (pointer: coarse), (any-pointer: coarse)")?.matches===!0}catch{return!1}})()){n=!1,r=void 0,i=void 0,e(!1);return}if(a(Ze)){n=!1,r=void 0,i=void 0,e(!1);return}',
-    assetPath,
-    "left sidebar floating hover preview",
-  );
-  patched = replaceOnce(
-    patched,
-    "R=()=>{s.set(Ne,!0)},z=()=>{s.set(Ne,!1),s.set(Le,!1),s.set(Ae,!1)}",
-    "R=e=>{if(e?.pointerType===`touch`||e?.pointerType===`pen`||navigator.maxTouchPoints>0)return;s.set(Ne,!0)},z=()=>{s.set(Ne,!1),s.set(Le,!1),s.set(Ae,!1)}",
-    assetPath,
-    "left sidebar trigger touch pointer hover",
-  );
-  return patched;
-}
-
-function replaceOnce(raw, search, replacement, assetPath, label) {
-  const index = raw.indexOf(search);
-  if (index < 0) {
-    fail(`Could not apply Codex App web patch for ${label}: ${assetPath}`);
-  }
-  if (raw.indexOf(search, index + search.length) >= 0) {
-    fail(`Codex App web patch for ${label} matched more than once: ${assetPath}`);
-  }
-  return `${raw.slice(0, index)}${replacement}${raw.slice(index + search.length)}`;
 }
 
 function rewriteCssAssetUrls(assetPath, raw) {

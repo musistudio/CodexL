@@ -61,8 +61,8 @@ use file_picker::{web_file_picker_directory_payload, web_file_picker_payload, We
 #[cfg(test)]
 use resource::{
     append_html_asset_auth_query, extension_from_url, infer_resource_url, inject_web_bridge_script,
-    parse_web_resource_socket_message, patch_codex_app_web_javascript_resource,
-    resource_path_matches_lookup, resource_url_with_main_query, rewrite_css_resource_links,
+    parse_web_resource_socket_message, resource_path_matches_lookup, resource_url_with_main_query,
+    rewrite_css_resource_links,
     rewrite_html_resource_links, runtime_fetch_url_variants, strip_html_content_security_policy,
     web_cache_resource_paths, web_path_candidates, web_resource_socket_response,
     web_resource_version,

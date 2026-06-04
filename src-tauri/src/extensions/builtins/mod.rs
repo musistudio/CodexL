@@ -239,6 +239,10 @@ pub fn prepare_builtin_extensions_runtime() -> Result<RuntimeStatus, String> {
     Ok(runtime_status(Some(&node)))
 }
 
+pub fn user_node_runtime_available() -> bool {
+    resolve_user_node_runtime().is_some()
+}
+
 fn prepare_builtin_node_extension(
     spec: BuiltinNodeExtensionSpec,
 ) -> Result<BuiltinExtensionStatus, String> {
@@ -850,6 +854,14 @@ fn resolve_existing_node_runtime() -> Option<NodeRuntime> {
         .flatten()
         .or_else(resolve_system_node_runtime)
         .or_else(resolve_managed_node_runtime)
+}
+
+fn resolve_user_node_runtime() -> Option<NodeRuntime> {
+    match resolve_explicit_node_runtime() {
+        Ok(Some(runtime)) => Some(runtime),
+        Ok(None) => resolve_system_node_runtime(),
+        Err(_) => None,
+    }
 }
 
 fn resolve_explicit_node_runtime() -> Result<Option<NodeRuntime>, String> {
