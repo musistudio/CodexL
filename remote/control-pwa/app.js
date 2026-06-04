@@ -1,5 +1,5 @@
-import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260604-pwa-preserve-lang-v13";
-import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260604-pwa-preserve-lang-v13";
+import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260604-pwa-friendly-status-v14";
+import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260604-pwa-friendly-status-v14";
 
 const MAX_SCREEN_ZOOM = 4;
 const MIN_SCREEN_ZOOM = 1;
@@ -40,7 +40,7 @@ const SIDEBAR_SWIPE_RIGHT_OPEN_REGION_RATIO = 0.22;
 const SIDEBAR_SWIPE_MIN_DISTANCE_PX = 72;
 const SIDEBAR_SWIPE_MAX_VERTICAL_PX = 52;
 const SIDEBAR_SWIPE_DIRECTION_RATIO = 1.35;
-const PWA_BUILD = "20260604-pwa-preserve-lang-v13";
+const PWA_BUILD = "20260604-pwa-friendly-status-v14";
 const WEB_BRIDGE_URL_PARAM = "codexBridgeUrl";
 const PARENT_BRIDGE_OPEN_MESSAGE = "codex-web-parent-bridge-open";
 const PARENT_BRIDGE_OPENED_MESSAGE = "codex-web-parent-bridge-opened";
@@ -82,26 +82,26 @@ const CONTROL_STRINGS = {
     retry: "Retry",
     screenLabel: "Codex app screen",
     secureWeb: "Use HTTPS",
-    webAssetVersion: "Codex app web bundle version",
-    webFrameTitle: "Codex web bridge",
-    webMode: "Web",
+    webAssetVersion: "Codex app version",
+    webFrameTitle: "Remote workspace view",
+    webMode: "Workspace",
     status: {
-      cdpConnected: "CDP connected",
+      cdpConnected: "Desktop screen connected",
       connected: "Connected",
       connecting: "Connecting",
-      connectingWebBridge: "Connecting web bridge",
-      controlDisconnectedRetrying: "Control disconnected, retrying",
+      connectingWebBridge: "Connecting to your workspace",
+      controlDisconnectedRetrying: "Connection lost, retrying",
       enterPassword: "Enter the remote password.",
-      frameDecodeFailed: "Frame decode failed",
-      httpsBundleUnavailable: "HTTPS app bundle unavailable",
+      frameDecodeFailed: "Unable to show the remote screen",
+      httpsBundleUnavailable: "Secure workspace view unavailable",
       invalidUrl: "Invalid URL",
       loadingRemoteScreen: "Loading remote screen",
-      loadingWebBridge: "Loading web bridge",
+      loadingWebBridge: "Opening your workspace",
       missingToken: "Missing token",
       notConnected: "Not connected",
       offlineWaiting: "Offline, waiting to reconnect",
-      openingLanRemote: "Opening LAN remote",
-      preparingWebCache: "Preparing web cache",
+      openingLanRemote: "Opening local network connection",
+      preparingWebCache: "Preparing your workspace",
       remoteConnectionUnavailable: "Remote connection unavailable.",
       remoteMetadataTimedOut: "Remote metadata timed out.",
       remotePasswordRequired: "Remote password required",
@@ -110,15 +110,15 @@ const CONTROL_STRINGS = {
       restoringConnection: "Restoring connection",
       unableUnlock: "Unable to unlock remote control.",
       unlocking: "Unlocking",
-      waitingForCdp: "Waiting for CDP",
-      webBridgeDisconnectedRetrying: "Web bridge disconnected, retrying",
-      webBridgeUnavailable: "Web bridge unavailable",
-      webCacheFailed: "Web cache failed",
-      webConnected: "Web connected",
+      waitingForCdp: "Waiting for the desktop screen",
+      webBridgeDisconnectedRetrying: "Workspace connection lost, retrying",
+      webBridgeUnavailable: "Workspace view unavailable",
+      webCacheFailed: "Unable to prepare workspace",
+      webConnected: "Workspace ready",
     },
-    loadingAppBundle: (version) => `Loading app bundle (${version})`,
-    openingHttpsAppBundle: (version) => `Opening HTTPS app bundle (${version})`,
-    webCacheUpdated: (count) => `Web cache updated (${count})`,
+    loadingAppBundle: (version) => `Loading workspace (${version})`,
+    openingHttpsAppBundle: (version) => `Opening secure workspace (${version})`,
+    webCacheUpdated: (count) => `Workspace files updated (${count})`,
   },
   zh: {
     appName: "CodexL",
@@ -143,26 +143,26 @@ const CONTROL_STRINGS = {
     retry: "重试",
     screenLabel: "Codex 应用画面",
     secureWeb: "使用 HTTPS",
-    webAssetVersion: "Codex App Web 包版本",
-    webFrameTitle: "Codex Web 桥接页",
-    webMode: "Web",
+    webAssetVersion: "Codex App 版本",
+    webFrameTitle: "远程工作区视图",
+    webMode: "工作区",
     status: {
-      cdpConnected: "CDP 已连接",
+      cdpConnected: "桌面画面已连接",
       connected: "已连接",
       connecting: "连接中",
-      connectingWebBridge: "正在连接 Web 桥接",
-      controlDisconnectedRetrying: "控制连接已断开，正在重试",
+      connectingWebBridge: "正在连接远程工作区",
+      controlDisconnectedRetrying: "连接已断开，正在重试",
       enterPassword: "请输入远程密码。",
-      frameDecodeFailed: "画面解码失败",
-      httpsBundleUnavailable: "HTTPS App 包不可用",
+      frameDecodeFailed: "无法显示远程画面",
+      httpsBundleUnavailable: "安全工作区视图不可用",
       invalidUrl: "URL 无效",
       loadingRemoteScreen: "正在加载远程画面",
-      loadingWebBridge: "正在加载 Web 桥接",
+      loadingWebBridge: "正在打开远程工作区",
       missingToken: "连接 token 缺失",
       notConnected: "未连接",
       offlineWaiting: "网络离线，等待重连",
-      openingLanRemote: "正在打开局域网远程页面",
-      preparingWebCache: "正在准备 Web 缓存",
+      openingLanRemote: "正在打开局域网连接",
+      preparingWebCache: "正在准备远程工作区",
       remoteConnectionUnavailable: "远程连接暂不可用。",
       remoteMetadataTimedOut: "远程信息请求超时。",
       remotePasswordRequired: "需要远程密码",
@@ -171,15 +171,15 @@ const CONTROL_STRINGS = {
       restoringConnection: "正在恢复连接",
       unableUnlock: "无法解锁远程控制。",
       unlocking: "正在解锁",
-      waitingForCdp: "等待 CDP",
-      webBridgeDisconnectedRetrying: "Web 桥接已断开，正在重试",
-      webBridgeUnavailable: "Web 桥接不可用",
-      webCacheFailed: "Web 缓存失败",
-      webConnected: "Web 已连接",
+      waitingForCdp: "正在等待桌面画面",
+      webBridgeDisconnectedRetrying: "远程工作区连接已断开，正在重试",
+      webBridgeUnavailable: "远程工作区视图不可用",
+      webCacheFailed: "远程工作区准备失败",
+      webConnected: "远程工作区已就绪",
     },
-    loadingAppBundle: (version) => `正在加载 App 包（${version}）`,
-    openingHttpsAppBundle: (version) => `正在打开 HTTPS App 包（${version}）`,
-    webCacheUpdated: (count) => `Web 缓存已更新（${count}）`,
+    loadingAppBundle: (version) => `正在加载远程工作区（${version}）`,
+    openingHttpsAppBundle: (version) => `正在打开安全工作区（${version}）`,
+    webCacheUpdated: (count) => `远程工作区文件已更新（${count}）`,
   },
 };
 const controlStrings = CONTROL_STRINGS[CONTROL_LANGUAGE];
@@ -1757,7 +1757,7 @@ function createInstanceCard(instance) {
     createMetaLine("Last connected", formatTime(instance.lastConnectedAt)),
   ];
   if (instance.webAssetBaseUrl) {
-    metaLines.splice(1, 0, createMetaLine("Bundle", instance.webAssetVersion || "latest"));
+    metaLines.splice(1, 0, createMetaLine("Version", instance.webAssetVersion || "latest"));
   }
   meta.append(...metaLines);
 
@@ -2830,7 +2830,7 @@ function registerServiceWorker() {
     .register(SERVICE_WORKER_URL)
     .then((registration) => registration.update())
     .catch(() => {
-      // Screen mode still works without offline caching; Web mode requires the worker.
+      // Screen mode still works without offline caching; the workspace view requires the worker.
     });
 }
 
@@ -3679,7 +3679,7 @@ async function openRegistryStandalonePage() {
 
 async function prepareWebCache(iframeUrl) {
   if (!("serviceWorker" in navigator)) {
-    throw new Error("Service worker is required for Web mode");
+    throw new Error("This browser cannot prepare the remote workspace.");
   }
   const registration = await navigator.serviceWorker.ready;
   const worker = await webCacheServiceWorker(registration);
@@ -3690,7 +3690,7 @@ async function prepareWebCache(iframeUrl) {
     const channel = typeof MessageChannel === "function" ? new MessageChannel() : null;
     const timer = setTimeout(() => {
       cleanup();
-      reject(new Error("Timed out preparing web cache"));
+      reject(new Error("Timed out preparing the remote workspace."));
     }, WEB_CACHE_PREPARE_TIMEOUT_MS);
     const cleanup = () => {
       clearTimeout(timer);
@@ -3785,7 +3785,7 @@ function normalizeRemoteMode(mode) {
 }
 
 function remoteModeLabel(mode) {
-  return normalizeRemoteMode(mode) === REMOTE_MODE_WEB ? "Web" : "Screen";
+  return normalizeRemoteMode(mode) === REMOTE_MODE_WEB ? controlStrings.webMode : "Screen";
 }
 
 function webTransportUrl() {

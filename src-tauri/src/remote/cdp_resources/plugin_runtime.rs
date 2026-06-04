@@ -14,7 +14,7 @@ const CODEXL_PLUGIN_BRIDGE_PATH: &str = "/plugin/_bridge";
 const CODEXL_PLUGIN_CDP_BINDING_NAME: &str = "__codexlPluginBridge";
 const CODEXL_PLUGIN_INJECT_TIMEOUT_MS: u64 = 20_000;
 const CODEXL_PLUGIN_INJECT_RETRY_MS: u64 = 150;
-const CODEXL_PLUGIN_RUNTIME_VERSION: &str = "0.1.20";
+const CODEXL_PLUGIN_RUNTIME_VERSION: &str = "0.1.23";
 const CODEXL_RENDERER_PLUGIN_ENTRY_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
 const CODEXL_CORE_PLUGIN_ID: &str = "codexl.core";
 #[cfg(test)]
@@ -1228,7 +1228,7 @@ fn safe_relative_path(value: &str) -> Option<PathBuf> {
 
 const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   const RUNTIME_VERSION = "__CODEXL_PLUGIN_RUNTIME_VERSION__";
-  const RUNTIME_BUILD = "mobile-touch-react-surfaces";
+  const RUNTIME_BUILD = "mobile-touch-react-surfaces-model-submenu-overlay";
   const BRIDGE_URL = "__CODEXL_PLUGIN_BRIDGE_URL__";
   const ROOT_ID = "codexl-plugin-runtime-root";
   const CORE_PLUGIN_ID = "codexl.core";
@@ -1273,6 +1273,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     latestContextUsage: null,
     lastContextLocationKey: "",
     loadedPlugins: new Map(),
+    mobileModelPickerElements: new Map(),
     mobileTouchActiveKey: "",
     mobileTouchSurfaces: new Map(),
     pending: new Map(),
@@ -1428,6 +1429,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       updateUi();
       scheduleGatewayModelQuerySelectorRepair();
       scheduleMobileTouchReactSurfaceSync(root);
+      scheduleMobileModelPickerSync(root);
       if (originalOnCommitFiberRoot) {
         return originalOnCommitFiberRoot(id, root, priorityLevel, didError);
       }
@@ -1717,6 +1719,229 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     }
     runtime.mobileTouchActiveKey = "";
     runtime.mobileTouchSurfaceCleanupInstalled = false;
+  }
+
+  function scheduleMobileModelPickerSync(root) {
+    if (!root) {
+      return;
+    }
+    runtime.mobileModelPickerLastRoot = root;
+    if (runtime.mobileModelPickerSyncPending) {
+      return;
+    }
+    runtime.mobileModelPickerSyncPending = true;
+    const schedule =
+      typeof window.requestAnimationFrame === "function"
+        ? window.requestAnimationFrame.bind(window)
+        : (callback) => window.setTimeout(callback, 16);
+    schedule(() => {
+      runtime.mobileModelPickerSyncPending = false;
+      const pendingRoot = runtime.mobileModelPickerLastRoot;
+      runtime.mobileModelPickerLastRoot = null;
+      syncMobileModelPickerSurfaces(pendingRoot);
+    });
+  }
+
+  function syncMobileModelPickerSurfaces(root) {
+    const rootFiber = root?.current || root;
+    if (!rootFiber) {
+      return;
+    }
+    if (!runtime.mobileModelPickerCleanupInstalled) {
+      runtime.mobileModelPickerCleanupInstalled = true;
+      runtime.cleanup.push(cleanupMobileModelPickerSurfaces);
+    }
+    const seen = new Set();
+    let fiber = rootFiber;
+    let visited = 0;
+    while (fiber && visited < 30000) {
+      visited += 1;
+      const node = fiber.stateNode;
+      if (node instanceof Element) {
+        const kind = mobileModelPickerKind(node);
+        if (kind) {
+          markMobileModelPickerElement(node, kind);
+          seen.add(node);
+        }
+        if (mobileModelPickerIsItemElement(node) && mobileModelPickerModelFromElement(node)) {
+          markMobileModelPickerContainers(node, seen);
+        }
+      }
+      if (fiber.child) {
+        fiber = fiber.child;
+        continue;
+      }
+      while (fiber && fiber !== rootFiber && !fiber.sibling) {
+        fiber = fiber.return || null;
+      }
+      if (!fiber || fiber === rootFiber) {
+        break;
+      }
+      fiber = fiber.sibling;
+    }
+    for (const [element] of Array.from(runtime.mobileModelPickerElements.entries())) {
+      if (!element.isConnected || !seen.has(element)) {
+        removeMobileModelPickerElement(element);
+      }
+    }
+  }
+
+  function mobileModelPickerKind(element) {
+    if (!(element instanceof HTMLElement)) {
+      return "";
+    }
+    const role = element.getAttribute("role") || "";
+    if (mobileModelPickerIsItemRole(role) && mobileModelPickerModelFromElement(element)) {
+      return "item";
+    }
+    if ((role === "menu" || role === "listbox") && mobileModelPickerMenuHasModel(element)) {
+      return mobileModelPickerFloatingKind(element);
+    }
+    if (element.hasAttribute("data-radix-menu-content") && mobileModelPickerMenuHasModel(element)) {
+      return mobileModelPickerFloatingKind(element);
+    }
+    if (element.hasAttribute("data-codex-intelligence-trigger")) {
+      return "trigger";
+    }
+    if (element.tagName === "BUTTON" && mobileModelPickerModelFromElement(element)) {
+      return "trigger";
+    }
+    return "";
+  }
+
+  function mobileModelPickerMenuHasModel(element) {
+    try {
+      return Array.from(element.querySelectorAll(mobileModelPickerItemSelector())).some((item) =>
+        Boolean(mobileModelPickerModelFromElement(item))
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function mobileModelPickerItemSelector() {
+    return '[role="menuitem"],[role="menuitemradio"],[role="menuitemcheckbox"],[role="option"]';
+  }
+
+  function mobileModelPickerIsItemElement(element) {
+    return element instanceof Element && mobileModelPickerIsItemRole(element.getAttribute("role") || "");
+  }
+
+  function mobileModelPickerIsItemRole(role) {
+    return (
+      role === "menuitem" ||
+      role === "menuitemradio" ||
+      role === "menuitemcheckbox" ||
+      role === "option"
+    );
+  }
+
+  function markMobileModelPickerContainers(element, seen) {
+    const containers = [
+      element.closest?.('[data-radix-menu-content]'),
+      element.closest?.('[role="menu"],[role="listbox"]'),
+      element.closest?.('[data-side][data-align]'),
+    ];
+    for (const container of containers) {
+      if (!(container instanceof Element)) {
+        continue;
+      }
+      markMobileModelPickerElement(container, mobileModelPickerFloatingKind(container));
+      seen.add(container);
+    }
+  }
+
+  function mobileModelPickerFloatingKind(element) {
+    const side = String(element?.getAttribute?.("data-side") || "");
+    return side === "left" || side === "right" ? "submenu" : "menu";
+  }
+
+  function mobileModelPickerModelFromElement(element) {
+    if (!element) {
+      return "";
+    }
+    return (
+      gatewayModelFromElement(element) ||
+      mobileModelPickerModelFromText(element.textContent) ||
+      mobileModelPickerModelFromText(element.getAttribute?.("aria-label")) ||
+      mobileModelPickerModelFromText(element.getAttribute?.("title"))
+    );
+  }
+
+  function mobileModelPickerModelFromText(text) {
+    const value = String(text || "").replace(/\s+/g, " ").trim();
+    if (!value) {
+      return "";
+    }
+    const gatewayModel = gatewayModelFromText(value);
+    if (gatewayModel) {
+      return gatewayModel;
+    }
+    const match = value.match(
+      /\b(?:gpt|o[1-9]|claude|gemini|llama|qwen|deepseek|mistral|kimi|grok|sonnet|opus|haiku|codex|glm|codestral|devstral|mixtral|phi|nemotron|command-r)[a-z0-9._:+/-]{1,96}\b/i
+    );
+    return match?.[0] || "";
+  }
+
+  function markMobileModelPickerElement(element, kind) {
+    runtime.mobileModelPickerElements.set(element, kind);
+    element.setAttribute("data-codexl-model-picker", kind);
+    if (kind === "submenu") {
+      markMobileModelPickerSubmenuWrapper(element);
+    }
+  }
+
+  function markMobileModelPickerSubmenuWrapper(element) {
+    const wrapper =
+      element.parentElement?.hasAttribute?.("data-radix-popper-content-wrapper") === true
+        ? element.parentElement
+        : element.closest?.("[data-radix-popper-content-wrapper]");
+    if (!(wrapper instanceof HTMLElement)) {
+      return;
+    }
+    const viewportHeight =
+      window.visualViewport?.height ||
+      window.innerHeight ||
+      document.documentElement?.clientHeight ||
+      640;
+    const rect = wrapper.getBoundingClientRect();
+    const desiredHeight = Math.min(
+      Math.max(rect.height || 240, 160),
+      Math.max(viewportHeight - 16, 160),
+    );
+    const maxTop = Math.max(8, viewportHeight - desiredHeight - 8);
+    const top = Math.round(Math.max(8, Math.min(rect.top || 8, maxTop)));
+    const maxHeight = Math.max(160, Math.round(viewportHeight - top - 8));
+    wrapper.setAttribute("data-codexl-model-picker-wrapper", "submenu");
+    wrapper.style.setProperty("--codexl-model-submenu-y", `${top}px`);
+    wrapper.style.setProperty("--codexl-model-submenu-max-height", `${maxHeight}px`);
+  }
+
+  function removeMobileModelPickerElement(element) {
+    try {
+      if (element.getAttribute?.("data-codexl-model-picker") === "submenu") {
+        const wrapper =
+          element.parentElement?.hasAttribute?.("data-radix-popper-content-wrapper") === true
+            ? element.parentElement
+            : element.closest?.("[data-radix-popper-content-wrapper]");
+        if (wrapper instanceof HTMLElement) {
+          wrapper.removeAttribute("data-codexl-model-picker-wrapper");
+          wrapper.style.removeProperty("--codexl-model-submenu-y");
+          wrapper.style.removeProperty("--codexl-model-submenu-max-height");
+        }
+      }
+      element.removeAttribute("data-codexl-model-picker");
+    } catch {}
+    runtime.mobileModelPickerElements.delete(element);
+  }
+
+  function cleanupMobileModelPickerSurfaces() {
+    for (const [element] of Array.from(runtime.mobileModelPickerElements.entries())) {
+      removeMobileModelPickerElement(element);
+    }
+    runtime.mobileModelPickerCleanupInstalled = false;
+    runtime.mobileModelPickerLastRoot = null;
+    runtime.mobileModelPickerSyncPending = false;
   }
 
   function request(type, payload = {}) {
@@ -3229,6 +3454,114 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
         display: flex !important;
         opacity: 1 !important;
         pointer-events: auto !important;
+      }
+      @media (hover: none), (pointer: coarse), (any-pointer: coarse) {
+        [data-codexl-model-picker="submenu"] {
+          min-width: 0 !important;
+          width: min(28rem, calc(100vw - 16px)) !important;
+          max-width: calc(100vw - 16px) !important;
+        }
+        [data-codexl-model-picker-wrapper="submenu"] {
+          left: 8px !important;
+          min-width: 0 !important;
+          position: fixed !important;
+          right: auto !important;
+          top: var(--codexl-model-submenu-y, 8px) !important;
+          transform: none !important;
+          width: calc(100vw - 16px) !important;
+          max-width: calc(100vw - 16px) !important;
+        }
+        [data-codexl-model-picker-wrapper="submenu"] > [data-codexl-model-picker="submenu"] {
+          max-height: var(--codexl-model-submenu-max-height, calc(100vh - 16px)) !important;
+          max-width: 100% !important;
+          min-width: 0 !important;
+          overflow-y: auto !important;
+          width: 100% !important;
+        }
+        [data-codexl-model-picker="item"] {
+          align-items: flex-start !important;
+          min-height: 2.25rem !important;
+        }
+        [data-codexl-model-picker="item"] [class*="truncate"],
+        [data-codexl-model-picker="item"] [data-tooltip-overflow-target] {
+          max-width: 100% !important;
+          overflow: visible !important;
+          overflow-wrap: anywhere !important;
+          text-overflow: clip !important;
+          white-space: normal !important;
+          word-break: break-word !important;
+        }
+        [data-codexl-model-picker="trigger"] {
+          max-width: min(100%, calc(100vw - 5rem)) !important;
+        }
+        [data-codexl-model-picker="trigger"] [class*="truncate"],
+        [data-codexl-model-picker="trigger"] [data-tooltip-overflow-target] {
+          -webkit-box-orient: vertical !important;
+          -webkit-line-clamp: 2 !important;
+          display: -webkit-box !important;
+          line-height: 1.15 !important;
+          max-height: 2.4em !important;
+          max-width: 100% !important;
+          min-width: 0 !important;
+          overflow: hidden !important;
+          overflow-wrap: anywhere !important;
+          text-overflow: clip !important;
+          white-space: normal !important;
+          word-break: break-word !important;
+        }
+      }
+      html[data-codexl-touch-device="1"] [data-codexl-model-picker="submenu"] {
+        min-width: 0 !important;
+        width: min(28rem, calc(100vw - 16px)) !important;
+        max-width: calc(100vw - 16px) !important;
+      }
+      html[data-codexl-touch-device="1"] [data-codexl-model-picker-wrapper="submenu"] {
+        left: 8px !important;
+        min-width: 0 !important;
+        position: fixed !important;
+        right: auto !important;
+        top: var(--codexl-model-submenu-y, 8px) !important;
+        transform: none !important;
+        width: calc(100vw - 16px) !important;
+        max-width: calc(100vw - 16px) !important;
+      }
+      html[data-codexl-touch-device="1"] [data-codexl-model-picker-wrapper="submenu"] > [data-codexl-model-picker="submenu"] {
+        max-height: var(--codexl-model-submenu-max-height, calc(100vh - 16px)) !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
+        overflow-y: auto !important;
+        width: 100% !important;
+      }
+      html[data-codexl-touch-device="1"] [data-codexl-model-picker="item"] {
+        align-items: flex-start !important;
+        min-height: 2.25rem !important;
+      }
+      html[data-codexl-touch-device="1"] [data-codexl-model-picker="item"] [class*="truncate"],
+      html[data-codexl-touch-device="1"] [data-codexl-model-picker="item"] [data-tooltip-overflow-target] {
+        max-width: 100% !important;
+        overflow: visible !important;
+        overflow-wrap: anywhere !important;
+        text-overflow: clip !important;
+        white-space: normal !important;
+        word-break: break-word !important;
+      }
+      html[data-codexl-touch-device="1"] [data-codexl-model-picker="trigger"] {
+        max-width: min(100%, calc(100vw - 5rem)) !important;
+      }
+      html[data-codexl-touch-device="1"] [data-codexl-model-picker="trigger"] [class*="truncate"],
+      html[data-codexl-touch-device="1"] [data-codexl-model-picker="trigger"] [data-tooltip-overflow-target] {
+        -webkit-box-orient: vertical !important;
+        -webkit-line-clamp: 2 !important;
+        display: -webkit-box !important;
+        line-height: 1.15 !important;
+        max-height: 2.4em !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
+        overflow: hidden !important;
+        overflow-wrap: anywhere !important;
+        text-overflow: clip !important;
+        white-space: normal !important;
+        word-break: break-word !important;
       }
       [data-codexl-touch-surface="thread"] [data-thread-title-trigger],
       [data-codexl-touch-surface="thread"] [data-app-action-sidebar-thread-title],
@@ -5811,15 +6144,34 @@ mod tests {
         assert!(script.contains("clearActiveContextUsage"));
         assert!(script.contains("clearActiveContextUsage(\"thread-start\")"));
         assert!(script.contains("const usage = runtime.contextUsageByThread.get(threadId) || null"));
-        assert!(script.contains("mobile-touch-react-surfaces"));
+        assert!(script.contains("mobile-touch-react-surfaces-model-submenu-overlay"));
         assert!(script.contains("installMobileSidebarTriggerTouchGuard"));
         assert!(script.contains("installReactHook();\n  installMobileSidebarTriggerTouchGuard();"));
         assert!(script.contains("scheduleMobileTouchReactSurfaceSync(root);"));
+        assert!(script.contains("scheduleMobileModelPickerSync(root);"));
         assert!(script.contains("function syncMobileTouchReactSurfaces(root)"));
+        assert!(script.contains("function syncMobileModelPickerSurfaces(root)"));
+        assert!(script.contains("function mobileModelPickerModelFromElement(element)"));
+        assert!(script.contains("function mobileModelPickerModelFromText(text)"));
+        assert!(script.contains("function markMobileModelPickerContainers(element, seen)"));
+        assert!(script.contains("function mobileModelPickerFloatingKind(element)"));
+        assert!(script.contains("function markMobileModelPickerSubmenuWrapper(element)"));
+        assert!(script.contains("data-codex-intelligence-trigger"));
+        assert!(script.contains("data-radix-menu-content"));
+        assert!(script.contains("data-radix-popper-content-wrapper"));
+        assert!(script.contains("data-codexl-model-picker-wrapper"));
+        assert!(script.contains("--codexl-model-submenu-y"));
+        assert!(script.contains("--codexl-model-submenu-max-height"));
+        assert!(script.contains("menuitemradio"));
+        assert!(script.contains("[data-codexl-model-picker=\"submenu\"]"));
+        assert!(script.contains("command-r"));
         assert!(script.contains("function mobileTouchSurfaceKind(element, fiber)"));
         assert!(script.contains("function activateMobileTouchSurface(element, event)"));
         assert!(script.contains("codexl-mobile-touch-active"));
         assert!(script.contains("data-codexl-touch-surface"));
+        assert!(script.contains("data-codexl-model-picker"));
+        assert!(script.contains("overflow-wrap: anywhere"));
+        assert!(script.contains("-webkit-line-clamp: 2"));
         assert!(script.contains("button[aria-label],button[title]"));
         assert!(script.contains("div:has(> [data-testid=\"app-shell-floating-left-panel\"])"));
         assert!(script.contains("SIDEBAR_TOUCH_HOVER_SUPPRESSION_MS"));

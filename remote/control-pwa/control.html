@@ -9,7 +9,7 @@
     <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png" />
     <link rel="manifest" href="manifest.webmanifest" />
-    <link rel="stylesheet" href="styles.css?v=20260604-pwa-preserve-lang-v13" />
+    <link rel="stylesheet" href="styles.css?v=20260604-pwa-friendly-status-v14" />
   </head>
   <body>
     <div id="controlView" class="control-view">
@@ -20,10 +20,10 @@
         </div>
         <div class="topbar-actions">
           <select id="remoteModeSelect" class="mode-select" aria-label="远程模式" hidden>
-            <option value="web">Web</option>
+            <option value="web">工作区</option>
           </select>
           <button id="secureWebButton" class="mode-select secure-web-button" type="button" title="使用 HTTPS" aria-label="使用 HTTPS" hidden>使用 HTTPS</button>
-          <select id="webAssetVersionSelect" class="mode-select web-asset-version-select" aria-label="Codex App Web 包版本" title="Codex App Web 包版本" hidden>
+          <select id="webAssetVersionSelect" class="mode-select web-asset-version-select" aria-label="Codex App 版本" title="Codex App 版本" hidden>
             <option value="latest">最新</option>
           </select>
           <div id="pageZoomControl" class="zoom-control">
@@ -67,10 +67,10 @@
       <main class="viewport">
         <div id="screenWrap" class="screen-wrap">
           <canvas id="screen" class="screen" aria-label="Codex 应用画面" hidden></canvas>
-          <iframe id="webFrame" class="web-frame" title="Codex Web 桥接页" allow="camera *; microphone *" hidden></iframe>
+          <iframe id="webFrame" class="web-frame" title="远程工作区视图" allow="camera *; microphone *" hidden></iframe>
           <div id="emptyState" class="empty-state" role="status" aria-live="polite">
             <div id="emptyStateTitle" class="empty-state-title">正在连接</div>
-            <div id="emptyStateMessage" class="empty-state-message">正在加载 Web 桥接</div>
+            <div id="emptyStateMessage" class="empty-state-message">正在打开远程工作区</div>
             <div id="emptyStateActions" class="empty-state-actions" hidden>
               <button id="emptyRetryButton" class="primary-button" type="button">重试</button>
               <button id="emptyBackButton" class="secondary-button" type="button">返回实例列表</button>
@@ -108,7 +108,7 @@
       ></textarea>
     </div>
 
-    <script src="vendor/jsQR.js?v=20260604-pwa-preserve-lang-v13"></script>
-    <script src="app.js?v=20260604-pwa-preserve-lang-v13" type="module"></script>
+    <script src="vendor/jsQR.js?v=20260604-pwa-friendly-status-v14"></script>
+    <script src="app.js?v=20260604-pwa-friendly-status-v14" type="module"></script>
   </body>
 </html>

@@ -8957,7 +8957,7 @@ function RemoteQrDialog({
         </DialogHeader>
         <div className="px-5 py-5 flex flex-col gap-4">
           <div
-            className="mx-auto rounded-lg bg-white p-3 shadow-sm"
+            className="mx-auto max-w-full rounded-lg bg-white p-3 shadow-sm [&_svg]:h-auto [&_svg]:max-w-full"
             dangerouslySetInnerHTML={{ __html: qrMarkup }}
           />
           <div className="space-y-2">
@@ -9627,12 +9627,23 @@ function compactRemoteQrUrl(value: string) {
   try {
     const url = new URL(value);
     for (const key of [
+      "deviceName",
+      "device_name",
+      "itemName",
+      "item_name",
+      "name",
+      "remoteFrontendMode",
+      "remoteMode",
+      "remote_frontend_mode",
+      "remote_mode",
       "webAssetMode",
       "webAssetBaseUrl",
       "webAssetVersion",
       "web_asset_mode",
       "web_asset_base_url",
       "web_asset_version",
+      "workspaceName",
+      "workspace_name",
     ]) {
       url.searchParams.delete(key);
     }

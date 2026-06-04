@@ -1827,6 +1827,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
       }
       .codex-web-folder-picker-path-row {
         display: flex;
+        align-items: center;
         gap: 8px;
         padding: 12px 18px 8px;
       }
@@ -1865,6 +1866,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
       }
       .codex-web-folder-picker-button {
         height: 36px;
+        flex: 0 0 auto;
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -2048,7 +2050,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
         display: flex;
         align-items: center;
         gap: 8px;
-        justify-content: flex-end;
+        justify-content: space-between;
         padding: 12px 18px;
         border-top: 1px solid var(--codex-picker-border);
       }
@@ -2100,18 +2102,6 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
           width: 100%;
           height: 100%;
           max-height: none;
-        }
-        .codex-web-folder-picker-path-row {
-          flex-wrap: wrap;
-        }
-        .codex-web-folder-picker-input-shell {
-          flex-basis: 100%;
-        }
-        .codex-web-folder-picker-actions {
-          flex-direction: column-reverse;
-        }
-        .codex-web-folder-picker-actions .codex-web-folder-picker-button {
-          width: 100%;
         }
       }
     `;

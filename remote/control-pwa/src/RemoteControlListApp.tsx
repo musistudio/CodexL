@@ -40,7 +40,7 @@ import { decodeCodexQrFromVideo } from "../qrDecoder.js";
 const INSTANCE_STORAGE_KEY = "codexl-remote.instances";
 const CONTROL_CONNECTION_STORAGE_PREFIX = "codexl-remote.control-connection.";
 const REMOTE_MODE_WEB = "web";
-const PWA_BUILD = "20260604-pwa-preserve-lang-v13";
+const PWA_BUILD = "20260604-pwa-friendly-status-v14";
 const SERVICE_WORKER_URL = `service-worker.js?v=${PWA_BUILD}`;
 const STATUS_CONNECTING = "Connecting";
 const STATUS_NOT_CONNECTED = "Not connected";
@@ -71,7 +71,7 @@ const REMOTE_STRINGS = {
       title: "Add instance",
     },
     card: {
-      bundle: "Bundle",
+      bundle: "Version",
       connect: "Connect",
       edit: "Edit",
       lastConnected: "Last connected",
@@ -120,10 +120,10 @@ const REMOTE_STRINGS = {
     },
     mode: {
       screen: "Screen",
-      web: "Web",
+      web: "Workspace",
     },
     status: {
-      cdpConnected: "CDP connected",
+      cdpConnected: "Desktop screen connected",
       connected: "Connected",
       connecting: "Connecting",
       disconnected: "Disconnected",
@@ -131,7 +131,7 @@ const REMOTE_STRINGS = {
       notConnected: "Not connected",
       preparing: "Preparing",
       retrying: "Retrying",
-      webConnected: "Web connected",
+      webConnected: "Workspace ready",
     },
     time: {
       never: "Never",
@@ -156,7 +156,7 @@ const REMOTE_STRINGS = {
       title: "添加实例",
     },
     card: {
-      bundle: "资源包",
+      bundle: "版本",
       connect: "连接",
       edit: "编辑",
       lastConnected: "上次连接",
@@ -205,10 +205,10 @@ const REMOTE_STRINGS = {
     },
     mode: {
       screen: "屏幕",
-      web: "Web",
+      web: "工作区",
     },
     status: {
-      cdpConnected: "CDP 已连接",
+      cdpConnected: "桌面画面已连接",
       connected: "已连接",
       connecting: "连接中",
       disconnected: "已断开",
@@ -216,7 +216,7 @@ const REMOTE_STRINGS = {
       notConnected: "未连接",
       preparing: "准备中",
       retrying: "重试中",
-      webConnected: "Web 已连接",
+      webConnected: "远程工作区已就绪",
     },
     time: {
       never: "从未",

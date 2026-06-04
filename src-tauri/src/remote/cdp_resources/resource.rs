@@ -13,7 +13,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 const WEB_RESOURCE_TREE_CACHE_TTL_MS: u64 = 30_000;
 const WEB_RESOURCE_REWRITE_VERSION: &str =
-    "bridge-script-plugin-entry-v10-mobile-touch-react-surfaces";
+    "bridge-script-plugin-entry-v13-mobile-model-submenu-overlay";
 
 static WEB_RESOURCE_TREE_CACHE: OnceLock<StdMutex<Option<CachedWebResourceTree>>> = OnceLock::new();
 static WEB_RESOURCE_TREE_LOAD_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();

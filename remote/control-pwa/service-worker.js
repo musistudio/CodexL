@@ -1,4 +1,4 @@
-const CACHE_NAME = "codexl-remote-v63-preserve-lang";
+const CACHE_NAME = "codexl-remote-v64-friendly-status";
 const WEB_CACHE_NAME = "codexl-remote-web-v20-control-refresh-token";
 const WEB_CACHE_CONFIG_KEY = new URL("__codex-web-cache-config.json", self.registration.scope).toString();
 const WEB_VERSION_CACHE_KEY = new URL("__codex-web-version.json", self.registration.scope).toString();
@@ -38,13 +38,13 @@ const ASSETS = [
   "./",
   "index.html",
   "control.html",
-  "app.js?v=20260604-pwa-preserve-lang-v13",
-  "qrDecoder.js?v=20260604-pwa-preserve-lang-v13",
-  "realtimeTransport.js?v=20260604-pwa-preserve-lang-v13",
-  "react-app.css?v=20260604-pwa-preserve-lang-v13",
-  "react-app.js?v=20260604-pwa-preserve-lang-v13",
-  "vendor/jsQR.js?v=20260604-pwa-preserve-lang-v13",
-  "styles.css?v=20260604-pwa-preserve-lang-v13",
+  "app.js?v=20260604-pwa-friendly-status-v14",
+  "qrDecoder.js?v=20260604-pwa-friendly-status-v14",
+  "realtimeTransport.js?v=20260604-pwa-friendly-status-v14",
+  "react-app.css?v=20260604-pwa-friendly-status-v14",
+  "react-app.js?v=20260604-pwa-friendly-status-v14",
+  "vendor/jsQR.js?v=20260604-pwa-friendly-status-v14",
+  "styles.css?v=20260604-pwa-friendly-status-v14",
   "manifest.webmanifest",
   "icon.png",
   "favicon-32x32.png",
