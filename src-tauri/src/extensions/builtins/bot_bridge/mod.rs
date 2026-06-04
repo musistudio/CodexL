@@ -123,7 +123,7 @@ const FLOCK_EXCLUSIVE: std::os::raw::c_int = 2;
 #[cfg(unix)]
 const FLOCK_NONBLOCKING: std::os::raw::c_int = 4;
 
-type SharedAppStdin = Arc<Mutex<ChildStdin>>;
+pub type SharedAppStdin = Arc<Mutex<Box<dyn Write + Send>>>;
 
 static APP_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BOT_MEDIA_SESSION_FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -731,6 +731,13 @@ enum McpMessageFraming {
 struct McpMessage {
     value: Value,
     framing: McpMessageFraming,
+}
+
+pub fn shared_app_stdin<W>(writer: W) -> SharedAppStdin
+where
+    W: Write + Send + 'static,
+{
+    Arc::new(Mutex::new(Box::new(writer)))
 }
 
 pub fn spawn_app_stdio_bot_bridge(app_stdin: SharedAppStdin) -> Option<mpsc::Sender<Vec<u8>>> {

@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,7 +36,7 @@ pub const CLAUDE_CODE_MCP_METADATA_RELAY_RUN_MODE_ARG: &str =
 const CODEXL_WORKSPACE_CWD_FILTER_KEY: &str = "codexlWorkspaceCwd";
 
 type RequestMap = Arc<Mutex<std::collections::HashMap<String, RequestInfo>>>;
-type SharedChildStdin = Arc<Mutex<ChildStdin>>;
+type SharedChildStdin = bot_bridge::SharedAppStdin;
 type SharedCurrentCwd = Arc<Mutex<Option<String>>>;
 type SharedOutput<W> = Arc<Mutex<W>>;
 
@@ -713,7 +713,7 @@ where
 
     let request_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let chatgpt_auth = ChatGptAuth::load();
-    let shared_child_stdin = Arc::new(Mutex::new(child_stdin));
+    let shared_child_stdin = bot_bridge::shared_app_stdin(child_stdin);
     let shared_output = Arc::new(Mutex::new(output));
     let current_cwd = Arc::new(Mutex::new(None));
     let bridge_stdout_tx = bot_bridge::spawn_app_stdio_bot_bridge(Arc::clone(&shared_child_stdin));

@@ -1,3 +1,4 @@
+use crate::extensions::builtins::bot_bridge;
 use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -951,6 +952,87 @@ const CLAUDE_STREAM_JSON_ARGS: &[&str] = &[
 type SharedOutput<W> = Arc<Mutex<W>>;
 type SharedState = Arc<Mutex<ClaudeAppServerState>>;
 
+struct ClaudeBotBridgeInput {
+    buffer: Vec<u8>,
+    tx: mpsc::Sender<Vec<u8>>,
+}
+
+struct ClaudeBotBridgeOutput<W> {
+    buffer: Vec<u8>,
+    inner: W,
+    tx: Option<mpsc::Sender<Vec<u8>>>,
+}
+
+impl ClaudeBotBridgeInput {
+    fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            buffer: Vec::new(),
+            tx,
+        }
+    }
+}
+
+impl Write for ClaudeBotBridgeInput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let line = self.buffer.drain(..=index).collect::<Vec<_>>();
+            self.tx.send(line).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Claude Code bot bridge input channel closed",
+                )
+            })?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<W> ClaudeBotBridgeOutput<W>
+where
+    W: Write,
+{
+    fn new(inner: W, tx: Option<mpsc::Sender<Vec<u8>>>) -> Self {
+        Self {
+            buffer: Vec::new(),
+            inner,
+            tx,
+        }
+    }
+
+    fn write_complete_lines(&mut self) -> std::io::Result<()> {
+        while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let line = self.buffer.drain(..=index).collect::<Vec<_>>();
+            if let Some(tx) = self.tx.as_ref() {
+                let _ = tx.send(line.clone());
+            }
+            if !bot_bridge::should_intercept_app_server_line(&line) {
+                self.inner.write_all(&line)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<W> Write for ClaudeBotBridgeOutput<W>
+where
+    W: Write,
+{
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        self.write_complete_lines()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 static CLAUDE_CODE_LOG_LOCK: Mutex<()> = Mutex::new(());
 static CLAUDE_THREAD_LIST_CACHE: OnceLock<Mutex<Option<ClaudeThreadListCacheEntry>>> =
     OnceLock::new();
@@ -1431,7 +1513,23 @@ where
         threads: BTreeMap::new(),
         workspace_name: options.workspace_name,
     }));
-    let output = Arc::new(Mutex::new(output));
+    let (bot_input_tx, bot_input_rx) = mpsc::channel();
+    let bot_bridge_stdout_tx = bot_bridge::spawn_app_stdio_bot_bridge(
+        bot_bridge::shared_app_stdin(ClaudeBotBridgeInput::new(bot_input_tx)),
+    );
+    let output = Arc::new(Mutex::new(ClaudeBotBridgeOutput::new(
+        output,
+        bot_bridge_stdout_tx.clone(),
+    )));
+    let _bot_bridge_input_worker = if bot_bridge_stdout_tx.is_some() {
+        let bot_state = Arc::clone(&state);
+        let bot_output = Arc::clone(&output);
+        Some(thread::spawn(move || {
+            handle_bot_bridge_input(bot_input_rx, bot_state, bot_output);
+        }))
+    } else {
+        None
+    };
     let mut workers = Vec::new();
     let mut reader = BufReader::new(input);
     let mut line = Vec::new();
@@ -1461,6 +1559,36 @@ where
         }),
     );
     Ok(0)
+}
+
+fn handle_bot_bridge_input<W>(
+    input: mpsc::Receiver<Vec<u8>>,
+    state: SharedState,
+    output: SharedOutput<W>,
+) where
+    W: Write + Send + 'static,
+{
+    let mut workers = Vec::new();
+    for line in input {
+        match handle_client_line(&line, Arc::clone(&state), Arc::clone(&output)) {
+            Ok(Some(worker)) => workers.push(worker),
+            Ok(None) => {}
+            Err(err) => {
+                claude_code_log_event(
+                    "bot_bridge_input_error",
+                    json!({
+                        "error": err,
+                    }),
+                );
+            }
+        }
+    }
+
+    for worker in workers {
+        if worker.join().is_err() {
+            claude_code_log_event("bot_bridge_worker_panic", json!({}));
+        }
+    }
 }
 
 fn parse_options(args: Vec<OsString>) -> RunOptions {
@@ -16705,6 +16833,70 @@ mod tests {
             threads: BTreeMap::new(),
             workspace_name: workspace_name.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn bot_bridge_input_buffers_until_complete_json_lines() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut input = ClaudeBotBridgeInput::new(tx);
+
+        input.write_all(br#"{"id":"1""#).expect("write partial");
+        assert!(rx.try_recv().is_err());
+
+        input
+            .write_all(
+                br#","method":"thread/list","params":{}}
+{"id":"2","method":"config/read","params":{}}
+"#,
+            )
+            .expect("write complete lines");
+
+        let first = String::from_utf8(rx.recv().expect("first line")).expect("utf8");
+        let second = String::from_utf8(rx.recv().expect("second line")).expect("utf8");
+        assert_eq!(
+            first,
+            r#"{"id":"1","method":"thread/list","params":{}}
+"#
+        );
+        assert_eq!(
+            second,
+            r#"{"id":"2","method":"config/read","params":{}}
+"#
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn bot_bridge_output_tees_events_and_hides_internal_responses() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut output = ClaudeBotBridgeOutput::new(Vec::<u8>::new(), Some(tx));
+
+        output
+            .write_all(
+                br#"{"method":"item/completed","params":{"threadId":"thread","turnId":"turn"}}
+"#,
+            )
+            .expect("write event");
+        output
+            .write_all(
+                br#"{"id":"codexl-bot-1","result":{"ok":true}}
+"#,
+            )
+            .expect("write internal response");
+        output.flush().expect("flush");
+
+        let visible = String::from_utf8(output.inner).expect("visible utf8");
+        assert!(
+            visible.contains(r#""method":"item/completed""#),
+            "{visible}"
+        );
+        assert!(!visible.contains("codexl-bot-1"), "{visible}");
+
+        let first = String::from_utf8(rx.recv().expect("first tee line")).expect("utf8");
+        let second = String::from_utf8(rx.recv().expect("second tee line")).expect("utf8");
+        assert!(first.contains(r#""method":"item/completed""#), "{first}");
+        assert!(second.contains(r#""id":"codexl-bot-1""#), "{second}");
+        assert!(rx.try_recv().is_err());
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
