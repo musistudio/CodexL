@@ -14,7 +14,7 @@ const CODEXL_PLUGIN_BRIDGE_PATH: &str = "/plugin/_bridge";
 const CODEXL_PLUGIN_CDP_BINDING_NAME: &str = "__codexlPluginBridge";
 const CODEXL_PLUGIN_INJECT_TIMEOUT_MS: u64 = 20_000;
 const CODEXL_PLUGIN_INJECT_RETRY_MS: u64 = 150;
-const CODEXL_PLUGIN_RUNTIME_VERSION: &str = "0.1.19";
+const CODEXL_PLUGIN_RUNTIME_VERSION: &str = "0.1.20";
 const CODEXL_RENDERER_PLUGIN_ENTRY_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
 const CODEXL_CORE_PLUGIN_ID: &str = "codexl.core";
 #[cfg(test)]
@@ -1228,7 +1228,7 @@ fn safe_relative_path(value: &str) -> Option<PathBuf> {
 
 const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   const RUNTIME_VERSION = "__CODEXL_PLUGIN_RUNTIME_VERSION__";
-  const RUNTIME_BUILD = "mobile-touch-actions-2";
+  const RUNTIME_BUILD = "mobile-touch-react-surfaces";
   const BRIDGE_URL = "__CODEXL_PLUGIN_BRIDGE_URL__";
   const ROOT_ID = "codexl-plugin-runtime-root";
   const CORE_PLUGIN_ID = "codexl.core";
@@ -1273,6 +1273,8 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     latestContextUsage: null,
     lastContextLocationKey: "",
     loadedPlugins: new Map(),
+    mobileTouchActiveKey: "",
+    mobileTouchSurfaces: new Map(),
     pending: new Map(),
     panels: new Map(),
     renderers: new Map(),
@@ -1425,6 +1427,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       runtime.lastFiberRoot = root;
       updateUi();
       scheduleGatewayModelQuerySelectorRepair();
+      scheduleMobileTouchReactSurfaceSync(root);
       if (originalOnCommitFiberRoot) {
         return originalOnCommitFiberRoot(id, root, priorityLevel, didError);
       }
@@ -1496,6 +1499,224 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       fiber = fiber.return || null;
     }
     return null;
+  }
+
+  function scheduleMobileTouchReactSurfaceSync(root) {
+    if (!root) {
+      return;
+    }
+    runtime.mobileTouchLastRoot = root;
+    if (runtime.mobileTouchSyncPending) {
+      return;
+    }
+    runtime.mobileTouchSyncPending = true;
+    const schedule =
+      typeof window.requestAnimationFrame === "function"
+        ? window.requestAnimationFrame.bind(window)
+        : (callback) => window.setTimeout(callback, 16);
+    schedule(() => {
+      runtime.mobileTouchSyncPending = false;
+      const pendingRoot = runtime.mobileTouchLastRoot;
+      runtime.mobileTouchLastRoot = null;
+      syncMobileTouchReactSurfaces(pendingRoot);
+    });
+  }
+
+  function syncMobileTouchReactSurfaces(root) {
+    const rootFiber = root?.current || root;
+    if (!rootFiber) {
+      return;
+    }
+    if (!runtime.mobileTouchSurfaceCleanupInstalled) {
+      runtime.mobileTouchSurfaceCleanupInstalled = true;
+      runtime.cleanup.push(cleanupMobileTouchSurfaces);
+    }
+    const seen = new Set();
+    let fiber = rootFiber;
+    let visited = 0;
+    while (fiber && visited < 30000) {
+      visited += 1;
+      const node = fiber.stateNode;
+      if (node instanceof Element) {
+        const kind = mobileTouchSurfaceKind(node, fiber);
+        if (kind) {
+          registerMobileTouchSurface(node, kind, fiber);
+          seen.add(node);
+        }
+      }
+      if (fiber.child) {
+        fiber = fiber.child;
+        continue;
+      }
+      while (fiber && fiber !== rootFiber && !fiber.sibling) {
+        fiber = fiber.return || null;
+      }
+      if (!fiber || fiber === rootFiber) {
+        break;
+      }
+      fiber = fiber.sibling;
+    }
+    for (const [element, meta] of Array.from(runtime.mobileTouchSurfaces.entries())) {
+      if (!element.isConnected || !seen.has(element)) {
+        removeMobileTouchSurface(element, meta);
+      }
+    }
+    applyMobileTouchActiveSurfaces();
+  }
+
+  function mobileTouchSurfaceKind(element, fiber) {
+    if (!(element instanceof HTMLElement)) {
+      return "";
+    }
+    if (element.hasAttribute("data-app-action-sidebar-thread-row")) {
+      return "thread";
+    }
+    if (
+      element.getAttribute("role") === "button" &&
+      element.querySelector?.(
+        "[data-thread-title-trigger],[data-app-action-sidebar-thread-title]"
+      )
+    ) {
+      return "thread";
+    }
+    if (
+      element.hasAttribute("data-tab-id") &&
+      element.getAttribute("role") !== "tabpanel" &&
+      String(element.className || "").includes("group/tab")
+    ) {
+      return "tab";
+    }
+    if (fiberName(fiber).toLowerCase().includes("tab") && element.hasAttribute("data-tab-id")) {
+      return element.getAttribute("role") === "tabpanel" ? "" : "tab";
+    }
+    return "";
+  }
+
+  function mobileTouchSurfaceKey(element, kind) {
+    if (kind === "thread") {
+      const threadId = element.getAttribute("data-app-action-sidebar-thread-id");
+      const hostId = element.getAttribute("data-app-action-sidebar-thread-host-id") || "";
+      if (threadId) {
+        return `thread:${hostId}:${threadId}`;
+      }
+      const title =
+        element.getAttribute("data-app-action-sidebar-thread-title") ||
+        normalizedText(element.querySelector?.("[data-thread-title-trigger]")) ||
+        normalizedText(element);
+      return `thread:title:${title.slice(0, 160)}`;
+    }
+    if (kind === "tab") {
+      const controller = element.getAttribute("data-app-shell-tab-controller") || "";
+      return `tab:${controller}:${element.getAttribute("data-tab-id") || ""}`;
+    }
+    return `${kind}:${normalizedText(element).slice(0, 160)}`;
+  }
+
+  function registerMobileTouchSurface(element, kind, fiber) {
+    const key = mobileTouchSurfaceKey(element, kind);
+    let meta = runtime.mobileTouchSurfaces.get(element);
+    if (!meta) {
+      const activate = (event) => activateMobileTouchSurface(element, event);
+      meta = {
+        activate,
+        fiberName: fiberName(fiber),
+        key,
+        kind,
+      };
+      runtime.mobileTouchSurfaces.set(element, meta);
+      element.addEventListener("pointerdown", activate, { capture: true, passive: true });
+      element.addEventListener("touchstart", activate, { capture: true, passive: true });
+      element.addEventListener("click", activate, true);
+    } else {
+      meta.fiberName = fiberName(fiber);
+      meta.key = key;
+      meta.kind = kind;
+    }
+    element.setAttribute("data-codexl-touch-surface", kind);
+  }
+
+  function activateMobileTouchSurface(element, event) {
+    if (!isMobileTouchActivationEvent(event)) {
+      return;
+    }
+    const meta = runtime.mobileTouchSurfaces.get(element);
+    if (!meta) {
+      return;
+    }
+    markMobileTouchDevice();
+    runtime.mobileTouchActiveKey = meta.key;
+    applyMobileTouchActiveSurfaces();
+  }
+
+  function isMobileTouchActivationEvent(event) {
+    if (!event) {
+      return isMobileTouchEnvironment();
+    }
+    if (String(event.type || "").startsWith("touch")) {
+      return true;
+    }
+    const pointerType = String(event.pointerType || "");
+    if (pointerType === "touch" || pointerType === "pen") {
+      return true;
+    }
+    return event.type === "click" && isMobileTouchEnvironment();
+  }
+
+  function isMobileTouchEnvironment() {
+    try {
+      return (
+        document.documentElement?.getAttribute("data-codexl-touch-device") === "1" ||
+        navigator.maxTouchPoints > 0 ||
+        window.matchMedia?.("(hover: none), (pointer: coarse), (any-pointer: coarse)")
+          ?.matches === true
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function markMobileTouchDevice() {
+    try {
+      document.documentElement?.setAttribute("data-codexl-touch-device", "1");
+    } catch {}
+  }
+
+  function applyMobileTouchActiveSurfaces() {
+    for (const [element, meta] of Array.from(runtime.mobileTouchSurfaces.entries())) {
+      if (!element.isConnected) {
+        removeMobileTouchSurface(element, meta);
+        continue;
+      }
+      const active = Boolean(runtime.mobileTouchActiveKey && meta.key === runtime.mobileTouchActiveKey);
+      element.classList.toggle("codexl-mobile-touch-active", active);
+      if (active) {
+        element.setAttribute("data-codexl-touch-active", "1");
+      } else {
+        element.removeAttribute("data-codexl-touch-active");
+      }
+    }
+  }
+
+  function removeMobileTouchSurface(element, meta) {
+    try {
+      element.removeEventListener("pointerdown", meta.activate, true);
+      element.removeEventListener("touchstart", meta.activate, true);
+      element.removeEventListener("click", meta.activate, true);
+    } catch {}
+    try {
+      element.classList.remove("codexl-mobile-touch-active");
+      element.removeAttribute("data-codexl-touch-active");
+      element.removeAttribute("data-codexl-touch-surface");
+    } catch {}
+    runtime.mobileTouchSurfaces.delete(element);
+  }
+
+  function cleanupMobileTouchSurfaces() {
+    for (const [element, meta] of Array.from(runtime.mobileTouchSurfaces.entries())) {
+      removeMobileTouchSurface(element, meta);
+    }
+    runtime.mobileTouchActiveKey = "";
+    runtime.mobileTouchSurfaceCleanupInstalled = false;
   }
 
   function request(type, payload = {}) {
@@ -2942,59 +3163,78 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
           display: none !important;
           pointer-events: none !important;
         }
-        [data-app-action-sidebar-thread-row] [class*="group-hover:opacity-100"],
-        [data-app-action-sidebar-thread-row] [class*="group-focus-within:opacity-100"],
-        [data-app-action-sidebar-thread-row] [class*="group-hover:opacity-50"] {
-          opacity: 1 !important;
-        }
-        [data-app-action-sidebar-thread-row] [class*="group-hover:pointer-events-auto"],
-        [data-app-action-sidebar-thread-row] [class*="group-focus-within:pointer-events-auto"] {
-          pointer-events: auto !important;
-        }
-        [data-app-action-sidebar-thread-row] [class*="group-hover:opacity-0"],
-        [data-app-action-sidebar-thread-row] [class*="group-focus-within:opacity-0"] {
-          opacity: 0 !important;
-        }
-        [data-app-action-sidebar-thread-row] [class*="group-hover:min-w-5"],
-        [data-app-action-sidebar-thread-row] [class*="group-has-"][class*="min-w-5"] {
-          min-width: 1.25rem !important;
-        }
-        [data-app-action-sidebar-thread-row] [class*="group-hover:min-w-12"],
-        [data-app-action-sidebar-thread-row] [class*="group-has-"][class*="min-w-12"] {
-          min-width: 3rem !important;
-        }
-        [data-app-action-sidebar-thread-row] [class*="group-hover:min-w-20"],
-        [data-app-action-sidebar-thread-row] [class*="group-has-"][class*="min-w-20"] {
-          min-width: 5rem !important;
-        }
-        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:opacity-100"],
-        [role="button"]:has([data-thread-title-trigger]) [class*="group-focus-within:opacity-100"],
-        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:opacity-50"] {
-          opacity: 1 !important;
-        }
-        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:pointer-events-auto"],
-        [role="button"]:has([data-thread-title-trigger]) [class*="group-focus-within:pointer-events-auto"] {
-          pointer-events: auto !important;
-        }
-        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:opacity-0"],
-        [role="button"]:has([data-thread-title-trigger]) [class*="group-focus-within:opacity-0"] {
-          opacity: 0 !important;
-        }
-        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:min-w-5"],
-        [role="button"]:has([data-thread-title-trigger]) [class*="group-has-"][class*="min-w-5"] {
-          min-width: 1.25rem !important;
-        }
-        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:min-w-12"],
-        [role="button"]:has([data-thread-title-trigger]) [class*="group-has-"][class*="min-w-12"] {
-          min-width: 3rem !important;
-        }
-        [role="button"]:has([data-thread-title-trigger]) [class*="group-hover:min-w-20"],
-        [role="button"]:has([data-thread-title-trigger]) [class*="group-has-"][class*="min-w-20"] {
-          min-width: 5rem !important;
-        }
-        [role="button"]:has([data-thread-title-trigger]) button {
+        [data-codexl-touch-surface] button,
+        [data-codexl-touch-surface] [role="button"] {
           touch-action: manipulation;
         }
+      }
+      html[data-codexl-touch-device="1"] [data-testid="app-shell-floating-left-panel"],
+      html[data-codexl-touch-device="1"] div:has(> [data-testid="app-shell-floating-left-panel"]) {
+        display: none !important;
+        pointer-events: none !important;
+      }
+      .codexl-mobile-touch-active [class*="group-hover:opacity-100"],
+      .codexl-mobile-touch-active [class*="group-focus-within:opacity-100"],
+      .codexl-mobile-touch-active [class*="group-hover:opacity-50"],
+      [data-codexl-touch-active="1"] [class*="group-hover:opacity-100"],
+      [data-codexl-touch-active="1"] [class*="group-focus-within:opacity-100"],
+      [data-codexl-touch-active="1"] [class*="group-hover:opacity-50"] {
+          opacity: 1 !important;
+      }
+      .codexl-mobile-touch-active [class*="group-hover:pointer-events-auto"],
+      .codexl-mobile-touch-active [class*="group-focus-within:pointer-events-auto"],
+      [data-codexl-touch-active="1"] [class*="group-hover:pointer-events-auto"],
+      [data-codexl-touch-active="1"] [class*="group-focus-within:pointer-events-auto"] {
+        pointer-events: auto !important;
+      }
+      .codexl-mobile-touch-active [class*="group-hover:opacity-0"],
+      .codexl-mobile-touch-active [class*="group-focus-within:opacity-0"],
+      [data-codexl-touch-active="1"] [class*="group-hover:opacity-0"],
+      [data-codexl-touch-active="1"] [class*="group-focus-within:opacity-0"] {
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+      .codexl-mobile-touch-active [class*="group-hover:hidden"],
+      .codexl-mobile-touch-active [class*="group-focus-within:hidden"],
+      [data-codexl-touch-active="1"] [class*="group-hover:hidden"],
+      [data-codexl-touch-active="1"] [class*="group-focus-within:hidden"] {
+        display: none !important;
+      }
+      .codexl-mobile-touch-active [class*="group-hover:invisible"],
+      .codexl-mobile-touch-active [class*="group-focus-within:invisible"],
+      [data-codexl-touch-active="1"] [class*="group-hover:invisible"],
+      [data-codexl-touch-active="1"] [class*="group-focus-within:invisible"] {
+        visibility: hidden !important;
+      }
+      .codexl-mobile-touch-active [class*="group-hover:min-w-5"],
+      .codexl-mobile-touch-active [class*="group-has-"][class*="min-w-5"],
+      [data-codexl-touch-active="1"] [class*="group-hover:min-w-5"],
+      [data-codexl-touch-active="1"] [class*="group-has-"][class*="min-w-5"] {
+        min-width: 1.25rem !important;
+      }
+      .codexl-mobile-touch-active [class*="group-hover:min-w-12"],
+      .codexl-mobile-touch-active [class*="group-has-"][class*="min-w-12"],
+      [data-codexl-touch-active="1"] [class*="group-hover:min-w-12"],
+      [data-codexl-touch-active="1"] [class*="group-has-"][class*="min-w-12"] {
+        min-width: 3rem !important;
+      }
+      .codexl-mobile-touch-active [class*="group-hover:min-w-20"],
+      .codexl-mobile-touch-active [class*="group-has-"][class*="min-w-20"],
+      [data-codexl-touch-active="1"] [class*="group-hover:min-w-20"],
+      [data-codexl-touch-active="1"] [class*="group-has-"][class*="min-w-20"] {
+        min-width: 5rem !important;
+      }
+      [data-codexl-touch-surface="tab"].codexl-mobile-touch-active [class*="group-hover/tab:flex"],
+      [data-codexl-touch-surface="tab"][data-codexl-touch-active="1"] [class*="group-hover/tab:flex"] {
+        display: flex !important;
+        opacity: 1 !important;
+        pointer-events: auto !important;
+      }
+      [data-codexl-touch-surface="thread"] [data-thread-title-trigger],
+      [data-codexl-touch-surface="thread"] [data-app-action-sidebar-thread-title],
+      [data-codexl-touch-surface="thread"] [data-thread-title] {
+        opacity: 1 !important;
+        visibility: visible !important;
       }
     `;
     (document.head || document.documentElement).appendChild(style);
@@ -5571,9 +5811,15 @@ mod tests {
         assert!(script.contains("clearActiveContextUsage"));
         assert!(script.contains("clearActiveContextUsage(\"thread-start\")"));
         assert!(script.contains("const usage = runtime.contextUsageByThread.get(threadId) || null"));
-        assert!(script.contains("mobile-touch-actions-2"));
+        assert!(script.contains("mobile-touch-react-surfaces"));
         assert!(script.contains("installMobileSidebarTriggerTouchGuard"));
         assert!(script.contains("installReactHook();\n  installMobileSidebarTriggerTouchGuard();"));
+        assert!(script.contains("scheduleMobileTouchReactSurfaceSync(root);"));
+        assert!(script.contains("function syncMobileTouchReactSurfaces(root)"));
+        assert!(script.contains("function mobileTouchSurfaceKind(element, fiber)"));
+        assert!(script.contains("function activateMobileTouchSurface(element, event)"));
+        assert!(script.contains("codexl-mobile-touch-active"));
+        assert!(script.contains("data-codexl-touch-surface"));
         assert!(script.contains("button[aria-label],button[title]"));
         assert!(script.contains("div:has(> [data-testid=\"app-shell-floating-left-panel\"])"));
         assert!(script.contains("SIDEBAR_TOUCH_HOVER_SUPPRESSION_MS"));
@@ -5587,9 +5833,15 @@ mod tests {
         assert!(script.contains("@media (hover: none), (pointer: coarse), (any-pointer: coarse)"));
         assert!(script.contains("navigator.maxTouchPoints"));
         assert!(script.contains("data-codexl-touch-device"));
-        assert!(script.contains("[data-app-action-sidebar-thread-row]"));
-        assert!(script.contains("[role=\"button\"]:has([data-thread-title-trigger])"));
+        assert!(script.contains("data-codexl-touch-active"));
+        assert!(script.contains("data-app-action-sidebar-thread-row"));
+        assert!(script.contains("data-app-action-sidebar-thread-title"));
+        assert!(script.contains("data-app-shell-tab-controller"));
         assert!(script.contains("[class*=\"group-hover:pointer-events-auto\"]"));
+        assert!(script.contains("[class*=\"group-hover:opacity-0\"]"));
+        assert!(script.contains("[class*=\"group-hover:hidden\"]"));
+        assert!(script.contains("[data-thread-title]"));
+        assert!(script.contains("visibility: visible"));
         assert!(script.contains("touch-action: manipulation"));
         assert!(script.contains("if (!usage)"));
         assert!(!script.contains("new MutationObserver"));

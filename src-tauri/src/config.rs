@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::extensions::builtins::gateway::config as gateway_config;
+use crate::extensions::{self, builtins::gateway::config as gateway_config};
 
 pub const DEFAULT_PROVIDER_PROFILE_NAME: &str = "Default";
 pub const REMOTE_FRONTEND_MODE_APP: &str = "app";
@@ -609,13 +609,27 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn load() -> Self {
-        let mut config = std::fs::read_to_string(config_path())
+        let path = config_path();
+        let first_launch = !path.exists();
+        let mut config = std::fs::read_to_string(&path)
             .ok()
             .and_then(|content| serde_json::from_str::<AppConfig>(&content).ok())
             .unwrap_or_default();
+        if first_launch {
+            config.apply_initial_extension_defaults();
+        }
         config.normalize();
         let _ = config.save();
         config
+    }
+
+    fn apply_initial_extension_defaults(&mut self) {
+        if !extensions::user_node_runtime_available() {
+            return;
+        }
+        self.extensions.enabled = true;
+        self.extensions.bot_gateway_enabled = true;
+        self.extensions.next_ai_gateway_enabled = true;
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -4179,6 +4193,65 @@ requires_openai_auth = true
             std::env::set_var("CODEXL_CODEX_PATH", value);
         } else {
             std::env::remove_var("CODEXL_CODEX_PATH");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_load_enables_builtin_extensions_when_user_node_available_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("initial-extension-defaults");
+        let old_home = std::env::var("HOME").ok();
+        let old_config_path = std::env::var("CODEXL_CONFIG_PATH").ok();
+        let old_node_path = std::env::var("CODEXL_NODE_PATH").ok();
+        let config_path = root.join("config.json");
+        let node_path = root.join("node");
+
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(&node_path, "#!/bin/sh\necho v20.0.0\n").expect("write fake node");
+        let mut permissions = std::fs::metadata(&node_path)
+            .expect("fake node metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&node_path, permissions).expect("make fake node executable");
+
+        std::env::set_var("HOME", &root);
+        std::env::set_var("CODEXL_CONFIG_PATH", &config_path);
+        std::env::set_var("CODEXL_NODE_PATH", &node_path);
+
+        let config = AppConfig::load();
+        assert!(config.extensions.enabled);
+        assert!(config.extensions.bot_gateway_enabled);
+        assert!(config.extensions.next_ai_gateway_enabled);
+
+        let mut manually_disabled = config.clone();
+        manually_disabled.extensions.enabled = false;
+        manually_disabled.extensions.bot_gateway_enabled = false;
+        manually_disabled.extensions.next_ai_gateway_enabled = false;
+        manually_disabled.save().expect("save disabled extensions");
+
+        let reloaded = AppConfig::load();
+        assert!(!reloaded.extensions.enabled);
+        assert!(!reloaded.extensions.bot_gateway_enabled);
+        assert!(!reloaded.extensions.next_ai_gateway_enabled);
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_config_path {
+            std::env::set_var("CODEXL_CONFIG_PATH", value);
+        } else {
+            std::env::remove_var("CODEXL_CONFIG_PATH");
+        }
+        if let Some(value) = old_node_path {
+            std::env::set_var("CODEXL_NODE_PATH", value);
+        } else {
+            std::env::remove_var("CODEXL_NODE_PATH");
         }
         let _ = std::fs::remove_dir_all(root);
     }
