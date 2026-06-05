@@ -23,8 +23,8 @@ const NEXT_AI_GATEWAY_EXTENSION_ID: &str = "next-ai-gateway";
 const NEXT_AI_GATEWAY_EXTENSION_NAME: &str = "NeXT AI Gateway";
 const NEXT_AI_GATEWAY_EXTENSION_DESCRIPTION: &str =
     "Use the built-in Gateway to convert other protocol interfaces for Codex.";
-const NEXT_AI_GATEWAY_EXTENSION_VERSION: &str = "1.0.3";
-const NEXT_AI_GATEWAY_BUNDLED_PACKAGE_FILE: &str = "next-ai-gateway-1.0.3.tar.gz";
+const NEXT_AI_GATEWAY_EXTENSION_VERSION: &str = "1.0.5";
+const NEXT_AI_GATEWAY_BUNDLED_PACKAGE_FILE: &str = "next-ai-gateway-1.0.5.tar.gz";
 const NEXT_AI_GATEWAY_ENTRY_ENV: &str = "CODEXL_BUILTIN_NEXT_AI_GATEWAY_ENTRY";
 const NEXT_AI_GATEWAY_PACKAGE_ENV: &str = "CODEXL_BUILTIN_NEXT_AI_GATEWAY_PACKAGE";
 const NEXT_AI_GATEWAY_PACKAGE_URL_ENV: &str = "CODEXL_BUILTIN_NEXT_AI_GATEWAY_PACKAGE_URL";

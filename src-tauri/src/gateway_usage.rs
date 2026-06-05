@@ -1,9 +1,10 @@
+use crate::extensions::builtins::gateway::config as gateway_config;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -146,6 +147,26 @@ pub struct GatewayUsageRequestEvent {
     pub total_tokens: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRequestLog {
+    pub request_id: String,
+    pub manifest_path: String,
+    pub request_parts: Vec<GatewayRequestLogPart>,
+    pub response_parts: Vec<GatewayRequestLogPart>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRequestLogPart {
+    pub part_type: String,
+    pub content_type: String,
+    pub content: String,
+    pub file_path: String,
+    pub original_bytes: u64,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone)]
 struct GatewayUsageEvent {
     event_id: String,
@@ -247,6 +268,20 @@ pub async fn load_usage_summary(
             database_path.to_string_lossy().to_string(),
             codex_home,
         )
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+pub async fn load_request_log(request_id: String) -> Result<GatewayRequestLog, String> {
+    let request_id = request_id.trim().to_string();
+    if request_id.is_empty() {
+        return Err("Gateway request id is required".to_string());
+    }
+
+    let spool_dirs = gateway_config::gateway_raw_trace_spool_dirs()?;
+    tokio::task::spawn_blocking(move || {
+        load_request_log_from_spool_candidates(&spool_dirs, &request_id)
     })
     .await
     .map_err(|err| err.to_string())?
@@ -872,6 +907,316 @@ where
         result.push(row.map_err(|err| err.to_string())?);
     }
     Ok(result)
+}
+
+fn load_request_log_from_spool(
+    spool_dir: &Path,
+    request_id: &str,
+) -> Result<GatewayRequestLog, String> {
+    let spool_dir = spool_dir
+        .canonicalize()
+        .map_err(|_| "Gateway raw trace spool directory was not found".to_string())?;
+    let trace_dir_name = sanitize_raw_trace_request_id(request_id);
+    if trace_dir_name == "." || trace_dir_name == ".." {
+        return Err("Gateway request id is invalid".to_string());
+    }
+    let request_dir = spool_dir.join(trace_dir_name);
+    let request_dir = match request_dir.canonicalize() {
+        Ok(path) => path,
+        Err(_) => find_request_log_dir_by_manifest(&spool_dir, request_id)?
+            .ok_or_else(|| "Gateway request log was not found".to_string())?,
+    };
+    if !request_dir.starts_with(&spool_dir) {
+        return Err(
+            "Gateway request log path is outside the raw trace spool directory".to_string(),
+        );
+    }
+    let manifest_path = request_dir.join("manifest.json");
+    let manifest_content = fs::read_to_string(&manifest_path)
+        .map_err(|_| "Gateway request log manifest was not found".to_string())?;
+    let manifest = serde_json::from_str::<Value>(&manifest_content)
+        .map_err(|err| format!("Gateway request log manifest is invalid: {}", err))?;
+    let parts = manifest
+        .get("parts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Gateway request log manifest has no parts".to_string())?;
+
+    let mut request_parts = Vec::new();
+    let mut response_parts = Vec::new();
+    for part in parts {
+        let Some(log_part) = load_request_log_part(&request_dir, part)? else {
+            continue;
+        };
+        if request_log_part_is_request(&log_part.part_type) {
+            request_parts.push(log_part);
+        } else if request_log_part_is_response(&log_part.part_type) {
+            response_parts.push(log_part);
+        }
+    }
+
+    request_parts.sort_by_key(|part| request_log_part_rank(&part.part_type));
+    response_parts.sort_by_key(|part| response_log_part_rank(&part.part_type));
+    if request_parts.is_empty() && response_parts.is_empty() {
+        return Err("Gateway request log has no local request or response parts".to_string());
+    }
+
+    Ok(GatewayRequestLog {
+        request_id: request_id.to_string(),
+        manifest_path: manifest_path.to_string_lossy().to_string(),
+        request_parts,
+        response_parts,
+    })
+}
+
+fn load_request_log_from_spool_candidates(
+    spool_dirs: &[PathBuf],
+    request_id: &str,
+) -> Result<GatewayRequestLog, String> {
+    let mut checked = Vec::new();
+    let mut last_error = None;
+
+    for spool_dir in spool_dirs {
+        checked.push(spool_dir.to_string_lossy().to_string());
+        match load_request_log_from_spool(spool_dir, request_id) {
+            Ok(log) => return Ok(log),
+            Err(err) => last_error = Some(err),
+        }
+    }
+
+    let checked_paths = checked
+        .into_iter()
+        .filter(|path| !path.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if checked_paths.is_empty() {
+        return Err(last_error.unwrap_or_else(|| "Gateway request log was not found".to_string()));
+    }
+    Err(format!(
+        "{} (checked: {})",
+        last_error.unwrap_or_else(|| "Gateway request log was not found".to_string()),
+        checked_paths
+    ))
+}
+
+fn find_request_log_dir_by_manifest(
+    spool_dir: &Path,
+    request_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    let entries = fs::read_dir(spool_dir)
+        .map_err(|_| "Gateway raw trace spool directory was not found".to_string())?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let manifest_path = path.join("manifest.json");
+        let Ok(content) = fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        let manifest_request_id = manifest
+            .get("requestId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if manifest_request_id != request_id {
+            continue;
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| "Gateway request log was not found".to_string())?;
+        if !canonical.starts_with(spool_dir) {
+            return Err(
+                "Gateway request log path is outside the raw trace spool directory".to_string(),
+            );
+        }
+        return Ok(Some(canonical));
+    }
+    Ok(None)
+}
+
+fn load_request_log_part(
+    request_dir: &Path,
+    part: &Value,
+) -> Result<Option<GatewayRequestLogPart>, String> {
+    let part_type = part
+        .get("partType")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Gateway request log part is missing partType".to_string())?;
+    if !request_log_part_is_request(part_type) && !request_log_part_is_response(part_type) {
+        return Ok(None);
+    }
+
+    let content_type = part
+        .get("contentType")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("text/plain; charset=utf-8")
+        .to_string();
+    let Some(path) = request_log_part_path(request_dir, part, part_type, &content_type)? else {
+        return Ok(None);
+    };
+    let (content, original_bytes) = read_request_log_part_content(&path, &content_type)?;
+
+    Ok(Some(GatewayRequestLogPart {
+        part_type: part_type.to_string(),
+        content_type,
+        content,
+        file_path: path.to_string_lossy().to_string(),
+        original_bytes,
+        truncated: false,
+    }))
+}
+
+fn request_log_part_path(
+    request_dir: &Path,
+    part: &Value,
+    part_type: &str,
+    content_type: &str,
+) -> Result<Option<PathBuf>, String> {
+    if let Some(file_path) = part
+        .get("filePath")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return canonical_request_log_part_path(request_dir, Path::new(file_path)).map(Some);
+    }
+
+    let fallback = request_dir.join(format!(
+        "{}.{}",
+        part_type,
+        request_log_extension_from_content_type(content_type)
+    ));
+    if fallback.is_file() {
+        return canonical_request_log_part_path(request_dir, &fallback).map(Some);
+    }
+
+    Ok(None)
+}
+
+fn canonical_request_log_part_path(request_dir: &Path, path: &Path) -> Result<PathBuf, String> {
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        request_dir.join(path)
+    };
+    let path = absolute_path
+        .canonicalize()
+        .map_err(|err| format!("Gateway request log part is unavailable: {}", err))?;
+    if !path.starts_with(request_dir) {
+        return Err(
+            "Gateway request log part path is outside the request trace directory".to_string(),
+        );
+    }
+    Ok(path)
+}
+
+fn read_request_log_part_content(path: &Path, content_type: &str) -> Result<(String, u64), String> {
+    let metadata = fs::metadata(path).map_err(|err| err.to_string())?;
+    let original_bytes = metadata.len();
+    let mut buffer = Vec::new();
+    File::open(path)
+        .map_err(|err| err.to_string())?
+        .read_to_end(&mut buffer)
+        .map_err(|err| err.to_string())?;
+    let content = String::from_utf8_lossy(&buffer).to_string();
+    let content = pretty_request_log_content(&content, content_type, path);
+
+    Ok((content, original_bytes))
+}
+
+fn pretty_request_log_content(content: &str, content_type: &str, path: &Path) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() || !request_log_content_is_json(content_type, path) {
+        return content.to_string();
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| content.to_string())
+}
+
+fn request_log_content_is_json(content_type: &str, path: &Path) -> bool {
+    content_type.to_ascii_lowercase().contains("json")
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.eq_ignore_ascii_case("json"))
+            .unwrap_or(false)
+}
+
+fn request_log_extension_from_content_type(content_type: &str) -> &'static str {
+    let lower = content_type.to_ascii_lowercase();
+    if lower.contains("ndjson") {
+        "ndjson"
+    } else if lower.contains("json") {
+        "json"
+    } else if lower.contains("xml") {
+        "xml"
+    } else {
+        "txt"
+    }
+}
+
+fn sanitize_raw_trace_request_id(request_id: &str) -> String {
+    request_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn request_log_part_is_request(part_type: &str) -> bool {
+    matches!(
+        part_type,
+        "client_request"
+            | "upstream_request"
+            | "client_request_metadata"
+            | "upstream_request_metadata"
+    )
+}
+
+fn request_log_part_is_response(part_type: &str) -> bool {
+    matches!(
+        part_type,
+        "response_stream"
+            | "upstream_response"
+            | "upstream_response_metadata"
+            | "gateway_response"
+            | "gateway_response_metadata"
+    )
+}
+
+fn request_log_part_rank(part_type: &str) -> usize {
+    match part_type {
+        "client_request" => 0,
+        "upstream_request" => 1,
+        "client_request_metadata" => 2,
+        "upstream_request_metadata" => 3,
+        _ => 10,
+    }
+}
+
+fn response_log_part_rank(part_type: &str) -> usize {
+    match part_type {
+        "response_stream" => 0,
+        "upstream_response" => 1,
+        "gateway_response" => 1,
+        "upstream_response_metadata" => 2,
+        "gateway_response_metadata" => 2,
+        _ => 10,
+    }
 }
 
 #[derive(Debug)]
@@ -1747,6 +2092,155 @@ mod tests {
         assert_eq!(event.total_tokens, 150);
         assert_eq!(event.latency_ms, Some(1234));
         assert_eq!(event.client_session_id, "session-a");
+    }
+
+    #[test]
+    fn loads_gateway_request_log_from_local_raw_trace_parts() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let spool_dir = std::env::temp_dir().join(format!("codexl-request-log-test-{}", suffix));
+        let request_id = "req/one";
+        let request_dir = spool_dir.join("req_one");
+        std::fs::create_dir_all(&request_dir).expect("create request dir");
+        let request_path = request_dir.join("client_request.json");
+        let response_path = request_dir.join("response_stream.txt");
+        let gateway_response_path = request_dir.join("gateway_response.json");
+        std::fs::write(&request_path, r#"{"model":"gpt-4.1","input":"hello"}"#)
+            .expect("write request part");
+        std::fs::write(&response_path, "data: {\"output\":\"hi\"}\n\n")
+            .expect("write response part");
+        std::fs::write(
+            &gateway_response_path,
+            r#"{"error":{"message":"Model not found"}}"#,
+        )
+        .expect("write gateway response part");
+        std::fs::write(
+            request_dir.join("manifest.json"),
+            serde_json::to_string(&json!({
+                "requestId": request_id,
+                "parts": [
+                    {
+                        "partType": "client_request",
+                        "filePath": request_path,
+                        "contentType": "application/json; charset=utf-8"
+                    },
+                    {
+                        "partType": "response_stream",
+                        "filePath": response_path,
+                        "contentType": "text/event-stream; charset=utf-8"
+                    },
+                    {
+                        "partType": "gateway_response",
+                        "filePath": gateway_response_path,
+                        "contentType": "application/json; charset=utf-8"
+                    }
+                ]
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let log = load_request_log_from_spool(&spool_dir, request_id).expect("load log");
+
+        assert_eq!(sanitize_raw_trace_request_id(request_id), "req_one");
+        assert_eq!(log.request_parts.len(), 1);
+        assert_eq!(log.response_parts.len(), 2);
+        assert!(log.request_parts[0].content.contains("\n  \"model\""));
+        assert_eq!(
+            log.response_parts[0].content,
+            "data: {\"output\":\"hi\"}\n\n"
+        );
+        assert_eq!(log.response_parts[1].part_type, "gateway_response");
+        assert!(log.response_parts[1].content.contains("Model not found"));
+
+        let _ = std::fs::remove_dir_all(spool_dir);
+    }
+
+    #[test]
+    fn loads_gateway_request_log_by_manifest_request_id_fallback() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let spool_dir =
+            std::env::temp_dir().join(format!("codexl-request-log-manifest-test-{}", suffix));
+        let request_id = "req/manifest-only";
+        let request_dir = spool_dir.join("nonmatching-trace-dir");
+        std::fs::create_dir_all(&request_dir).expect("create request dir");
+        let request_path = request_dir.join("client_request.json");
+        std::fs::write(&request_path, r#"{"model":"gpt-5.4-mini","input":"hello"}"#)
+            .expect("write request part");
+        std::fs::write(
+            request_dir.join("manifest.json"),
+            serde_json::to_string(&json!({
+                "requestId": request_id,
+                "parts": [
+                    {
+                        "partType": "client_request",
+                        "filePath": request_path,
+                        "contentType": "application/json; charset=utf-8"
+                    }
+                ]
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let log = load_request_log_from_spool_candidates(
+            &[
+                std::env::temp_dir().join("codexl-missing-raw-trace-spool"),
+                spool_dir.clone(),
+            ],
+            request_id,
+        )
+        .expect("load log");
+
+        assert_eq!(log.request_id, request_id);
+        assert_eq!(log.request_parts.len(), 1);
+        assert!(log.request_parts[0].content.contains("gpt-5.4-mini"));
+
+        let _ = std::fs::remove_dir_all(spool_dir);
+    }
+
+    #[test]
+    fn loads_gateway_request_log_parts_without_truncating_content() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let spool_dir =
+            std::env::temp_dir().join(format!("codexl-request-log-large-test-{}", suffix));
+        let request_id = "req_large";
+        let request_dir = spool_dir.join(request_id);
+        std::fs::create_dir_all(&request_dir).expect("create request dir");
+        let request_path = request_dir.join("client_request.txt");
+        let large_body = "x".repeat(2 * 1024 * 1024 + 128);
+        std::fs::write(&request_path, &large_body).expect("write request part");
+        std::fs::write(
+            request_dir.join("manifest.json"),
+            serde_json::to_string(&json!({
+                "requestId": request_id,
+                "parts": [
+                    {
+                        "partType": "client_request",
+                        "filePath": request_path,
+                        "contentType": "text/plain; charset=utf-8"
+                    }
+                ]
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let log = load_request_log_from_spool(&spool_dir, request_id).expect("load log");
+
+        assert_eq!(log.request_parts.len(), 1);
+        assert_eq!(log.request_parts[0].content.len(), large_body.len());
+        assert!(!log.request_parts[0].truncated);
+
+        let _ = std::fs::remove_dir_all(spool_dir);
     }
 
     #[test]

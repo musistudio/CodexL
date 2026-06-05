@@ -87,6 +87,7 @@ pub async fn ensure_running(state: &AppState) -> Result<GatewayServiceStatus, St
     } else {
         None
     };
+    let request_logging_enabled = gateway_request_logging_enabled(&config_file.config);
 
     let mut guard = state.gateway_service.lock().await;
     if let Some(status) =
@@ -117,6 +118,7 @@ pub async fn ensure_running(state: &AppState) -> Result<GatewayServiceStatus, St
         &auth_introspection_url,
         &auth_secret,
         usage_webhook_url.as_deref(),
+        request_logging_enabled,
     )?;
     let pid = handle.child.id();
     wait_until_ready(&mut handle).await?;
@@ -200,6 +202,7 @@ fn start_process(
     auth_introspection_url: &str,
     auth_secret: &str,
     usage_webhook_url: Option<&str>,
+    request_logging_enabled: bool,
 ) -> Result<GatewayServiceHandle, String> {
     let mut command = Command::new(&extension.node.executable);
     command
@@ -235,6 +238,13 @@ fn start_process(
             .env("BILLING_WEBHOOK_TIMEOUT_MS", "2000");
     }
 
+    if request_logging_enabled {
+        command
+            .env("RAW_TRACE_MODE", "wire_raw")
+            .env("RAW_TRACE_MAX_PART_BYTES", "2147483647")
+            .env("RAW_TRACE_DELETE_LOCAL_AFTER_UPLOAD", "false");
+    }
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -257,6 +267,23 @@ fn gateway_usage_capture_enabled(config: &Value) -> bool {
         Some(Value::String(enabled)) => enabled.trim().eq_ignore_ascii_case("true"),
         _ => false,
     }
+}
+
+fn gateway_request_logging_enabled(config: &Value) -> bool {
+    let Some(raw_trace) = config.get("rawTrace") else {
+        return false;
+    };
+    let enabled = match raw_trace.get("enabled") {
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(Value::String(enabled)) => enabled.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    };
+    let mode = raw_trace
+        .get("mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    enabled && !mode.eq_ignore_ascii_case("disabled")
 }
 
 fn codexl_gateway_usage_webhook_url(config: &AppConfig) -> String {

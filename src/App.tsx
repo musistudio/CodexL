@@ -18,6 +18,8 @@ import {
   Activity,
   AlertCircle,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   CheckCircle2,
   CircleUserRound,
   Cloud,
@@ -28,6 +30,7 @@ import {
   EyeOff,
   ExternalLink,
   FileCog,
+  FileText,
   FolderOpen,
   Globe,
   ImageIcon,
@@ -611,6 +614,9 @@ type Language = "en" | "zh";
 type Appearance = "system" | "light" | "dark";
 
 type JsonObject = Record<string, unknown>;
+type GatewayRequestLogParsedContent =
+  | { kind: "json"; value: unknown }
+  | { kind: "text"; content: string };
 type GatewayConfigFile = {
   path: string;
   config: JsonObject;
@@ -702,6 +708,24 @@ type GatewayUsageRequestEvent = {
   cacheWriteTokens: number;
   totalTokens: number;
 };
+type GatewayRequestLogPart = {
+  partType: string;
+  contentType: string;
+  content: string;
+  filePath: string;
+  originalBytes: number;
+  truncated: boolean;
+};
+type GatewayRequestLog = {
+  requestId: string;
+  manifestPath: string;
+  requestParts: GatewayRequestLogPart[];
+  responseParts: GatewayRequestLogPart[];
+};
+type GatewayRequestLogLoadState =
+  | { status: "loading" }
+  | { status: "ready"; log: GatewayRequestLog }
+  | { status: "error"; message: string };
 type GatewayUsageSummary = {
   databasePath: string;
   windowDays: number;
@@ -1067,6 +1091,29 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     gatewayUsageWeeklyMode: t("gateway.usageWeeklyMode"),
     gatewayUsageCumulativeMode: t("gateway.usageCumulativeMode"),
     gatewayUsageDayUnit: t("gateway.usageDayUnit"),
+    gatewayUsageViewLog: t("gateway.usageViewLog"),
+    gatewayUsageHideLog: t("gateway.usageHideLog"),
+    gatewayUsageLogRequest: t("gateway.usageLogRequest"),
+    gatewayUsageLogResponse: t("gateway.usageLogResponse"),
+    gatewayUsageLogLoading: t("gateway.usageLogLoading"),
+    gatewayUsageLogUnavailable: t("gateway.usageLogUnavailable"),
+    gatewayUsageLogCopyPart: t("gateway.usageLogCopyPart"),
+    gatewayUsageLogCopied: t("gateway.usageLogCopied"),
+    gatewayUsageLogTruncated: t("gateway.usageLogTruncated"),
+    gatewayUsageLogClientRequest: t("gateway.usageLogClientRequest"),
+    gatewayUsageLogClientRequestMetadata: t("gateway.usageLogClientRequestMetadata"),
+    gatewayUsageLogUpstreamRequest: t("gateway.usageLogUpstreamRequest"),
+    gatewayUsageLogUpstreamRequestMetadata: t("gateway.usageLogUpstreamRequestMetadata"),
+    gatewayUsageLogUpstreamResponse: t("gateway.usageLogUpstreamResponse"),
+    gatewayUsageLogUpstreamResponseMetadata: t("gateway.usageLogUpstreamResponseMetadata"),
+    gatewayUsageLogGatewayResponse: t("gateway.usageLogGatewayResponse"),
+    gatewayUsageLogGatewayResponseMetadata: t("gateway.usageLogGatewayResponseMetadata"),
+    gatewayUsageLogResponseStream: t("gateway.usageLogResponseStream"),
+    gatewayUsageRowsPerPage: t("gateway.usageRowsPerPage"),
+    gatewayUsagePageSummary: (start: number, end: number, total: number) =>
+      t("gateway.usagePageSummary", { start, end, total }),
+    gatewayUsagePreviousPage: t("gateway.usagePreviousPage"),
+    gatewayUsageNextPage: t("gateway.usageNextPage"),
     botSettingsDescription: t("bot.settingsDescription"),
     addBot: t("bot.addBot"),
     associatedWorkspace: t("bot.associatedWorkspace"),
@@ -1495,6 +1542,8 @@ function App() {
   const gatewayModelTriggerRef = useRef<HTMLButtonElement>(null);
   const workspaceSavePendingRef = useRef(false);
   const workspaceDeletePendingRef = useRef(false);
+  const weixinBotQrRef = useRef<WeixinBotQrState | null>(null);
+  const weixinBotLoginGenerationRef = useRef(0);
 
   const { i18n } = useTranslation();
   const strings = useAppStrings();
@@ -1505,6 +1554,24 @@ function App() {
     () => workspaceSelectableDefaultProviders(defaultProviders, gatewayProfileEnabled),
     [defaultProviders, gatewayProfileEnabled],
   );
+
+  useEffect(() => {
+    weixinBotQrRef.current = weixinBotQr;
+  }, [weixinBotQr]);
+
+  const cancelWeixinBotLoginState = useCallback((profileName?: string | null) => {
+    const targetProfileName = profileName?.trim() || "";
+    const current = weixinBotQrRef.current;
+    weixinBotLoginGenerationRef.current += 1;
+    if (!current || (targetProfileName && current.profileName !== targetProfileName)) {
+      return;
+    }
+
+    weixinBotQrRef.current = null;
+    setWeixinBotQr(null);
+    invoke("cancel_weixin_bot_login", { sessionId: current.sessionId }).catch(console.error);
+    closeQrWebview(current.sessionId).catch(console.error);
+  }, []);
 
   useEffect(() => {
     if (import.meta.env.DEV) {
@@ -2167,18 +2234,29 @@ function App() {
 
   const openWeixinBotLogin = useCallback(
     async (profileName: string) => {
+      cancelWeixinBotLoginState();
+      const loginGeneration = weixinBotLoginGenerationRef.current + 1;
+      weixinBotLoginGenerationRef.current = loginGeneration;
       const login = await invoke<WeixinBotQrStart>("start_weixin_bot_login", {
         profileName,
         force: true,
       });
-      setWeixinBotQr({
+      if (loginGeneration !== weixinBotLoginGenerationRef.current) {
+        invoke("cancel_weixin_bot_login", { sessionId: login.sessionId }).catch(console.error);
+        closeQrWebview(login.sessionId).catch(console.error);
+        return;
+      }
+
+      const nextLogin: WeixinBotQrState = {
         ...login,
         qrDisplay: normalizeQrDisplay(login.qrCodeUrl),
         status: "qr_pending",
         statusMessage: login.message || strings.scanQrInWeixin,
-      });
+      };
+      weixinBotQrRef.current = nextLogin;
+      setWeixinBotQr(nextLogin);
     },
-    [strings.scanQrInWeixin],
+    [cancelWeixinBotLoginState, strings.scanQrInWeixin],
   );
 
   const saveProvider = useCallback(async () => {
@@ -2283,11 +2361,10 @@ function App() {
         nextConfig = await invoke<AppConfig>("create_provider", { provider });
       }
 
-      savedProfileKey = nextConfig.active_provider || originalProfileKey;
       const savedProfile =
-        nextConfig.provider_profiles.find((profile) => profileKey(profile) === savedProfileKey) ||
+        nextConfig.provider_profiles.find((profile) => originalProfileKey && profileKey(profile) === originalProfileKey) ||
         nextConfig.provider_profiles.find((profile) => profile.name === savedProfileName);
-      savedProfileKey = savedProfile ? profileKey(savedProfile) : savedProfileKey;
+      savedProfileKey = savedProfile ? profileKey(savedProfile) : originalProfileKey || savedProfileName;
       savedBot = savedProfile?.bot ?? savedBot;
       if (extensionsEnabled && savedProfileKey && isStaticAuthBot(savedBot)) {
         nextConfig = await invoke<AppConfig>("configure_bot_integration", {
@@ -2304,6 +2381,9 @@ function App() {
       setEditingProfileKey(null);
       setDialogMode("add");
       setForm(emptyForm);
+      if (savedProfileKey && !shouldStartQrLogin(savedBot)) {
+        cancelWeixinBotLoginState(savedProfileKey);
+      }
       await refreshStatus();
       if (extensionsEnabled && savedProfileKey && shouldStartQrLogin(savedBot)) {
         await openWeixinBotLogin(savedProfileKey);
@@ -2316,6 +2396,7 @@ function App() {
     }
   }, [
     config,
+    cancelWeixinBotLoginState,
     dialogMode,
     editingProfileKey,
     editingProfileName,
@@ -2354,9 +2435,12 @@ function App() {
         bot_configs: nextBotConfigs,
       };
       await invoke("update_config", { newConfig: nextConfig });
+      if (!botExtensionsEnabled(nextConfig.extensions)) {
+        cancelWeixinBotLoginState();
+      }
       setConfig(nextConfig);
     },
-    [config],
+    [cancelWeixinBotLoginState, config],
   );
 
   const saveBotConfigs = useCallback(
@@ -2601,22 +2685,31 @@ function App() {
   );
 
   const closeWeixinBotLogin = useCallback(() => {
-    const sessionId = weixinBotQr?.sessionId;
-    setWeixinBotQr(null);
-    if (sessionId) {
-      invoke("cancel_weixin_bot_login", { sessionId }).catch(console.error);
-      closeQrWebview(sessionId).catch(console.error);
-    }
-  }, [weixinBotQr?.sessionId]);
+    cancelWeixinBotLoginState();
+  }, [cancelWeixinBotLoginState]);
 
   const regenerateWeixinBotLogin = useCallback(async () => {
-    if (!weixinBotQr) return;
-    const current = weixinBotQr;
+    const current = weixinBotQrRef.current;
+    if (!current) return;
+    weixinBotLoginGenerationRef.current += 1;
+    weixinBotQrRef.current = null;
     setWeixinBotQr(null);
     await closeQrWebview(current.sessionId).catch(console.error);
     await invoke("cancel_weixin_bot_login", { sessionId: current.sessionId }).catch(console.error);
     await openWeixinBotLogin(current.profileName);
-  }, [openWeixinBotLogin, weixinBotQr]);
+  }, [openWeixinBotLogin]);
+
+  useEffect(() => {
+    if (!weixinBotQr || !config) {
+      return;
+    }
+    const profile = config.provider_profiles.find(
+      (item) => profileKey(item) === weixinBotQr.profileName || item.name === weixinBotQr.profileName,
+    );
+    if (!botExtensionsEnabled(config.extensions) || !profile || !isQrLoginBot(profile.bot)) {
+      cancelWeixinBotLoginState(weixinBotQr.profileName);
+    }
+  }, [cancelWeixinBotLoginState, config, weixinBotQr]);
 
   useEffect(() => {
     if (!weixinBotQr || isTerminalBotLoginStatus(weixinBotQr.status)) {
@@ -3669,7 +3762,7 @@ function AppSettingsDialog({
   const [usageLoading, setUsageLoading] = useState(false);
   const [usageError, setUsageError] = useState("");
   const [usageDateRange, setUsageDateRange] = useState<GatewayUsageDateRange>(() =>
-    gatewayUsageDateRangeForHours(24),
+    gatewayUsageDateRangeForDays(30),
   );
   const [usageFullscreen, setUsageFullscreen] = useState(false);
   const botEnabled = draftExtensions.enabled && draftExtensions.bot_gateway_enabled;
@@ -4310,7 +4403,7 @@ function AppSettingsDialog({
                 onChange={setGatewayForm}
               />
             ) : activeSection === "usage" ? (
-              <div className={cn(usageViewMode === "overview" ? "max-w-none" : "max-w-5xl", usageFullscreenActive && "max-w-none")}>
+              <div className="min-w-0 w-full">
                 {usageViewMode === "overview" ? (
                   <GatewayUsageOverviewDashboard
                     auth={remoteCloudAuth}
@@ -4327,6 +4420,7 @@ function AppSettingsDialog({
                     loading={usageLoading}
                     error={usageError || gatewayError}
                     strings={strings}
+                    requestLoggingEnabled={Boolean(gatewayForm?.requestLoggingEnabled)}
                     dateRange={usageDateRange}
                     onDateRangeChange={setUsageDateRange}
                     onPresetHours={(hours) => setUsageDateRange(gatewayUsageDateRangeForHours(hours))}
@@ -6218,6 +6312,7 @@ function GatewayUsageDashboard({
   loading,
   error,
   strings,
+  requestLoggingEnabled,
   dateRange,
   onDateRangeChange,
   onPresetHours,
@@ -6230,6 +6325,7 @@ function GatewayUsageDashboard({
   loading: boolean;
   error: string;
   strings: AppStrings;
+  requestLoggingEnabled: boolean;
   dateRange: GatewayUsageDateRange;
   onDateRangeChange: React.Dispatch<React.SetStateAction<GatewayUsageDateRange>>;
   onPresetHours: (hours: number) => void;
@@ -6247,7 +6343,7 @@ function GatewayUsageDashboard({
   const [breakdownMode, setBreakdownMode] = useState<GatewayUsageBreakdownMode>("model");
 
   return (
-    <section className="space-y-4">
+    <section className="w-full min-w-0 space-y-4">
       <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
         <SectionTitle icon={<Activity className="h-4 w-4" />} title={strings.gatewayUsageDashboard} />
         <div className="grid w-full gap-2 sm:grid-cols-[auto_minmax(0,1fr)_auto] xl:w-auto xl:flex xl:flex-wrap xl:items-center xl:justify-end">
@@ -6382,7 +6478,7 @@ function GatewayUsageDashboard({
       ) : null}
 
       {hasUsage || loading ? (
-        <div className="space-y-4">
+        <div className="min-w-0 space-y-4">
           <GatewayUsageDailyChart daily={summary?.daily || []} strings={strings} />
 
           <GatewayUsageBreakdownModePicker
@@ -6399,7 +6495,11 @@ function GatewayUsageDashboard({
             <GatewayUsageProjectAnalysis items={summary?.byProject || []} strings={strings} />
           )}
 
-          <GatewayUsageRequestTable items={summary?.requests || []} strings={strings} />
+          <GatewayUsageRequestTable
+            items={summary?.requests || []}
+            strings={strings}
+            requestLoggingEnabled={requestLoggingEnabled}
+          />
         </div>
       ) : null}
 
@@ -6432,13 +6532,13 @@ function GatewayUsageDailyChart({ daily, strings }: { daily: GatewayUsageDaily[]
   }));
 
   return (
-    <section className="rounded-md border border-border bg-muted/10 p-3 sm:p-4">
+    <section className="w-full min-w-0 rounded-md border border-border bg-muted/10 p-3 sm:p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
         <h3 className="text-sm font-semibold">{strings.gatewayUsageDaily}</h3>
         <span className="text-xs text-muted-foreground">{strings.gatewayUsageTokens}</span>
       </div>
       {chartData.length > 0 ? (
-        <div className="h-[200px] sm:h-[260px]">
+        <div className="h-[200px] min-w-0 sm:h-[260px]">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={chartData} margin={{ top: 8, right: 18, left: 0, bottom: 0 }}>
               <CartesianGrid stroke="rgba(148, 163, 184, 0.18)" vertical={false} />
@@ -6513,7 +6613,7 @@ function GatewayUsageModelComparison({ items, strings }: { items: GatewayUsageBr
   const maxTokens = Math.max(...items.map((item) => item.totalTokens), 1);
 
   return (
-    <section className="rounded-md border border-border bg-muted/10 p-3 sm:p-4">
+    <section className="w-full min-w-0 rounded-md border border-border bg-muted/10 p-3 sm:p-4">
       <h3 className="mb-3 text-sm font-semibold">{strings.gatewayUsageByModel}</h3>
       {items.length > 0 ? (
         <div className="space-y-3">
@@ -6575,7 +6675,7 @@ function GatewayUsageSessionAnalysis({
   const maxTokens = Math.max(...items.map((item) => item.totalTokens), 1);
 
   return (
-    <section className="rounded-md border border-border bg-muted/10 p-3 sm:p-4">
+    <section className="w-full min-w-0 rounded-md border border-border bg-muted/10 p-3 sm:p-4">
       <h3 className="mb-3 text-sm font-semibold">{strings.gatewayUsageBySession}</h3>
       {items.length > 0 ? (
         <div className="space-y-3">
@@ -6652,7 +6752,7 @@ function GatewayUsageProjectAnalysis({
   const maxTokens = Math.max(...items.map((item) => item.totalTokens), 1);
 
   return (
-    <section className="rounded-md border border-border bg-muted/10 p-3 sm:p-4">
+    <section className="w-full min-w-0 rounded-md border border-border bg-muted/10 p-3 sm:p-4">
       <h3 className="mb-3 text-sm font-semibold">{strings.gatewayUsageByProject}</h3>
       {items.length > 0 ? (
         <div className="space-y-3">
@@ -6718,14 +6818,145 @@ function GatewayUsageProjectAnalysis({
   );
 }
 
-function GatewayUsageRequestTable({ items, strings }: { items: GatewayUsageRequestEvent[]; strings: AppStrings }) {
+function GatewayUsageRequestTable({
+  items,
+  strings,
+  requestLoggingEnabled,
+}: {
+  items: GatewayUsageRequestEvent[];
+  strings: AppStrings;
+  requestLoggingEnabled: boolean;
+}) {
+  const [expandedEventId, setExpandedEventId] = useState<string | null>(null);
+  const [logStates, setLogStates] = useState<Record<string, GatewayRequestLogLoadState>>({});
+  const [pageSize, setPageSize] = useState(10);
+  const [pageIndex, setPageIndex] = useState(0);
+  const gridColumns = requestLoggingEnabled
+    ? "grid-cols-[116px_160px_minmax(180px,1fr)_86px_70px_70px_70px_70px_66px_44px]"
+    : "grid-cols-[116px_160px_minmax(180px,1fr)_86px_70px_70px_70px_70px_66px]";
+  const totalItems = items.length;
+  const pageSizeOptions = [10, 25, 50, 100];
+  const pageCount = Math.max(1, Math.ceil(totalItems / pageSize));
+  const safePageIndex = Math.min(pageIndex, pageCount - 1);
+  const pageStartIndex = safePageIndex * pageSize;
+  const pageEndIndex = Math.min(pageStartIndex + pageSize, totalItems);
+  const pageStart = totalItems > 0 ? pageStartIndex + 1 : 0;
+  const paginatedItems = useMemo(
+    () => items.slice(pageStartIndex, pageEndIndex),
+    [items, pageEndIndex, pageStartIndex],
+  );
+
+  useEffect(() => {
+    setPageIndex((current) => Math.min(Math.max(0, current), pageCount - 1));
+  }, [pageCount]);
+
+  const loadRequestLog = useCallback((event: GatewayUsageRequestEvent) => {
+    const requestId = event.requestId.trim();
+    if (!requestId) {
+      return;
+    }
+    setLogStates((current) => {
+      const existing = current[requestId];
+      if (existing?.status === "loading" || existing?.status === "ready") {
+        return current;
+      }
+      return {
+        ...current,
+        [requestId]: { status: "loading" },
+      };
+    });
+    invoke<GatewayRequestLog>("get_gateway_request_log", { requestId })
+      .then((log) => {
+        setLogStates((current) => ({
+          ...current,
+          [requestId]: { status: "ready", log },
+        }));
+      })
+      .catch((error) => {
+        setLogStates((current) => ({
+          ...current,
+          [requestId]: { status: "error", message: errorMessage(error) },
+        }));
+      });
+  }, []);
+
+  const toggleRequestLog = (event: GatewayUsageRequestEvent) => {
+    const requestId = event.requestId.trim();
+    if (!requestLoggingEnabled || !requestId) {
+      return;
+    }
+    const expanding = expandedEventId !== event.eventId;
+    setExpandedEventId(expanding ? event.eventId : null);
+    if (expanding && !logStates[requestId]) {
+      loadRequestLog(event);
+    }
+  };
+
   return (
-    <section className="rounded-md border border-border bg-muted/10 p-3 sm:p-4">
-      <h3 className="mb-3 text-sm font-semibold">{strings.gatewayUsageRequestList}</h3>
+    <section className="w-full min-w-0 rounded-md border border-border bg-muted/10 p-3 sm:p-4">
+      <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <h3 className="text-sm font-semibold">{strings.gatewayUsageRequestList}</h3>
+        {items.length > 0 ? (
+          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            <span>{strings.gatewayUsageRowsPerPage}</span>
+            <Select
+              value={String(pageSize)}
+              onValueChange={(value) => {
+                const nextPageSize = Number(value);
+                if (!Number.isFinite(nextPageSize) || nextPageSize <= 0) {
+                  return;
+                }
+                setPageSize(nextPageSize);
+                setPageIndex(0);
+              }}
+            >
+              <SelectTrigger className="h-8 w-[84px] text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {pageSizeOptions.map((value) => (
+                  <SelectItem key={value} value={String(value)}>
+                    {value}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <span className="min-w-[104px] text-right tabular-nums">
+              {strings.gatewayUsagePageSummary(pageStart, pageEndIndex, totalItems)}
+            </span>
+            <div className="flex items-center gap-1">
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="h-8 w-8"
+                title={strings.gatewayUsagePreviousPage}
+                aria-label={strings.gatewayUsagePreviousPage}
+                disabled={safePageIndex <= 0}
+                onClick={() => setPageIndex((current) => Math.max(0, current - 1))}
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="h-8 w-8"
+                title={strings.gatewayUsageNextPage}
+                aria-label={strings.gatewayUsageNextPage}
+                disabled={safePageIndex >= pageCount - 1}
+                onClick={() => setPageIndex((current) => Math.min(pageCount - 1, current + 1))}
+              >
+                <ChevronRight className="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+        ) : null}
+      </div>
       {items.length > 0 ? (
         <div className="overflow-x-auto rounded border border-border/70">
           <div className="min-w-[960px]">
-            <div className="grid grid-cols-[116px_160px_minmax(180px,1fr)_86px_70px_70px_70px_70px_66px] bg-muted/20 px-2 py-2 text-xs font-medium text-muted-foreground sm:px-3">
+            <div className={cn("grid bg-muted/20 px-2 py-2 text-xs font-medium text-muted-foreground sm:px-3", gridColumns)}>
               <span>{strings.gatewayUsageTime}</span>
               <span>{strings.gatewayUsageSession}</span>
               <span>{strings.model}</span>
@@ -6735,49 +6966,73 @@ function GatewayUsageRequestTable({ items, strings }: { items: GatewayUsageReque
               <span className="text-right">{strings.gatewayUsageCache}</span>
               <span className="text-right">{strings.gatewayUsageTotal}</span>
               <span className="text-right">{strings.gatewayUsageLatency}</span>
+              {requestLoggingEnabled ? <span className="sr-only">{strings.gatewayUsageViewLog}</span> : null}
             </div>
-            {items.map((event) => {
+            {paginatedItems.map((event) => {
               const sessionLabel = event.clientSessionLabel || gatewayUsageSessionLabel(event.clientSessionId, strings);
               const projectLabel = event.clientProjectLabel || strings.gatewayUsageUnknownProject;
+              const requestId = event.requestId.trim();
+              const expanded = expandedEventId === event.eventId;
+              const logState = requestId ? logStates[requestId] : undefined;
 
               return (
-                <div
-                  key={event.eventId}
-                  className="grid grid-cols-[116px_160px_minmax(180px,1fr)_86px_70px_70px_70px_70px_66px] items-center border-t border-border/70 px-2 py-2 text-sm sm:px-3"
-                >
-                  <span className="truncate text-xs text-muted-foreground">{formatUnixDateTime(event.receivedAtUnix)}</span>
-                  <div className="min-w-0 text-xs text-muted-foreground" title={sessionLabel}>
-                    <div className="truncate">{compactGatewayUsageLabel(sessionLabel)}</div>
-                    <div className="truncate" title={event.clientProjectPath || projectLabel}>
-                      {projectLabel}
+                <div key={event.eventId} className="border-t border-border/70">
+                  <div className={cn("grid items-center px-2 py-2 text-sm sm:px-3", gridColumns)}>
+                    <span className="truncate text-xs text-muted-foreground">{formatUnixDateTime(event.receivedAtUnix)}</span>
+                    <div className="min-w-0 text-xs text-muted-foreground" title={sessionLabel}>
+                      <div className="truncate">{compactGatewayUsageLabel(sessionLabel)}</div>
+                      <div className="truncate" title={event.clientProjectPath || projectLabel}>
+                        {projectLabel}
+                      </div>
                     </div>
+                    <div className="min-w-0">
+                      <div className="truncate font-medium">
+                        {event.model || event.providerName || event.provider || strings.none}
+                      </div>
+                      <div className="truncate text-xs text-muted-foreground">
+                        {event.route || event.requestId || event.eventId}
+                      </div>
+                    </div>
+                    <span>
+                      <Badge className={gatewayUsageStatusClass(event.status)}>{event.status || strings.none}</Badge>
+                    </span>
+                    <span className="text-right tabular-nums text-muted-foreground">
+                      {formatTokenCount(event.inputTokens)}
+                    </span>
+                    <span className="text-right tabular-nums text-muted-foreground">
+                      {formatTokenCount(event.outputTokens)}
+                    </span>
+                    <span className="text-right tabular-nums text-muted-foreground">
+                      {formatTokenCount(gatewayUsageCacheTokens(event))}
+                    </span>
+                    <span className="text-right tabular-nums text-muted-foreground">
+                      {formatTokenCount(event.totalTokens)}
+                    </span>
+                    <span className="text-right text-xs tabular-nums text-muted-foreground">
+                      {event.latencyMs !== null ? formatLatency(event.latencyMs) : "-"}
+                    </span>
+                    {requestLoggingEnabled ? (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className={cn(
+                          "ml-auto h-8 w-8 text-muted-foreground hover:text-foreground",
+                          expanded && "bg-muted text-foreground",
+                        )}
+                        title={expanded ? strings.gatewayUsageHideLog : strings.gatewayUsageViewLog}
+                        aria-label={expanded ? strings.gatewayUsageHideLog : strings.gatewayUsageViewLog}
+                        aria-expanded={expanded}
+                        disabled={!requestId}
+                        onClick={() => toggleRequestLog(event)}
+                      >
+                        {expanded ? <ChevronDown className="h-4 w-4" /> : <FileText className="h-4 w-4" />}
+                      </Button>
+                    ) : null}
                   </div>
-                  <div className="min-w-0">
-                    <div className="truncate font-medium">
-                      {event.model || event.providerName || event.provider || strings.none}
-                    </div>
-                    <div className="truncate text-xs text-muted-foreground">
-                      {event.route || event.requestId || event.eventId}
-                    </div>
-                  </div>
-                  <span>
-                    <Badge className={gatewayUsageStatusClass(event.status)}>{event.status || strings.none}</Badge>
-                  </span>
-                  <span className="text-right tabular-nums text-muted-foreground">
-                    {formatTokenCount(event.inputTokens)}
-                  </span>
-                  <span className="text-right tabular-nums text-muted-foreground">
-                    {formatTokenCount(event.outputTokens)}
-                  </span>
-                  <span className="text-right tabular-nums text-muted-foreground">
-                    {formatTokenCount(gatewayUsageCacheTokens(event))}
-                  </span>
-                  <span className="text-right tabular-nums text-muted-foreground">
-                    {formatTokenCount(event.totalTokens)}
-                  </span>
-                  <span className="text-right text-xs tabular-nums text-muted-foreground">
-                    {event.latencyMs !== null ? formatLatency(event.latencyMs) : "-"}
-                  </span>
+                  {expanded ? (
+                    <GatewayUsageRequestLogViewer event={event} state={logState} strings={strings} />
+                  ) : null}
                 </div>
               );
             })}
@@ -6788,6 +7043,414 @@ function GatewayUsageRequestTable({ items, strings }: { items: GatewayUsageReque
       )}
     </section>
   );
+}
+
+function GatewayUsageRequestLogViewer({
+  event,
+  state,
+  strings,
+}: {
+  event: GatewayUsageRequestEvent;
+  state: GatewayRequestLogLoadState | undefined;
+  strings: AppStrings;
+}) {
+  if (!state || state.status === "loading") {
+    return (
+      <div className="px-2 pb-3 sm:px-3">
+        <div className="flex items-center gap-2 rounded-md border border-border/70 bg-background px-3 py-3 text-sm text-muted-foreground">
+          <RefreshCw className="h-4 w-4 animate-spin" />
+          {strings.gatewayUsageLogLoading}
+        </div>
+      </div>
+    );
+  }
+
+  if (state.status === "error") {
+    return (
+      <div className="px-2 pb-3 sm:px-3">
+        <p className="rounded-md border border-destructive/50 bg-destructive/12 px-3 py-2.5 text-sm leading-relaxed text-red-300">
+          {state.message || strings.gatewayUsageLogUnavailable}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="px-2 pb-3 sm:px-3">
+      <div className="rounded-md border border-border/70 bg-background p-3">
+        <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+          <span className="font-mono">{state.log.requestId || event.requestId}</span>
+          <span>
+            {strings.status} {event.statusCode !== null ? `HTTP ${event.statusCode}` : event.status || strings.none}
+          </span>
+          <span>{strings.gatewayUsageLatency} {event.latencyMs !== null ? formatLatency(event.latencyMs) : "-"}</span>
+        </div>
+        <div className="grid min-w-0 gap-3 lg:grid-cols-2">
+          <GatewayUsageRequestLogPane
+            title={strings.gatewayUsageLogRequest}
+            parts={state.log.requestParts}
+            strings={strings}
+          />
+          <GatewayUsageRequestLogPane
+            title={strings.gatewayUsageLogResponse}
+            parts={state.log.responseParts}
+            strings={strings}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GatewayUsageRequestLogPane({
+  title,
+  parts,
+  strings,
+}: {
+  title: string;
+  parts: GatewayRequestLogPart[];
+  strings: AppStrings;
+}) {
+  const [copiedPartKey, setCopiedPartKey] = useState<string | null>(null);
+
+  const copyPart = (part: GatewayRequestLogPart, partKey: string) => {
+    navigator.clipboard
+      .writeText(gatewayRequestLogCopyText(part))
+      .then(() => {
+        setCopiedPartKey(partKey);
+        window.setTimeout(() => {
+          setCopiedPartKey((current) => (current === partKey ? null : current));
+        }, 1600);
+      })
+      .catch(console.error);
+  };
+
+  return (
+    <section className="min-w-0">
+      <div className="mb-2 text-sm font-semibold">{title}</div>
+      {parts.length > 0 ? (
+        <div className="space-y-2">
+          {parts.map((part, index) => {
+            const partKey = `${part.partType}-${index}`;
+            const copied = copiedPartKey === partKey;
+            return (
+              <div key={partKey} className="overflow-hidden rounded-md border border-border/70 bg-muted/10">
+                <div className="flex min-h-9 items-center justify-between gap-2 border-b border-border/70 px-3 py-1.5">
+                  <div className="min-w-0">
+                    <div className="truncate text-xs font-medium" title={gatewayRequestLogPartLabel(part.partType, strings)}>
+                      {gatewayRequestLogPartLabel(part.partType, strings)}
+                    </div>
+                    <div className="truncate text-[11px] text-muted-foreground" title={part.filePath}>
+                      {gatewayRequestLogPartDetail(part)}
+                    </div>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
+                    title={copied ? strings.gatewayUsageLogCopied : strings.gatewayUsageLogCopyPart}
+                    aria-label={copied ? strings.gatewayUsageLogCopied : strings.gatewayUsageLogCopyPart}
+                    onClick={() => copyPart(part, partKey)}
+                  >
+                    {copied ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                  </Button>
+                </div>
+                <GatewayUsageRequestLogContent part={part} />
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="rounded-md border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
+          {strings.gatewayUsageLogUnavailable}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function GatewayUsageRequestLogContent({ part }: { part: GatewayRequestLogPart }) {
+  const parsed = useMemo(() => gatewayRequestLogParsedContent(part), [
+    part.content,
+    part.contentType,
+    part.partType,
+  ]);
+
+  if (parsed.kind === "json") {
+    return (
+      <div className="max-h-[420px] overflow-auto px-3 py-3 font-mono text-xs leading-relaxed text-foreground">
+        <GatewayRequestLogJsonNode value={parsed.value} depth={0} />
+      </div>
+    );
+  }
+
+  return (
+    <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap break-words px-3 py-3 font-mono text-xs leading-relaxed text-foreground">
+      {parsed.content || "-"}
+    </pre>
+  );
+}
+
+function GatewayRequestLogJsonNode({
+  name,
+  value,
+  depth,
+}: {
+  name?: string;
+  value: unknown;
+  depth: number;
+}) {
+  const entries = gatewayRequestLogJsonEntries(value);
+  const isContainer = entries !== null;
+  const [expanded, setExpanded] = useState(depth < 2);
+
+  if (!isContainer) {
+    const leaf = gatewayRequestLogJsonLeaf(value);
+    return (
+      <div className="flex min-w-0 gap-1.5" style={{ paddingLeft: depth > 0 ? 12 : 0 }}>
+        {name !== undefined ? (
+          <>
+            <span className="text-sky-500">{JSON.stringify(name)}</span>
+            <span className="text-muted-foreground">:</span>
+          </>
+        ) : null}
+        <span className={leaf.className}>{leaf.text}</span>
+      </div>
+    );
+  }
+
+  const arrayValue = Array.isArray(value);
+  const openToken = arrayValue ? "[" : "{";
+  const closeToken = arrayValue ? "]" : "}";
+  const summary = arrayValue ? `Array(${entries.length})` : `Object(${entries.length})`;
+
+  return (
+    <div className="min-w-0">
+      <div className="flex min-w-0 items-center gap-1.5" style={{ paddingLeft: depth > 0 ? 12 : 0 }}>
+        <button
+          type="button"
+          className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+          aria-label={expanded ? "Collapse JSON" : "Expand JSON"}
+          aria-expanded={expanded}
+          onClick={() => setExpanded((current) => !current)}
+        >
+          <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", !expanded && "-rotate-90")} />
+        </button>
+        {name !== undefined ? (
+          <>
+            <span className="truncate text-sky-500">{JSON.stringify(name)}</span>
+            <span className="text-muted-foreground">:</span>
+          </>
+        ) : null}
+        <span className="text-muted-foreground">{openToken}</span>
+        {!expanded ? (
+          <>
+            <span className="text-muted-foreground">{summary}</span>
+            <span className="text-muted-foreground">{closeToken}</span>
+          </>
+        ) : null}
+      </div>
+      {expanded ? (
+        <div className="border-l border-border/60" style={{ marginLeft: depth > 0 ? 18 : 6 }}>
+          {entries.map(([entryName, entryValue]) => (
+              <GatewayRequestLogJsonNode
+                key={entryName}
+                name={entryName}
+                value={entryValue}
+                depth={depth + 1}
+              />
+          ))}
+          <div className="text-muted-foreground" style={{ paddingLeft: depth > 0 ? 12 : 0 }}>
+            {closeToken}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function gatewayRequestLogPartLabel(partType: string, strings: AppStrings) {
+  switch (partType) {
+    case "client_request":
+      return strings.gatewayUsageLogClientRequest;
+    case "client_request_metadata":
+      return strings.gatewayUsageLogClientRequestMetadata;
+    case "upstream_request":
+      return strings.gatewayUsageLogUpstreamRequest;
+    case "upstream_request_metadata":
+      return strings.gatewayUsageLogUpstreamRequestMetadata;
+    case "upstream_response":
+      return strings.gatewayUsageLogUpstreamResponse;
+    case "upstream_response_metadata":
+      return strings.gatewayUsageLogUpstreamResponseMetadata;
+    case "gateway_response":
+      return strings.gatewayUsageLogGatewayResponse;
+    case "gateway_response_metadata":
+      return strings.gatewayUsageLogGatewayResponseMetadata;
+    case "response_stream":
+      return strings.gatewayUsageLogResponseStream;
+    default:
+      return partType.split("_").join(" ");
+  }
+}
+
+function gatewayRequestLogPartDetail(part: GatewayRequestLogPart) {
+  return [
+    part.contentType.split(";")[0] || "text/plain",
+    formatBytes(part.originalBytes),
+  ]
+    .filter(Boolean)
+    .join(" / ");
+}
+
+function gatewayRequestLogParsedContent(part: GatewayRequestLogPart): GatewayRequestLogParsedContent {
+  const displayContent = gatewayRequestLogDisplayContent(part.content);
+  const content = displayContent.trim();
+  if (!content) {
+    return { kind: "text", content: displayContent };
+  }
+
+  const contentType = part.contentType.toLowerCase();
+  if (part.partType === "response_stream" || contentType.includes("event-stream")) {
+    const streamItems = gatewayRequestLogParseSseJson(content);
+    if (streamItems) {
+      return { kind: "json", value: { streamed_data: streamItems } };
+    }
+  }
+
+  if (contentType.includes("ndjson")) {
+    const ndjsonItems = gatewayRequestLogParseNdjson(content);
+    if (ndjsonItems) {
+      return { kind: "json", value: ndjsonItems };
+    }
+  }
+
+  if (contentType.includes("json") || content.startsWith("{") || content.startsWith("[")) {
+    try {
+      return { kind: "json", value: JSON.parse(content) };
+    } catch {
+      return { kind: "text", content: displayContent };
+    }
+  }
+
+  return { kind: "text", content: displayContent };
+}
+
+function gatewayRequestLogCopyText(part: GatewayRequestLogPart) {
+  const parsed = gatewayRequestLogParsedContent(part);
+  if (parsed.kind === "json") {
+    return JSON.stringify(parsed.value, null, 2);
+  }
+  return parsed.content;
+}
+
+function gatewayRequestLogDisplayContent(content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("{")) {
+    return content;
+  }
+  try {
+    const value = JSON.parse(trimmed);
+    if (!isGatewayRequestLogPreviewWrapper(value)) {
+      return content;
+    }
+    const preview = value.preview;
+    if (typeof preview === "string") {
+      return preview;
+    }
+    return JSON.stringify(preview, null, 2);
+  } catch {
+    return content;
+  }
+}
+
+function isGatewayRequestLogPreviewWrapper(value: unknown): value is { preview: unknown } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const object = value as Record<string, unknown>;
+  return (
+    Object.prototype.hasOwnProperty.call(object, "preview") &&
+    (Object.prototype.hasOwnProperty.call(object, "truncated") ||
+      Object.prototype.hasOwnProperty.call(object, "originalLength"))
+  );
+}
+
+function gatewayRequestLogParseNdjson(content: string): unknown[] | null {
+  const lines = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return null;
+  }
+
+  const values = [];
+  for (const line of lines) {
+    try {
+      values.push(JSON.parse(line));
+    } catch {
+      return null;
+    }
+  }
+  return values;
+}
+
+function gatewayRequestLogParseSseJson(content: string): unknown[] | null {
+  const values = [];
+  const blocks = content.split(/\r?\n\r?\n+/);
+  for (const block of blocks) {
+    const dataLines = block
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trim());
+    if (dataLines.length === 0) {
+      continue;
+    }
+
+    const data = dataLines.join("\n").trim();
+    if (!data || data === "[DONE]") {
+      continue;
+    }
+
+    try {
+      values.push(JSON.parse(data));
+    } catch {
+      values.push(data);
+    }
+  }
+  return values.length > 0 ? values : null;
+}
+
+function gatewayRequestLogJsonEntries(value: unknown): [string, unknown][] | null {
+  if (Array.isArray(value)) {
+    return value.map((item, index) => [String(index), item]);
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.entries(value as Record<string, unknown>);
+  }
+  return null;
+}
+
+function gatewayRequestLogJsonLeaf(value: unknown): { text: string; className: string } {
+  if (typeof value === "string") {
+    return { text: JSON.stringify(value), className: "text-emerald-500" };
+  }
+  if (typeof value === "number") {
+    return { text: Number.isFinite(value) ? String(value) : JSON.stringify(value), className: "text-amber-500" };
+  }
+  if (typeof value === "boolean") {
+    return { text: String(value), className: "text-violet-500" };
+  }
+  if (value === null) {
+    return { text: "null", className: "text-muted-foreground" };
+  }
+  if (value === undefined) {
+    return { text: "undefined", className: "text-muted-foreground" };
+  }
+  return { text: String(value), className: "text-foreground" };
 }
 
 function GatewayProviderSummaryField({ label, value }: { label: string; value: string }) {
@@ -10535,6 +11198,9 @@ function gatewayModelName(item: unknown): string {
 }
 
 const CODEXL_DEEPSEEK_THINKING_PLUGIN_KEY_PREFIX = "codexl-deepseek-thinking";
+const CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY = "codexl-codex-model-rewrite";
+const CODEXL_CODEX_MODEL_REWRITE_NOOP_HEADER = "x-codexl-codex-model-rewrite-noop";
+const CODEXL_CODEX_MODEL_REWRITE_TARGET_HEADER = "x-codexl-codex-model-rewrite-target";
 
 function gatewayProviderFormFromRaw(raw: JsonObject, providerPlugins: JsonObject[] = []): GatewayProviderForm {
   const name = stringValue(raw.name, "");
@@ -10584,13 +11250,9 @@ function gatewayConfigFromForm(form: GatewayConfigForm): JsonObject {
   const rawTrace = objectValue(config.rawTrace);
   rawTrace.enabled = form.requestLoggingEnabled;
   if (form.requestLoggingEnabled) {
-    const mode = stringValue(rawTrace.mode, "").trim().toLowerCase();
-    if (!mode || mode === "disabled") {
-      rawTrace.mode = "body_redacted";
-    }
-    if (rawTrace.deleteLocalAfterUpload === undefined) {
-      rawTrace.deleteLocalAfterUpload = false;
-    }
+    rawTrace.mode = "wire_raw";
+    rawTrace.maxPartBytes = 2147483647;
+    rawTrace.deleteLocalAfterUpload = false;
   }
   config.rawTrace = rawTrace;
   config.Providers = form.providers.map(gatewayProviderConfigFromForm);
@@ -10639,10 +11301,13 @@ function gatewayProviderPluginsFromForm(form: GatewayConfigForm): JsonObject[] {
   const providerNames = new Set(
     form.providers.map((provider) => provider.name.trim()).filter(Boolean),
   );
-  const existingPlugins = arrayValue(form.rawConfig.providerPlugins)
+  const rawProviderPlugins = arrayValue(form.rawConfig.providerPlugins).map(objectValue);
+  const codexModelRewriteTargetModel =
+    rawProviderPlugins.map(gatewayCodexModelRewriteTargetModel).find(Boolean) || "";
+  const existingPlugins = rawProviderPlugins
     .map(objectValue)
     .filter((plugin) => {
-      if (isCodexLDeepSeekThinkingPlugin(plugin)) {
+      if (isCodexLDeepSeekThinkingPlugin(plugin) || isCodexLCodexModelRewritePlugin(plugin)) {
         return false;
       }
       const providerName = stringValue(plugin.providerName, "").trim();
@@ -10655,7 +11320,32 @@ function gatewayProviderPluginsFromForm(form: GatewayConfigForm): JsonObject[] {
   const generatedPlugins = form.providers
     .filter((provider) => gatewayProviderUsesDeepSeekThinking(provider))
     .map(gatewayDeepSeekThinkingPluginFromProvider);
-  return [...existingPlugins, ...generatedPlugins];
+  return [...existingPlugins, gatewayCodexModelRewritePlugin(codexModelRewriteTargetModel), ...generatedPlugins];
+}
+
+function gatewayCodexModelRewritePlugin(targetModel = ""): JsonObject {
+  const normalizedTargetModel = targetModel.trim();
+  const headers: JsonObject = {
+    [CODEXL_CODEX_MODEL_REWRITE_NOOP_HEADER]: "1",
+  };
+  if (normalizedTargetModel) {
+    headers[CODEXL_CODEX_MODEL_REWRITE_TARGET_HEADER] = normalizedTargetModel;
+  }
+  return {
+    key: CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY,
+    enabled: true,
+    codexModelRewrite: {
+      enabled: true,
+      ...(normalizedTargetModel ? { targetModel: normalizedTargetModel } : {}),
+    },
+    request: {
+      headers,
+      removeHeaders: [
+        CODEXL_CODEX_MODEL_REWRITE_NOOP_HEADER,
+        CODEXL_CODEX_MODEL_REWRITE_TARGET_HEADER,
+      ],
+    },
+  };
 }
 
 function gatewayDeepSeekThinkingPluginFromProvider(provider: GatewayProviderForm): JsonObject {
@@ -10777,6 +11467,24 @@ function providerPluginHasDeepSeekThinking(plugin: JsonObject): boolean {
 
 function isCodexLDeepSeekThinkingPlugin(plugin: JsonObject): boolean {
   return stringValue(plugin.key, "").startsWith(CODEXL_DEEPSEEK_THINKING_PLUGIN_KEY_PREFIX);
+}
+
+function isCodexLCodexModelRewritePlugin(plugin: JsonObject): boolean {
+  return stringValue(plugin.key, "") === CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY;
+}
+
+function gatewayCodexModelRewriteTargetModel(plugin: JsonObject): string {
+  if (!isCodexLCodexModelRewritePlugin(plugin)) {
+    return "";
+  }
+  const request = objectValue(plugin.request);
+  const headers = objectValue(request.headers);
+  const headerTarget = stringValue(headers[CODEXL_CODEX_MODEL_REWRITE_TARGET_HEADER], "").trim();
+  if (headerTarget) {
+    return headerTarget;
+  }
+  const rewrite = objectValue(plugin.codexModelRewrite);
+  return stringValue(rewrite.targetModel, "").trim();
 }
 
 function slugForGatewayPluginKey(value: string): string {

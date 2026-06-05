@@ -748,6 +748,13 @@ async fn get_gateway_usage_summary(
 }
 
 #[tauri::command]
+async fn get_gateway_request_log(
+    request_id: String,
+) -> Result<gateway_usage::GatewayRequestLog, String> {
+    gateway_usage::load_request_log(request_id).await
+}
+
+#[tauri::command]
 fn get_default_providers() -> Result<Vec<DefaultProviderProfile>, String> {
     config::read_default_provider_profiles()
 }
@@ -1415,6 +1422,7 @@ pub fn run() {
             update_gateway_config,
             get_gateway_tools,
             get_gateway_usage_summary,
+            get_gateway_request_log,
             get_default_providers,
             save_default_provider_profile,
             delete_default_provider_profile,

@@ -9,6 +9,9 @@ use std::sync::{Mutex, OnceLock};
 
 pub const NEXT_AI_GATEWAY_PROVIDER_NAME: &str = "next-ai-gateway";
 pub const NEXT_AI_GATEWAY_API_KEY: &str = "codexl-next-ai-gateway";
+pub const CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY: &str = "codexl-codex-model-rewrite";
+const CODEXL_CODEX_MODEL_REWRITE_NOOP_HEADER: &str = "x-codexl-codex-model-rewrite-noop";
+const CODEXL_CODEX_MODEL_REWRITE_TARGET_HEADER: &str = "x-codexl-codex-model-rewrite-target";
 pub const GATEWAY_AUTH_CREDENTIAL_HEADER: &str = "x-codexl-gateway-auth";
 pub const GATEWAY_AUTH_USER_ID: &str = "codexl";
 pub const GATEWAY_AUTH_TENANT_ID: &str = "local";
@@ -29,7 +32,9 @@ pub fn read_gateway_config() -> Result<GatewayConfigFile, String> {
     if !config.is_object() {
         return Err("Gateway config must be a JSON object".to_string());
     }
-    if ensure_gateway_auth_config(&mut config, None) {
+    let mut changed = ensure_gateway_auth_config(&mut config, None);
+    changed |= ensure_codex_model_rewrite_plugin_config(&mut config);
+    if changed {
         write_gateway_config_value(&path, &config)?;
     }
 
@@ -66,9 +71,19 @@ pub fn codex_provider_api_key() -> Result<String, String> {
 }
 
 pub fn write_codex_model_catalog(selected_model: &str) -> Result<String, String> {
-    let file = read_gateway_config()?;
+    let mut file = read_gateway_config()?;
+    let selected_model = selected_model.trim();
+    if !selected_model.is_empty()
+        && ensure_codex_model_rewrite_plugin_config_with_target(
+            &mut file.config,
+            Some(selected_model),
+        )
+    {
+        write_gateway_config_value(&gateway_config_path(), &file.config)?;
+    }
+
     let mut models = Vec::new();
-    push_unique_model(&mut models, selected_model.trim());
+    push_unique_model(&mut models, selected_model);
     for model in gateway_model_options_from_config(&file.config) {
         push_unique_model(&mut models, &model);
     }
@@ -391,6 +406,7 @@ pub fn write_gateway_config(config: Value) -> Result<GatewayConfigFile, String> 
     let path = gateway_config_path();
     let previous = read_gateway_config_value(&path).ok();
     ensure_gateway_auth_config(&mut config, previous.as_ref());
+    ensure_codex_model_rewrite_plugin_config(&mut config);
     write_gateway_config_value(&path, &config)?;
 
     Ok(GatewayConfigFile {
@@ -447,6 +463,53 @@ fn codex_model_catalog_path() -> PathBuf {
     gateway_home_dir().join("codex-model-catalog.json")
 }
 
+pub fn gateway_raw_trace_spool_dirs() -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    if let Some(path) = env_path("RAW_TRACE_SPOOL_DIR") {
+        push_unique_path(&mut paths, path);
+    }
+
+    // start.js sets RAW_TRACE_SPOOL_DIR to this path before the Gateway bundle
+    // reads rawTrace.spoolDir, so it is the runtime default even when the config
+    // contains another value.
+    push_unique_path(&mut paths, gateway_home_dir().join("raw-trace-spool"));
+
+    let file = read_gateway_config()?;
+    if let Some(value) = file
+        .config
+        .get("rawTrace")
+        .and_then(Value::as_object)
+        .and_then(|raw_trace| raw_trace.get("spoolDir"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let path = expand_home_path(value.to_string());
+        let path = if path.is_absolute() {
+            path
+        } else {
+            gateway_working_dir().join(path)
+        };
+        push_unique_path(&mut paths, path);
+    }
+
+    push_unique_path(&mut paths, gateway_working_dir().join(".raw-trace-spool"));
+    Ok(paths)
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn gateway_working_dir() -> PathBuf {
+    match super::super::resolve_builtin_next_ai_gateway_extension() {
+        Ok(extension) => extension.root_dir,
+        Err(_) => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    }
+}
+
 fn gateway_home_dir() -> PathBuf {
     env_path("CODEXL_NEXT_AI_GATEWAY_HOME")
         .unwrap_or_else(|| codexl_home_dir().join("next-ai-gateway"))
@@ -474,6 +537,9 @@ fn default_gateway_config() -> Value {
         "port": 14589,
         "bodyLimitBytes": 52428800,
         "Providers": [],
+        "providerPlugins": [
+            codex_model_rewrite_plugin_config(None)
+        ],
         "auth": default_gateway_auth_config(),
         "billing": {
             "enabled": false
@@ -497,6 +563,50 @@ fn default_gateway_config() -> Value {
         "mcpGateway": {
             "enabled": false
         }
+    })
+}
+
+fn codex_model_rewrite_plugin_config(target_model: Option<&str>) -> Value {
+    let target_model = target_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut codex_model_rewrite = json!({
+        "enabled": true
+    });
+    if let Some(target_model) = target_model {
+        codex_model_rewrite["targetModel"] = json!(target_model);
+    }
+
+    json!({
+        "key": CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY,
+        "enabled": true,
+        "codexModelRewrite": codex_model_rewrite,
+        "request": codex_model_rewrite_plugin_request_config(target_model)
+    })
+}
+
+fn codex_model_rewrite_plugin_request_config(target_model: Option<&str>) -> Value {
+    let target_model = target_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut headers = serde_json::Map::new();
+    headers.insert(
+        CODEXL_CODEX_MODEL_REWRITE_NOOP_HEADER.to_string(),
+        json!("1"),
+    );
+    if let Some(target_model) = target_model {
+        headers.insert(
+            CODEXL_CODEX_MODEL_REWRITE_TARGET_HEADER.to_string(),
+            json!(target_model),
+        );
+    }
+
+    json!({
+        "headers": Value::Object(headers),
+        "removeHeaders": [
+            CODEXL_CODEX_MODEL_REWRITE_NOOP_HEADER,
+            CODEXL_CODEX_MODEL_REWRITE_TARGET_HEADER
+        ]
     })
 }
 
@@ -561,6 +671,111 @@ fn ensure_gateway_auth_config(config: &mut Value, previous: Option<&Value>) -> b
     changed |= set_json_bool(introspection_object, "tokenBearerOnly", true);
 
     changed
+}
+
+fn ensure_codex_model_rewrite_plugin_config(config: &mut Value) -> bool {
+    ensure_codex_model_rewrite_plugin_config_with_target(config, None)
+}
+
+fn ensure_codex_model_rewrite_plugin_config_with_target(
+    config: &mut Value,
+    target_model: Option<&str>,
+) -> bool {
+    if !config.is_object() {
+        return false;
+    }
+    let target_model = target_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let object = config.as_object_mut().expect("checked object");
+    let provider_plugins = object
+        .entry("providerPlugins")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let mut changed = false;
+    if !provider_plugins.is_array() {
+        *provider_plugins = Value::Array(Vec::new());
+        changed = true;
+    }
+
+    let plugins = provider_plugins.as_array_mut().expect("checked array");
+    for plugin in plugins.iter_mut() {
+        if plugin
+            .get("key")
+            .and_then(Value::as_str)
+            .map(|key| key == CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY)
+            .unwrap_or(false)
+        {
+            if !plugin.is_object() {
+                *plugin = codex_model_rewrite_plugin_config(target_model);
+                return true;
+            }
+
+            let existing_target_model =
+                target_model.map(str::to_string).or_else(|| {
+                    codex_model_rewrite_target_model_from_plugin(plugin)
+                });
+            let plugin_object = plugin.as_object_mut().expect("checked object");
+            changed |= set_json_string(
+                plugin_object,
+                "key",
+                CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY,
+            );
+            changed |= set_json_bool(plugin_object, "enabled", true);
+            if plugin_object.remove("provider").is_some() {
+                changed = true;
+            }
+            if plugin_object.remove("providerName").is_some() {
+                changed = true;
+            }
+
+            let rewrite = plugin_object
+                .entry("codexModelRewrite")
+                .or_insert_with(|| json!({}));
+            if !rewrite.is_object() {
+                *rewrite = json!({});
+                changed = true;
+            }
+            let rewrite_object = rewrite.as_object_mut().expect("checked object");
+            changed |= set_json_bool(rewrite_object, "enabled", true);
+            if let Some(target_model) = existing_target_model.as_deref() {
+                changed |= set_json_string(rewrite_object, "targetModel", target_model);
+            }
+
+            let request = codex_model_rewrite_plugin_request_config(existing_target_model.as_deref());
+            if plugin_object.get("request") != Some(&request) {
+                plugin_object.insert("request".to_string(), request);
+                changed = true;
+            }
+            return changed;
+        }
+    }
+
+    plugins.push(codex_model_rewrite_plugin_config(target_model));
+    true
+}
+
+fn codex_model_rewrite_target_model_from_plugin(plugin: &Value) -> Option<String> {
+    plugin
+        .get("request")
+        .and_then(Value::as_object)
+        .and_then(|request| request.get("headers"))
+        .and_then(Value::as_object)
+        .and_then(|headers| headers.get(CODEXL_CODEX_MODEL_REWRITE_TARGET_HEADER))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            plugin
+                .get("codexModelRewrite")
+                .and_then(Value::as_object)
+                .and_then(|rewrite| rewrite.get("targetModel"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
 }
 
 fn first_non_default_gateway_key(config: &Value) -> Option<String> {
@@ -807,6 +1022,105 @@ mod tests {
                 "openai/search-fixed",
                 "openai/search-fixed-short",
             ]
+        );
+    }
+
+    #[test]
+    fn gateway_config_adds_codex_model_rewrite_plugin() {
+        let mut config = json!({
+            "Providers": []
+        });
+
+        assert!(ensure_codex_model_rewrite_plugin_config(&mut config));
+        assert_eq!(
+            config["providerPlugins"][0]["key"],
+            json!(CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY)
+        );
+        assert_eq!(config["providerPlugins"][0]["enabled"], json!(true));
+        assert_eq!(
+            config["providerPlugins"][0]["codexModelRewrite"]["enabled"],
+            json!(true)
+        );
+        assert_eq!(
+            config["providerPlugins"][0]["request"],
+            codex_model_rewrite_plugin_request_config(None)
+        );
+    }
+
+    #[test]
+    fn gateway_config_refreshes_codex_model_rewrite_plugin_without_removing_user_plugins() {
+        let mut config = json!({
+            "providerPlugins": [
+                {
+                    "key": "custom-plugin",
+                    "enabled": true,
+                    "request": {
+                        "headers": {
+                            "x-custom": "1"
+                        }
+                    }
+                },
+                {
+                    "key": CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY,
+                    "enabled": false,
+                    "providerName": "old-provider",
+                    "codexModelRewrite": {
+                        "enabled": false,
+                        "targetModel": "zhipu/glm-4.6"
+                    }
+                }
+            ]
+        });
+
+        assert!(ensure_codex_model_rewrite_plugin_config(&mut config));
+
+        let plugins = config["providerPlugins"].as_array().expect("plugins array");
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[0]["key"], json!("custom-plugin"));
+        assert_eq!(plugins[1]["key"], json!(CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY));
+        assert_eq!(plugins[1]["enabled"], json!(true));
+        assert_eq!(plugins[1].get("providerName"), None);
+        assert_eq!(plugins[1]["codexModelRewrite"]["enabled"], json!(true));
+        assert_eq!(
+            plugins[1]["codexModelRewrite"]["targetModel"],
+            json!("zhipu/glm-4.6")
+        );
+        assert_eq!(
+            plugins[1]["request"],
+            codex_model_rewrite_plugin_request_config(Some("zhipu/glm-4.6"))
+        );
+    }
+
+    #[test]
+    fn gateway_config_sets_codex_model_rewrite_target_model() {
+        let mut config = json!({
+            "providerPlugins": [
+                {
+                    "key": CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY,
+                    "enabled": true,
+                    "request": {
+                        "headers": {
+                            "x-codexl-codex-model-rewrite-noop": "1"
+                        },
+                        "removeHeaders": ["x-codexl-codex-model-rewrite-noop"]
+                    }
+                }
+            ]
+        });
+
+        assert!(ensure_codex_model_rewrite_plugin_config_with_target(
+            &mut config,
+            Some("moonshot/kimi-k2")
+        ));
+
+        let plugin = &config["providerPlugins"][0];
+        assert_eq!(
+            plugin["codexModelRewrite"]["targetModel"],
+            json!("moonshot/kimi-k2")
+        );
+        assert_eq!(
+            plugin["request"],
+            codex_model_rewrite_plugin_request_config(Some("moonshot/kimi-k2"))
         );
     }
 
