@@ -6609,8 +6609,44 @@ function GatewayUsageBreakdownModePicker({
   );
 }
 
+function GatewayUsageTokenBar({
+  value,
+  label,
+  maxTokens,
+}: {
+  value: GatewayUsageTokenBarValue;
+  label: string;
+  maxTokens: number;
+}) {
+  const total = gatewayUsageTokenBarTotal(value);
+  const barWidth = total > 0 ? `${Math.max(3, Math.round((total / Math.max(1, maxTokens)) * 100))}%` : "0%";
+  const inputWidth = gatewayUsagePercent(value.inputTokens ?? 0, total);
+  const outputWidth = gatewayUsagePercent(value.outputTokens ?? 0, total);
+  const outputLeft = inputWidth;
+  const cacheWidth = gatewayUsagePercent(
+    Math.min(Math.max(0, gatewayUsageCacheTokens(value)), Math.max(0, value.inputTokens ?? 0)),
+    total,
+  );
+
+  return (
+    <div className="h-2 overflow-hidden rounded-full bg-muted" aria-label={label}>
+      <div className="relative h-full min-w-1 overflow-hidden rounded-full" style={{ width: barWidth }}>
+        {(value.inputTokens ?? 0) > 0 ? (
+          <div className="absolute inset-y-0 left-0 bg-sky-400" style={{ width: inputWidth }} />
+        ) : null}
+        {(value.outputTokens ?? 0) > 0 ? (
+          <div className="absolute inset-y-0 bg-emerald-400" style={{ left: outputLeft, width: outputWidth }} />
+        ) : null}
+        {gatewayUsageCacheTokens(value) > 0 ? (
+          <div className="absolute inset-y-0 left-0 bg-amber-500" style={{ width: cacheWidth }} />
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function GatewayUsageModelComparison({ items, strings }: { items: GatewayUsageBreakdown[]; strings: AppStrings }) {
-  const maxTokens = Math.max(...items.map((item) => item.totalTokens), 1);
+  const maxTokens = Math.max(...items.map(gatewayUsageTokenBarTotal), 1);
 
   return (
     <section className="w-full min-w-0 rounded-md border border-border bg-muted/10 p-3 sm:p-4">
@@ -6618,12 +6654,6 @@ function GatewayUsageModelComparison({ items, strings }: { items: GatewayUsageBr
       {items.length > 0 ? (
         <div className="space-y-3">
           {items.map((item) => {
-            const total = Math.max(0, item.totalTokens);
-            const barWidth = `${Math.max(3, Math.round((total / maxTokens) * 100))}%`;
-            const inputWidth = total > 0 ? `${(item.inputTokens / total) * 100}%` : "0%";
-            const outputWidth = total > 0 ? `${(item.outputTokens / total) * 100}%` : "0%";
-            const cacheWidth = total > 0 ? `${(gatewayUsageCacheTokens(item) / total) * 100}%` : "0%";
-
             return (
               <div key={`${item.provider}-${item.providerName}-${item.model || item.label}`} className="space-y-1.5">
                 <div className="grid min-w-0 gap-1 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-3">
@@ -6637,17 +6667,7 @@ function GatewayUsageModelComparison({ items, strings }: { items: GatewayUsageBr
                   </div>
                   <div className="text-sm tabular-nums sm:shrink-0 sm:text-right">{formatTokenCount(item.totalTokens)}</div>
                 </div>
-                <div className="h-2 overflow-hidden rounded-full bg-muted" aria-label={item.label}>
-                  <div className="flex h-full min-w-1 overflow-hidden rounded-full" style={{ width: barWidth }}>
-                    {item.inputTokens > 0 ? <div className="h-full bg-sky-400" style={{ width: inputWidth }} /> : null}
-                    {gatewayUsageCacheTokens(item) > 0 ? (
-                      <div className="h-full bg-amber-500" style={{ width: cacheWidth }} />
-                    ) : null}
-                    {item.outputTokens > 0 ? (
-                      <div className="h-full bg-emerald-400" style={{ width: outputWidth }} />
-                    ) : null}
-                  </div>
-                </div>
+                <GatewayUsageTokenBar value={item} label={item.label} maxTokens={maxTokens} />
                 <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                   <span>{strings.gatewayUsageInput} {formatTokenCount(item.inputTokens)}</span>
                   <span>{strings.gatewayUsageCache} {formatTokenCount(gatewayUsageCacheTokens(item))}</span>
@@ -6672,7 +6692,7 @@ function GatewayUsageSessionAnalysis({
   items: GatewayUsageSessionBreakdown[];
   strings: AppStrings;
 }) {
-  const maxTokens = Math.max(...items.map((item) => item.totalTokens), 1);
+  const maxTokens = Math.max(...items.map(gatewayUsageTokenBarTotal), 1);
 
   return (
     <section className="w-full min-w-0 rounded-md border border-border bg-muted/10 p-3 sm:p-4">
@@ -6680,11 +6700,6 @@ function GatewayUsageSessionAnalysis({
       {items.length > 0 ? (
         <div className="space-y-3">
           {items.map((item) => {
-            const total = Math.max(0, item.totalTokens);
-            const barWidth = `${Math.max(3, Math.round((total / maxTokens) * 100))}%`;
-            const inputWidth = total > 0 ? `${(item.inputTokens / total) * 100}%` : "0%";
-            const outputWidth = total > 0 ? `${(item.outputTokens / total) * 100}%` : "0%";
-            const cacheWidth = total > 0 ? `${(gatewayUsageCacheTokens(item) / total) * 100}%` : "0%";
             const sessionLabel = item.label || gatewayUsageSessionLabel(item.sessionId, strings);
             const projectLabel = item.projectLabel || strings.gatewayUsageUnknownProject;
 
@@ -6714,17 +6729,7 @@ function GatewayUsageSessionAnalysis({
                     </div>
                   </div>
                 </div>
-                <div className="h-2 overflow-hidden rounded-full bg-muted" aria-label={sessionLabel}>
-                  <div className="flex h-full min-w-1 overflow-hidden rounded-full" style={{ width: barWidth }}>
-                    {item.inputTokens > 0 ? <div className="h-full bg-sky-400" style={{ width: inputWidth }} /> : null}
-                    {item.outputTokens > 0 ? (
-                      <div className="h-full bg-emerald-400" style={{ width: outputWidth }} />
-                    ) : null}
-                    {gatewayUsageCacheTokens(item) > 0 ? (
-                      <div className="h-full bg-amber-500" style={{ width: cacheWidth }} />
-                    ) : null}
-                  </div>
-                </div>
+                <GatewayUsageTokenBar value={item} label={sessionLabel} maxTokens={maxTokens} />
                 <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                   <span>{strings.gatewayUsageInput} {formatTokenCount(item.inputTokens)}</span>
                   <span>{strings.gatewayUsageOutput} {formatTokenCount(item.outputTokens)}</span>
@@ -6749,7 +6754,7 @@ function GatewayUsageProjectAnalysis({
   items: GatewayUsageProjectBreakdown[];
   strings: AppStrings;
 }) {
-  const maxTokens = Math.max(...items.map((item) => item.totalTokens), 1);
+  const maxTokens = Math.max(...items.map(gatewayUsageTokenBarTotal), 1);
 
   return (
     <section className="w-full min-w-0 rounded-md border border-border bg-muted/10 p-3 sm:p-4">
@@ -6757,11 +6762,6 @@ function GatewayUsageProjectAnalysis({
       {items.length > 0 ? (
         <div className="space-y-3">
           {items.map((item) => {
-            const total = Math.max(0, item.totalTokens);
-            const barWidth = `${Math.max(3, Math.round((total / maxTokens) * 100))}%`;
-            const inputWidth = total > 0 ? `${(item.inputTokens / total) * 100}%` : "0%";
-            const outputWidth = total > 0 ? `${(item.outputTokens / total) * 100}%` : "0%";
-            const cacheWidth = total > 0 ? `${(gatewayUsageCacheTokens(item) / total) * 100}%` : "0%";
             const label = item.label || strings.gatewayUsageUnknownProject;
 
             return (
@@ -6790,17 +6790,7 @@ function GatewayUsageProjectAnalysis({
                     </div>
                   </div>
                 </div>
-                <div className="h-2 overflow-hidden rounded-full bg-muted" aria-label={label}>
-                  <div className="flex h-full min-w-1 overflow-hidden rounded-full" style={{ width: barWidth }}>
-                    {item.inputTokens > 0 ? <div className="h-full bg-sky-400" style={{ width: inputWidth }} /> : null}
-                    {item.outputTokens > 0 ? (
-                      <div className="h-full bg-emerald-400" style={{ width: outputWidth }} />
-                    ) : null}
-                    {gatewayUsageCacheTokens(item) > 0 ? (
-                      <div className="h-full bg-amber-500" style={{ width: cacheWidth }} />
-                    ) : null}
-                  </div>
-                </div>
+                <GatewayUsageTokenBar value={item} label={label} maxTokens={maxTokens} />
                 <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                   <span>{strings.gatewayUsageInput} {formatTokenCount(item.inputTokens)}</span>
                   <span>{strings.gatewayUsageOutput} {formatTokenCount(item.outputTokens)}</span>
@@ -12462,6 +12452,25 @@ function gatewayUsageSeriesLabel(value: string, strings: AppStrings) {
   return value;
 }
 
+type GatewayUsageTokenBarValue = {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+};
+
+function gatewayUsageTokenBarTotal(value?: GatewayUsageTokenBarValue | null) {
+  return Math.max(0, value?.inputTokens ?? 0) + Math.max(0, value?.outputTokens ?? 0);
+}
+
+function gatewayUsagePercent(value: number, total: number) {
+  if (!Number.isFinite(value) || !Number.isFinite(total) || total <= 0) {
+    return "0%";
+  }
+  const percent = Math.min(100, Math.max(0, (value / total) * 100));
+  return `${percent}%`;
+}
+
 function gatewayUsageCacheTokens(
   value?: { cacheReadTokens?: number; cacheWriteTokens?: number } | null,
 ) {
@@ -12470,11 +12479,11 @@ function gatewayUsageCacheTokens(
 
 function gatewayUsageCacheRate(value?: { inputTokens?: number; cacheReadTokens?: number } | null) {
   const base = gatewayUsageCacheRateBase(value);
-  return base > 0 ? (value?.cacheReadTokens ?? 0) / base : 0;
+  return base > 0 ? Math.min(1, Math.max(0, value?.cacheReadTokens ?? 0) / base) : 0;
 }
 
 function gatewayUsageCacheRateBase(value?: { inputTokens?: number; cacheReadTokens?: number } | null) {
-  return (value?.inputTokens ?? 0) + (value?.cacheReadTokens ?? 0);
+  return value?.inputTokens ?? 0;
 }
 
 function gatewayUsageSessionLabel(value: string | null | undefined, strings: AppStrings) {
