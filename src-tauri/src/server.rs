@@ -33,6 +33,7 @@ const RETIRED_CDP_WEB_RESOURCE_MESSAGE: &str =
 pub(crate) struct ManagedInstance {
     child: Child,
     info: LaunchInfo,
+    bot_signature: String,
     stopped: bool,
 }
 
@@ -242,7 +243,7 @@ pub async fn launch_codex_instance(
     let mut instances = state.instances.lock().await;
     if let Some(instance) = instances.get_mut(&profile_name) {
         if let Some(pid) = running_child_pid(&mut instance.child)? {
-            if !requires_new_process(&instance.info, &requested_config) {
+            if !requires_new_process(&instance.info, &requested_config, &instance.bot_signature) {
                 let info = launch_info_from_instance(&instance.info, Some(pid));
                 cdp_resources::spawn_codex_plugin_injector(
                     info.cdp_host.clone(),
@@ -333,6 +334,7 @@ pub async fn launch_codex_instance(
         ManagedInstance {
             child: launch.child,
             info: info.clone(),
+            bot_signature: bot_runtime_signature(&requested_config),
             stopped: false,
         },
     );
@@ -404,7 +406,11 @@ fn should_reuse_external_cdp_endpoint(
         .is_none()
 }
 
-fn requires_new_process(current: &LaunchInfo, requested: &AppConfig) -> bool {
+fn requires_new_process(
+    current: &LaunchInfo,
+    requested: &AppConfig,
+    current_bot_signature: &str,
+) -> bool {
     let requested_proxy_url = requested
         .provider_profile(&requested.active_provider)
         .map(|profile| profile.proxy_url)
@@ -419,6 +425,17 @@ fn requires_new_process(current: &LaunchInfo, requested: &AppConfig) -> bool {
         || current.codex_path != requested.codex_path
         || current.proxy_url.trim() != requested_proxy_url.trim()
         || current.core_mode != requested_core_mode
+        || current_bot_signature != bot_runtime_signature(requested)
+}
+
+fn bot_runtime_signature(config: &AppConfig) -> String {
+    if !config.extensions.enabled || !config.extensions.bot_gateway_enabled {
+        return "disabled".to_string();
+    }
+    let Some(profile) = config.provider_profile(&config.active_provider) else {
+        return "missing-profile".to_string();
+    };
+    serde_json::to_string(&profile.bot).unwrap_or_default()
 }
 
 pub async fn stop_codex_instance(

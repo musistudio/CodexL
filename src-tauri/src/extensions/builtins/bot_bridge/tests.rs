@@ -1200,6 +1200,83 @@ fn codex_input_accepts_attachment_only_messages() {
 }
 
 #[test]
+fn event_message_text_reads_voice_transcription_fields() {
+    let event = json!({
+        "message": {
+            "attachments": [{
+                "type": "audio",
+                "raw": {
+                    "voice_item": {
+                        "text": " transcribed voice "
+                    }
+                }
+            }]
+        }
+    });
+
+    assert_eq!(
+        event_message_text(&event),
+        Some("transcribed voice".to_string())
+    );
+}
+
+#[test]
+fn deferable_inbound_attachments_skip_audio() {
+    let event = json!({
+        "message": {
+            "attachments": [
+                {
+                    "type": "image",
+                    "url": "/tmp/image.png",
+                    "name": "image.png"
+                },
+                {
+                    "type": "audio",
+                    "url": "/tmp/voice.silk",
+                    "name": "voice.silk",
+                    "mimeType": "audio/silk"
+                }
+            ]
+        }
+    });
+
+    let attachments = deferable_inbound_attachments(&event);
+
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0]["name"], json!("image.png"));
+}
+
+#[test]
+fn bot_event_with_extra_attachments_merges_pending_before_current() {
+    let event = json!({
+        "message": {
+            "text": "inspect these",
+            "attachments": [{
+                "type": "file",
+                "name": "current.pdf",
+                "url": "/tmp/current.pdf"
+            }]
+        }
+    });
+
+    let merged = bot_event_with_extra_attachments(
+        &event,
+        vec![json!({
+            "type": "image",
+            "name": "pending.png",
+            "url": "/tmp/pending.png"
+        })],
+    );
+    let attachments = merged["message"]["attachments"]
+        .as_array()
+        .expect("attachments");
+
+    assert_eq!(attachments.len(), 2);
+    assert_eq!(attachments[0]["name"], json!("pending.png"));
+    assert_eq!(attachments[1]["name"], json!("current.pdf"));
+}
+
+#[test]
 fn bot_media_mcp_lists_direct_media_tools() {
     let tools = bot_media_mcp_tools();
     let names: Vec<_> = tools

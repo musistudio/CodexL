@@ -1060,6 +1060,7 @@ async fn start_weixin_bot_login(
         &result.profile_name,
         &result.tenant_id,
         &result.integration_id,
+        &result.state_dir,
         "qr_pending",
         false,
     )
@@ -1097,6 +1098,7 @@ async fn wait_weixin_bot_login(
         &result.profile_name,
         &result.tenant_id,
         &result.integration_id,
+        &result.state_dir,
         status,
         result.confirmed,
     )
@@ -1240,6 +1242,7 @@ async fn update_profile_bot_status(
     profile_name: &str,
     tenant_id: &str,
     integration_id: &str,
+    state_dir: &str,
     status: &str,
     confirmed: bool,
 ) -> Result<(), String> {
@@ -1256,6 +1259,12 @@ async fn update_profile_bot_status(
     profile.bot.platform = config::BOT_PLATFORM_WEIXIN_ILINK.to_string();
     profile.bot.tenant_id = tenant_id.to_string();
     profile.bot.integration_id = integration_id.to_string();
+    if profile.bot.saved_config_id.trim().is_empty() {
+        profile.bot.saved_config_id = integration_id.to_string();
+    }
+    if !state_dir.trim().is_empty() {
+        profile.bot.state_dir = state_dir.to_string();
+    }
     profile.bot.status = status.to_string();
     if confirmed {
         profile.bot.last_login_at = timestamp_seconds();

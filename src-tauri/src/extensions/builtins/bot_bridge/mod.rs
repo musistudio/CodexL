@@ -44,6 +44,9 @@ const BOT_GATEWAY_HEALTH_TIMEOUT_SECS: u64 = 10;
 const BOT_GATEWAY_DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const BOT_GATEWAY_MCP_OUTBOUND_TIMEOUT_SECS: u64 = 170;
 const BOT_APPROVAL_POLL_INTERVAL_MS: u64 = 500;
+const BOT_PENDING_INBOUND_ATTACHMENTS_LIMIT: usize = 20;
+const BOT_VOICE_TRANSCRIBE_MAX_BYTES: u64 = 25 * 1024 * 1024;
+const BOT_VOICE_TRANSCRIBE_TIMEOUT_SECS: u64 = 60;
 const DINGTALK_STREAM_OPEN_URL: &str = "https://api.dingtalk.com/v1.0/gateway/connections/open";
 const DINGTALK_ACCESS_TOKEN_URL: &str = "https://api.dingtalk.com/v1.0/oauth2/accessToken";
 const DINGTALK_MEDIA_UPLOAD_URL: &str = "https://oapi.dingtalk.com/media/upload";
@@ -217,6 +220,7 @@ struct AppServerBridge {
     idle_cursor: CodexEventCursor,
     dingtalk_rx: Option<mpsc::Receiver<Value>>,
     pending_dingtalk_events: VecDeque<Value>,
+    pending_inbound_attachments: BTreeMap<String, Vec<Value>>,
     current_session_key: Option<String>,
     current_media_session_id: Option<String>,
     thread_id: Option<String>,
@@ -559,6 +563,7 @@ pub struct BotQrLoginStartInfo {
     pub profile_name: String,
     pub tenant_id: String,
     pub integration_id: String,
+    pub state_dir: String,
     pub session_id: String,
     pub qr_code_url: String,
     pub expires_at: String,
@@ -571,6 +576,7 @@ pub struct BotQrLoginWaitInfo {
     pub profile_name: String,
     pub tenant_id: String,
     pub integration_id: String,
+    pub state_dir: String,
     pub session_id: String,
     pub status: String,
     pub message: String,
@@ -1626,13 +1632,13 @@ pub fn start_weixin_qr_login_session(
     if bot_config.auth_type != config::BOT_AUTH_QR_LOGIN {
         return Err("selected bot auth type does not use QR login".to_string());
     }
-    let runtime = BotGatewayRuntimeConfig::from_profile(profile_name, &bot_config)?;
+    let mut runtime = BotGatewayRuntimeConfig::from_profile(profile_name, &bot_config)?;
     if runtime.platform != config::BOT_PLATFORM_WEIXIN_ILINK {
         return Err("selected bot platform does not support Weixin QR login".to_string());
     }
 
     let mut bot = BotGatewayClient::start(&runtime.extension, runtime.state_dir.as_deref())?;
-    let info = start_weixin_qr_login_with_client(profile_name, &runtime, &mut bot, force)?;
+    let info = start_weixin_qr_login_with_client(profile_name, &mut runtime, &mut bot, force)?;
     Ok((
         info,
         BotQrLoginSession {
@@ -1727,16 +1733,18 @@ impl BotQrLoginSession {
 
 fn start_weixin_qr_login_with_client(
     profile_name: &str,
-    runtime: &BotGatewayRuntimeConfig,
+    runtime: &mut BotGatewayRuntimeConfig,
     bot: &mut BotGatewayClient,
     force: bool,
 ) -> Result<BotQrLoginStartInfo, String> {
+    let integration_id = resolve_weixin_qr_integration_id(bot, runtime)?;
+    runtime.integration_id = integration_id.clone();
     let result = bot.request(
         "auth.qr.start",
         json!({
             "platform": config::BOT_PLATFORM_WEIXIN_ILINK,
             "tenantId": runtime.tenant_id.clone(),
-            "integrationId": runtime.integration_id.clone(),
+            "integrationId": integration_id,
             "force": force,
         }),
     )?;
@@ -1751,6 +1759,11 @@ fn start_weixin_qr_login_with_client(
         profile_name: profile_name.to_string(),
         tenant_id: runtime.tenant_id.clone(),
         integration_id: runtime.integration_id.clone(),
+        state_dir: runtime
+            .state_dir
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default(),
         session_id,
         qr_code_url: auth
             .get("qrCodeUrl")
@@ -1797,6 +1810,11 @@ fn wait_weixin_qr_login_with_client(
         profile_name: runtime.profile_name.clone(),
         tenant_id: runtime.tenant_id.clone(),
         integration_id: runtime.integration_id.clone(),
+        state_dir: runtime
+            .state_dir
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default(),
         session_id: session_id.to_string(),
         confirmed: status == "confirmed",
         status,
@@ -1806,6 +1824,63 @@ fn wait_weixin_qr_login_with_client(
             .unwrap_or("")
             .to_string(),
     })
+}
+
+fn resolve_weixin_qr_integration_id(
+    bot: &mut BotGatewayClient,
+    runtime: &BotGatewayRuntimeConfig,
+) -> Result<String, String> {
+    let requested = runtime.integration_id.trim();
+    let result = bot.request("integrations.list", json!({}))?;
+    let integrations = result
+        .get("integrations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(existing) = integrations
+        .iter()
+        .find(|integration| integration.get("id").and_then(Value::as_str) == Some(requested))
+    {
+        if existing.get("platform").and_then(Value::as_str)
+            == Some(config::BOT_PLATFORM_WEIXIN_ILINK)
+        {
+            return Ok(requested.to_string());
+        }
+    } else if !requested.is_empty() {
+        return Ok(requested.to_string());
+    }
+
+    let tenant = runtime.tenant_id.trim();
+    if let Some(existing) = integrations.iter().find(|integration| {
+        integration.get("platform").and_then(Value::as_str)
+            == Some(config::BOT_PLATFORM_WEIXIN_ILINK)
+            && integration
+                .get("tenantId")
+                .and_then(Value::as_str)
+                .map(|value| value.eq_ignore_ascii_case(tenant))
+                .unwrap_or(false)
+    }) {
+        if let Some(id) = existing.get("id").and_then(Value::as_str) {
+            return Ok(id.to_string());
+        }
+    }
+
+    if let Some(existing) = integrations.iter().find(|integration| {
+        integration.get("platform").and_then(Value::as_str)
+            == Some(config::BOT_PLATFORM_WEIXIN_ILINK)
+    }) {
+        if let Some(id) = existing.get("id").and_then(Value::as_str) {
+            return Ok(id.to_string());
+        }
+    }
+
+    let fallback = sanitize_path_segment(&format!(
+        "{}-{}",
+        config::BOT_PLATFORM_WEIXIN_ILINK,
+        if tenant.is_empty() { "default" } else { tenant }
+    ));
+    Ok(fallback)
 }
 
 fn run_bridge(
@@ -1867,6 +1942,7 @@ fn run_bridge(
         idle_cursor,
         dingtalk_rx,
         pending_dingtalk_events: VecDeque::new(),
+        pending_inbound_attachments: BTreeMap::new(),
         current_session_key: None,
         current_media_session_id: None,
         thread_id: None,
@@ -2584,6 +2660,10 @@ fn event_message_text(event: &Value) -> Option<String> {
         }
     }
 
+    if let Some(text) = event_voice_transcription_text(event) {
+        return Some(text);
+    }
+
     event_string_at_paths(
         event,
         &[
@@ -2593,6 +2673,63 @@ fn event_message_text(event: &Value) -> Option<String> {
             "/raw/text/content",
             "/raw/content/text",
             "/raw/content",
+        ],
+    )
+    .map(str::to_string)
+}
+
+fn event_voice_transcription_text(event: &Value) -> Option<String> {
+    value_string_at_paths(
+        event,
+        &[
+            "/message/transcript",
+            "/message/transcription",
+            "/message/voiceText",
+            "/message/voice_text",
+            "/message/audioText",
+            "/message/audio_text",
+            "/message/voice/text",
+            "/message/audio/text",
+            "/raw/transcript",
+            "/raw/transcription",
+            "/raw/voiceText",
+            "/raw/voice_text",
+            "/raw/audioText",
+            "/raw/audio_text",
+            "/raw/voice/text",
+            "/raw/audio/text",
+            "/raw/content/transcript",
+            "/raw/content/transcription",
+        ],
+    )
+    .map(str::to_string)
+    .or_else(|| {
+        message_attachments(event)?
+            .iter()
+            .filter(|attachment| is_audio_attachment(attachment))
+            .find_map(attachment_voice_transcription_text)
+    })
+}
+
+fn attachment_voice_transcription_text(attachment: &Value) -> Option<String> {
+    value_string_at_paths(
+        attachment,
+        &[
+            "/transcript",
+            "/transcription",
+            "/voiceText",
+            "/voice_text",
+            "/audioText",
+            "/audio_text",
+            "/text",
+            "/raw/transcript",
+            "/raw/transcription",
+            "/raw/voiceText",
+            "/raw/voice_text",
+            "/raw/audioText",
+            "/raw/audio_text",
+            "/raw/text",
+            "/raw/voice_item/text",
         ],
     )
     .map(str::to_string)
@@ -2736,20 +2873,52 @@ fn handle_queued_event(
         return Ok(());
     }
 
-    let message_text = event_message_text(event).unwrap_or_default();
+    let mut message_text = event_message_text(event).unwrap_or_default();
+    let mut transcription_error = None;
+    if message_text.trim().is_empty() {
+        match app.transcribe_event_voice(event, event_id) {
+            Ok(Some(text)) => message_text = text,
+            Ok(None) => {}
+            Err(err) => {
+                log_bridge(
+                    &app.config,
+                    &format!("voice transcription failed event_id={}: {}", event_id, err),
+                );
+                transcription_error = Some(err);
+            }
+        }
+    }
     let has_attachments =
         message_attachments(event).is_some_and(|attachments| !attachments.is_empty());
-    if message_text.is_empty() && !has_attachments {
+    if message_text.trim().is_empty() {
+        let deferred_count = if has_attachments {
+            app.remember_pending_inbound_attachments(event)
+        } else {
+            0
+        };
+        if let Some(err) = transcription_error {
+            send_bot_text_response(
+                bot,
+                &app.config,
+                event,
+                &format!("codexl:{}:voice-transcription-failed", event_id),
+                &bot_voice_transcription_failed_message(app.config.language, &err),
+            )?;
+        }
+        if deferred_count > 0 {
+            log_bridge(
+                &app.config,
+                &format!(
+                    "deferred inbound attachments event_id={} count={}",
+                    event_id, deferred_count
+                ),
+            );
+        }
         if requires_gateway_ack {
             let _ = bot.request("events.ack", json!({ "eventId": event_id }));
         }
         return Ok(());
     }
-    let message_text = if message_text.is_empty() {
-        "Please review the attached media/file(s).".to_string()
-    } else {
-        message_text
-    };
 
     if let Some(notice) = app.session_restore_notice(event) {
         send_bot_text_response(
@@ -2805,7 +2974,18 @@ fn handle_queued_event(
                 already_sent: false,
             },
             BotMessageAction::Run(message_text) => {
-                app.run_codex_turn(bot, &message_text, event, event_id)
+                let (codex_event, pending_count) =
+                    app.event_with_pending_inbound_attachments(event);
+                if pending_count > 0 {
+                    log_bridge(
+                        &app.config,
+                        &format!(
+                            "merged pending inbound attachments event_id={} count={}",
+                            event_id, pending_count
+                        ),
+                    );
+                }
+                app.run_codex_turn(bot, &message_text, &codex_event, event_id)
             }
             BotMessageAction::SwitchProjectAndRun(project_switch) => {
                 let notice = project_switch_notice(&project_switch.project, app.config.language);
@@ -2817,7 +2997,18 @@ fn handle_queued_event(
                     &notice,
                 )?;
                 app.apply_project_switch(&project_switch.project);
-                app.run_codex_turn(bot, &project_switch.message_text, event, event_id)
+                let (codex_event, pending_count) =
+                    app.event_with_pending_inbound_attachments(event);
+                if pending_count > 0 {
+                    log_bridge(
+                        &app.config,
+                        &format!(
+                            "merged pending inbound attachments event_id={} count={}",
+                            event_id, pending_count
+                        ),
+                    );
+                }
+                app.run_codex_turn(bot, &project_switch.message_text, &codex_event, event_id)
             }
         };
         if let Err(err) = app.persist_current_session() {
@@ -2885,6 +3076,80 @@ impl AppServerBridge {
 
     fn defer_dingtalk_stream_events(&mut self, events: Vec<Value>) {
         self.pending_dingtalk_events.extend(events);
+    }
+
+    fn remember_pending_inbound_attachments(&mut self, event: &Value) -> usize {
+        let attachments = deferable_inbound_attachments(event);
+        if attachments.is_empty() {
+            return 0;
+        }
+        let key = bot_session_key(&self.config, event);
+        let entry = self.pending_inbound_attachments.entry(key).or_default();
+        entry.extend(attachments);
+        if entry.len() > BOT_PENDING_INBOUND_ATTACHMENTS_LIMIT {
+            let overflow = entry.len() - BOT_PENDING_INBOUND_ATTACHMENTS_LIMIT;
+            entry.drain(0..overflow);
+        }
+        entry.len()
+    }
+
+    fn event_with_pending_inbound_attachments(&mut self, event: &Value) -> (Value, usize) {
+        let key = bot_session_key(&self.config, event);
+        let attachments = self
+            .pending_inbound_attachments
+            .remove(&key)
+            .unwrap_or_default();
+        let count = attachments.len();
+        (bot_event_with_extra_attachments(event, attachments), count)
+    }
+
+    fn transcribe_event_voice(
+        &self,
+        event: &Value,
+        event_id: &str,
+    ) -> Result<Option<String>, String> {
+        let Some(attachment) = message_attachments(event).and_then(|attachments| {
+            attachments
+                .iter()
+                .find(|attachment| is_audio_attachment(attachment))
+        }) else {
+            return Ok(None);
+        };
+        if let Some(text) = attachment_voice_transcription_text(attachment) {
+            return Ok(Some(text));
+        }
+
+        let url = attachment_url(attachment)
+            .ok_or_else(|| "audio attachment is missing url/path for transcription".to_string())?;
+        let mime_type = attachment_mime_type(attachment, Some(url));
+        let app_config = config::AppConfig::load();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| format!("failed to create voice transcription runtime: {}", err))?;
+        let text = runtime.block_on(async {
+            let audio = load_audio_attachment_bytes(attachment, url).await?;
+            crate::remote::transcribe_audio_bytes_for_config(
+                audio,
+                &mime_type,
+                &app_config,
+                "bot-bridge",
+            )
+            .await
+        })?;
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return Err("voice transcription returned empty text".to_string());
+        }
+        log_bridge(
+            &self.config,
+            &format!(
+                "transcribed voice attachment event_id={} text_len={}",
+                event_id,
+                text.chars().count()
+            ),
+        );
+        Ok(Some(text))
     }
 
     fn process_idle_app_output(&mut self, bot: &mut BotGatewayClient) {
@@ -4398,9 +4663,13 @@ fn is_dingtalk_event(event: &Value) -> bool {
 }
 
 fn event_string_at_paths<'a>(event: &'a Value, paths: &[&str]) -> Option<&'a str> {
+    value_string_at_paths(event, paths)
+}
+
+fn value_string_at_paths<'a>(value: &'a Value, paths: &[&str]) -> Option<&'a str> {
     paths
         .iter()
-        .filter_map(|path| event.pointer(path))
+        .filter_map(|path| value.pointer(path))
         .filter_map(Value::as_str)
         .map(str::trim)
         .find(|value| !value.is_empty() && *value != "unknown")
@@ -4701,6 +4970,172 @@ fn is_image_attachment(attachment: &Value) -> bool {
                     Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff")
                 )
             })
+}
+
+fn deferable_inbound_attachments(event: &Value) -> Vec<Value> {
+    message_attachments(event)
+        .map(|attachments| {
+            attachments
+                .iter()
+                .filter(|attachment| should_defer_inbound_attachment(attachment))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn should_defer_inbound_attachment(attachment: &Value) -> bool {
+    !is_audio_attachment(attachment)
+}
+
+fn is_audio_attachment(attachment: &Value) -> bool {
+    attachment
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("audio") || value.eq_ignore_ascii_case("voice")
+        })
+        || attachment
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.to_ascii_lowercase().starts_with("audio/"))
+        || attachment
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                let lower = value.to_ascii_lowercase();
+                matches!(
+                    Path::new(&lower).extension().and_then(|ext| ext.to_str()),
+                    Some(
+                        "mp3"
+                            | "wav"
+                            | "m4a"
+                            | "aac"
+                            | "ogg"
+                            | "oga"
+                            | "opus"
+                            | "amr"
+                            | "silk"
+                            | "webm"
+                    )
+                )
+            })
+}
+
+fn bot_event_with_extra_attachments(event: &Value, extra_attachments: Vec<Value>) -> Value {
+    if extra_attachments.is_empty() {
+        return event.clone();
+    }
+
+    let mut attachments = extra_attachments;
+    if let Some(current) = message_attachments(event) {
+        attachments.extend(current.iter().cloned());
+    }
+
+    let mut merged = event.clone();
+    let Some(root) = merged.as_object_mut() else {
+        return merged;
+    };
+    let message = root
+        .entry("message".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(message) = message.as_object_mut() else {
+        return merged;
+    };
+    message.insert("attachments".to_string(), Value::Array(attachments));
+    merged
+}
+
+async fn load_audio_attachment_bytes(attachment: &Value, url: &str) -> Result<Vec<u8>, String> {
+    if let Some(size) = attachment.get("sizeBytes").and_then(Value::as_u64) {
+        if size > BOT_VOICE_TRANSCRIBE_MAX_BYTES {
+            return Err(format!(
+                "audio attachment is too large for transcription: {} bytes",
+                size
+            ));
+        }
+    }
+
+    let bytes = if is_http_url(url) {
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(BOT_VOICE_TRANSCRIBE_TIMEOUT_SECS))
+            .build()
+            .map_err(|err| format!("failed to create audio download client: {}", err))?
+            .get(url)
+            .send()
+            .await
+            .map_err(|err| format!("failed to download audio attachment: {}", err))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!(
+                "audio attachment download returned HTTP {}",
+                status
+            ));
+        }
+        if let Some(size) = response.content_length() {
+            if size > BOT_VOICE_TRANSCRIBE_MAX_BYTES {
+                return Err(format!(
+                    "audio attachment is too large for transcription: {} bytes",
+                    size
+                ));
+            }
+        }
+        response
+            .bytes()
+            .await
+            .map_err(|err| format!("failed to read audio attachment: {}", err))?
+            .to_vec()
+    } else {
+        let path = local_path_from_media_url(url)
+            .ok_or_else(|| "audio attachment url is not a local path".to_string())?;
+        fs::read(&path).map_err(|err| {
+            format!(
+                "failed to read audio attachment {}: {}",
+                path.to_string_lossy(),
+                err
+            )
+        })?
+    };
+
+    if bytes.len() as u64 > BOT_VOICE_TRANSCRIBE_MAX_BYTES {
+        return Err(format!(
+            "audio attachment is too large for transcription: {} bytes",
+            bytes.len()
+        ));
+    }
+    if bytes.is_empty() {
+        return Err("audio attachment is empty".to_string());
+    }
+    Ok(bytes)
+}
+
+fn attachment_mime_type(attachment: &Value, url: Option<&str>) -> String {
+    attachment
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            attachment
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(guess_mime_type)
+        })
+        .or_else(|| {
+            url.and_then(filename_from_media_url)
+                .as_deref()
+                .and_then(guess_mime_type)
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_string())
+}
+
+fn bot_voice_transcription_failed_message(language: AppLanguage, err: &str) -> String {
+    let err = truncate_text(err, 300);
+    match language {
+        AppLanguage::Zh => format!("语音转录失败：{}", err),
+        AppLanguage::En => format!("Voice transcription failed: {}", err),
+    }
 }
 
 fn attachment_url(attachment: &Value) -> Option<&str> {

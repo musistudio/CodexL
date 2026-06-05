@@ -4348,6 +4348,52 @@ pub(crate) async fn custom_transcribe_fetch_response_for_config(
     custom_transcribe_fetch_response(message, &transcribe_api, source).await
 }
 
+pub(crate) async fn transcribe_audio_bytes_for_config(
+    audio: Vec<u8>,
+    content_type: &str,
+    config: &AppConfig,
+    source: &str,
+) -> Result<String, String> {
+    let request_id = format!(
+        "codexl-{}-transcribe-{}",
+        source,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default()
+    );
+    let message = json!({
+        "type": "fetch",
+        "requestId": request_id,
+        "method": "POST",
+        "url": "/transcribe",
+        "headers": {
+            "Content-Type": content_type,
+            "X-Codex-Base64": "1",
+        },
+        "body": BASE64_STANDARD.encode(audio),
+    });
+    let transcribe_api = TranscribeApiConfig::from_app_config(config);
+    let workspace_name = config
+        .provider_profile(&config.active_provider)
+        .map(|profile| profile.name)
+        .unwrap_or_else(|| config::DEFAULT_PROVIDER_PROFILE_NAME.to_string());
+    let response = cli_desktop_api_fetch_response(
+        &message,
+        &config.codex_home,
+        &workspace_name,
+        &transcribe_api,
+    )
+    .await
+    .map_err(|(status, err)| {
+        format!(
+            "transcription request failed with status {}: {}",
+            status, err
+        )
+    })?;
+    transcribe_text_from_fetch_response(&response)
+}
+
 async fn custom_transcribe_fetch_response(
     message: &Value,
     transcribe_api: &TranscribeApiConfig,
@@ -4376,6 +4422,46 @@ async fn custom_transcribe_fetch_response(
     match cli_custom_transcribe_fetch_response(message, transcribe_api).await {
         Ok(response) => Some(response),
         Err((status, error)) => Some(fetch_response_error_status(request_id, status, &error)),
+    }
+}
+
+fn transcribe_text_from_fetch_response(response: &Value) -> Result<String, String> {
+    if response.get("responseType").and_then(Value::as_str) == Some("error") {
+        return Err(response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("transcription failed")
+            .to_string());
+    }
+    let body = response
+        .get("bodyJsonString")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "transcription response missing body".to_string())?;
+    let body = serde_json::from_str::<Value>(body)
+        .map_err(|err| format!("failed to parse transcription response: {}", err))?;
+    match body {
+        Value::String(text) => non_empty_string(&text)
+            .ok_or_else(|| "transcription response returned empty text".to_string()),
+        Value::Object(_) => {
+            for path in [
+                "/text",
+                "/transcript",
+                "/transcription",
+                "/data/text",
+                "/result/text",
+            ] {
+                if let Some(text) = body
+                    .pointer(path)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    return Ok(text.to_string());
+                }
+            }
+            Err("transcription response missing text".to_string())
+        }
+        _ => Err("transcription response body was not text".to_string()),
     }
 }
 

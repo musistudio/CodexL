@@ -918,6 +918,7 @@ type WeixinBotQrStart = {
   profileName: string;
   tenantId: string;
   integrationId: string;
+  stateDir: string;
   sessionId: string;
   qrCodeUrl: string;
   expiresAt: string;
@@ -928,6 +929,7 @@ type WeixinBotQrWait = {
   profileName: string;
   tenantId: string;
   integrationId: string;
+  stateDir: string;
   sessionId: string;
   status: string;
   message: string;
@@ -979,6 +981,7 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     downloadUpdateTooltip: t("tooltips.downloadUpdate"),
     showRemoteQr: t("remote.showQr"),
     editProfile: (name: string) => t("actions.editProfile", { name }),
+    editRunningProfileUnavailable: t("actions.editRunningProfileUnavailable"),
     deleteProfile: (name: string) => t("actions.deleteProfile", { name }),
     stop: t("actions.stop"),
     stopping: t("actions.stopping"),
@@ -2062,6 +2065,11 @@ function App() {
 
   const openEditProviderDialog = useCallback(
     async (profile: ProviderProfile) => {
+      if (instanceStatusIsRunning(profileInstanceStatus(profile, instanceStatuses))) {
+        setSettingsError(strings.editRunningProfileUnavailable);
+        return;
+      }
+
       setDialogMode("edit");
       setEditingProfileName(profile.name);
       setEditingProfileKey(profile.name === "Default" ? profile.name : profileKey(profile));
@@ -2160,8 +2168,10 @@ function App() {
     [
       detectCodexAppPath,
       gatewayProfileEnabled,
+      instanceStatuses,
       loadDefaultProviders,
       loadGatewayModels,
+      strings.editRunningProfileUnavailable,
       strings.noProviderFound,
     ],
   );
@@ -2273,6 +2283,18 @@ function App() {
       let savedBot: BotProfileConfig | null = null;
       const extensionsEnabled = botExtensionsEnabled(config.extensions);
       const originalProfileKey = editingProfileKey || editingProfileName || "";
+      if (dialogMode === "edit" && originalProfileKey) {
+        const originalProfile =
+          config.provider_profiles.find((profile) => profileKey(profile) === originalProfileKey) ||
+          config.provider_profiles.find((profile) => profile.name === originalProfileKey);
+        const originalStatus = originalProfile
+          ? profileInstanceStatus(originalProfile, instanceStatuses)
+          : instanceStatuses.get(originalProfileKey) || null;
+        if (instanceStatusIsRunning(originalStatus)) {
+          setSettingsError(strings.editRunningProfileUnavailable);
+          return;
+        }
+      }
 
       if (providerMode === "none" || form.remoteFrontendMode === "claude-code") {
         const provider = readWorkspaceProviderForm(
@@ -2401,6 +2423,7 @@ function App() {
     editingProfileKey,
     editingProfileName,
     form,
+    instanceStatuses,
     openWeixinBotLogin,
     providerMode,
     refreshStatus,
@@ -2573,8 +2596,7 @@ function App() {
       if (workspaceOperation?.key === key) {
         return;
       }
-      const status = instanceStatuses.get(key);
-      const isRunning = Boolean(status?.running || status?.remote_control?.running);
+      const isRunning = instanceStatusIsRunning(profileInstanceStatus(profile, instanceStatuses));
       if (isRunning) {
         await stopCodex(profile);
         return;
@@ -2875,7 +2897,7 @@ function App() {
           <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
             {filteredProfiles.map((profile) => {
               const key = profileKey(profile);
-              const status = instanceStatuses.get(key) || instanceStatuses.get(profile.name) || null;
+              const status = profileInstanceStatus(profile, instanceStatuses);
               const operationKind = workspaceOperation?.key === key ? workspaceOperation.kind : null;
               return (
                 <ProfileCard
@@ -3334,10 +3356,15 @@ function ProfileCard({
 }: ProfileCardProps) {
   const strings = useAppStrings();
   const remote = status?.remote_control || null;
-  const isRunning = Boolean(status?.running || remote?.running);
+  const isRunning = instanceStatusIsRunning(status);
   const isRemoteRunning = Boolean(remote?.running);
   const isBusy = operationKind !== null;
   const showRemoteActions = isRunning && remoteControlReadyForQr(remote);
+  const editDisabledTooltip = isBusy
+    ? strings.saving
+    : isRunning
+      ? strings.editRunningProfileUnavailable
+      : "";
   const remoteQrDisabledTooltip = isBusy
     ? strings.saving
     : isRunning
@@ -3477,8 +3504,8 @@ function ProfileCard({
           </IconButton>
           <IconButton
             title={strings.editProfile(profile.name)}
-            disabled={isBusy}
-            tooltip={strings.saving}
+            disabled={isBusy || isRunning}
+            tooltip={editDisabledTooltip}
             onClick={() => onEdit(profile).catch(onError)}
           >
             <Pencil className="w-3.5 h-3.5" />
@@ -6407,32 +6434,35 @@ function GatewayUsageDashboard({
               }
             />
           </div>
-          <div className="grid grid-cols-2 gap-2 sm:flex">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="min-w-0"
-              title={strings.gatewayUsageRefresh}
-              onClick={onRefresh}
-              disabled={loading}
+          <div className="flex items-center justify-end gap-2">
+            <Tooltip label={strings.gatewayUsageRefresh} side="bottom">
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="h-9 w-9 shrink-0"
+                aria-label={strings.gatewayUsageRefresh}
+                onClick={onRefresh}
+                disabled={loading}
+              >
+                <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
+              </Button>
+            </Tooltip>
+            <Tooltip
+              label={fullscreen ? strings.gatewayUsageExitFullscreen : strings.gatewayUsageEnterFullscreen}
+              side="bottom"
             >
-              <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
-              <span className="hidden lg:inline">{strings.gatewayUsageRefresh}</span>
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="min-w-0"
-              title={fullscreen ? strings.gatewayUsageExitFullscreen : strings.gatewayUsageEnterFullscreen}
-              onClick={onToggleFullscreen}
-            >
-              {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
-              <span className="hidden lg:inline">
-                {fullscreen ? strings.gatewayUsageExitFullscreen : strings.gatewayUsageEnterFullscreen}
-              </span>
-            </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="h-9 w-9 shrink-0"
+                aria-label={fullscreen ? strings.gatewayUsageExitFullscreen : strings.gatewayUsageEnterFullscreen}
+                onClick={onToggleFullscreen}
+              >
+                {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+              </Button>
+            </Tooltip>
           </div>
         </div>
       </div>
@@ -6646,14 +6676,15 @@ function GatewayUsageTokenBar({
 }
 
 function GatewayUsageModelComparison({ items, strings }: { items: GatewayUsageBreakdown[]; strings: AppStrings }) {
-  const maxTokens = Math.max(...items.map(gatewayUsageTokenBarTotal), 1);
+  const visibleItems = items.filter(gatewayUsageHasTokenBarData);
+  const maxTokens = Math.max(...visibleItems.map(gatewayUsageTokenBarTotal), 1);
 
   return (
     <section className="w-full min-w-0 rounded-md border border-border bg-muted/10 p-3 sm:p-4">
       <h3 className="mb-3 text-sm font-semibold">{strings.gatewayUsageByModel}</h3>
-      {items.length > 0 ? (
+      {visibleItems.length > 0 ? (
         <div className="space-y-3">
-          {items.map((item) => {
+          {visibleItems.map((item) => {
             return (
               <div key={`${item.provider}-${item.providerName}-${item.model || item.label}`} className="space-y-1.5">
                 <div className="grid min-w-0 gap-1 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-3">
@@ -11991,6 +12022,15 @@ function profileKey(profile: ProviderProfile) {
   return profile.id.trim() || profile.name;
 }
 
+function profileInstanceStatus(profile: ProviderProfile, statuses: ReadonlyMap<string, InstanceStatus>) {
+  const key = profileKey(profile);
+  return statuses.get(key) || statuses.get(profile.name) || null;
+}
+
+function instanceStatusIsRunning(status: InstanceStatus | null | undefined) {
+  return Boolean(status?.running || status?.remote_control?.running);
+}
+
 function createDefaultProviderProfileForm(): DefaultProviderProfile {
   return {
     name: "",
@@ -12461,6 +12501,10 @@ type GatewayUsageTokenBarValue = {
 
 function gatewayUsageTokenBarTotal(value?: GatewayUsageTokenBarValue | null) {
   return Math.max(0, value?.inputTokens ?? 0) + Math.max(0, value?.outputTokens ?? 0);
+}
+
+function gatewayUsageHasTokenBarData(value?: GatewayUsageTokenBarValue | null) {
+  return gatewayUsageTokenBarTotal(value) > 0 || gatewayUsageCacheTokens(value) > 0;
 }
 
 function gatewayUsagePercent(value: number, total: number) {
