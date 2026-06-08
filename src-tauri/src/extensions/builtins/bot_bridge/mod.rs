@@ -2243,7 +2243,7 @@ fn enforce_bot_gateway_integration_config(
     platform: &str,
     integration_config: &mut Map<String, Value>,
 ) {
-    if let Some(transport) = socket_first_bot_gateway_transport(platform) {
+    if let Some(transport) = bot_gateway_runtime_transport(platform) {
         integration_config.insert(
             "transport".to_string(),
             Value::String(transport.to_string()),
@@ -2254,7 +2254,7 @@ fn enforce_bot_gateway_integration_config(
 fn default_bot_gateway_integration_config(platform: &str) -> Map<String, Value> {
     let mut config = Map::new();
     config.insert("dryRun".to_string(), Value::Bool(false));
-    if let Some(transport) = socket_first_bot_gateway_transport(platform) {
+    if let Some(transport) = bot_gateway_runtime_transport(platform) {
         config.insert(
             "transport".to_string(),
             Value::String(transport.to_string()),
@@ -2263,11 +2263,11 @@ fn default_bot_gateway_integration_config(platform: &str) -> Map<String, Value> 
     config
 }
 
-fn socket_first_bot_gateway_transport(platform: &str) -> Option<&'static str> {
+fn bot_gateway_runtime_transport(platform: &str) -> Option<&'static str> {
     match platform {
         config::BOT_PLATFORM_SLACK => Some("socket"),
         config::BOT_PLATFORM_DISCORD => Some("websocket"),
-        config::BOT_PLATFORM_TELEGRAM => Some("websocket"),
+        config::BOT_PLATFORM_TELEGRAM => Some("long_polling"),
         config::BOT_PLATFORM_FEISHU => Some("websocket"),
         config::BOT_PLATFORM_DINGTALK => Some("websocket"),
         config::BOT_PLATFORM_LINE => Some("websocket"),

@@ -535,11 +535,11 @@ fn feishu_gateway_config_uses_websocket_transport() {
 }
 
 #[test]
-fn local_bot_gateway_transports_default_to_socket_first_modes() {
+fn local_bot_gateway_transports_default_to_runtime_modes() {
     for (platform, expected_transport) in [
         (config::BOT_PLATFORM_SLACK, "socket"),
         (config::BOT_PLATFORM_DISCORD, "websocket"),
-        (config::BOT_PLATFORM_TELEGRAM, "websocket"),
+        (config::BOT_PLATFORM_TELEGRAM, "long_polling"),
         (config::BOT_PLATFORM_FEISHU, "websocket"),
         (config::BOT_PLATFORM_DINGTALK, "websocket"),
         (config::BOT_PLATFORM_LINE, "websocket"),
@@ -569,11 +569,11 @@ fn local_bot_gateway_transports_default_to_socket_first_modes() {
 }
 
 #[test]
-fn socket_first_transports_override_saved_webhook_mode() {
+fn runtime_transports_override_saved_webhook_mode() {
     for (platform, expected_transport) in [
         (config::BOT_PLATFORM_SLACK, "socket"),
         (config::BOT_PLATFORM_DISCORD, "websocket"),
-        (config::BOT_PLATFORM_TELEGRAM, "websocket"),
+        (config::BOT_PLATFORM_TELEGRAM, "long_polling"),
         (config::BOT_PLATFORM_FEISHU, "websocket"),
         (config::BOT_PLATFORM_DINGTALK, "websocket"),
         (config::BOT_PLATFORM_LINE, "websocket"),
