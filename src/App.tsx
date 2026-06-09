@@ -374,8 +374,10 @@ type DesktopCloudAuth = {
   email: string;
   avatarUrl: string | null;
   accessToken: string;
-  refreshToken: string;
-  expiresAt: number;
+  refreshToken?: string | null;
+  refresh_token?: string | null;
+  expiresAt: number | string;
+  expires_at?: number | string | null;
   relayUrl?: string | null;
   relay_url?: string | null;
   remoteRelayUrl?: string | null;
@@ -1390,6 +1392,8 @@ const BOT_CONFIG_CUSTOM_VALUE = "__codexl_bot_config_custom__";
 const DEFAULT_CODEXL_SERVER_URL = "https://codexl.io";
 const MAX_AUTH_STATUS_REFRESH_DELAY_MS = 2_147_483_647;
 const AUTH_REFRESH_SKEW_MS = 5 * 60_000;
+const AUTH_REFRESH_TOKEN_SKEW_MS = 60_000;
+const AUTH_REFRESH_MAX_INTERVAL_MS = 4 * 60_000;
 const AUTH_REFRESH_RETRY_DELAY_MS = 30_000;
 let initialAppUpdateCheckStarted = false;
 const providerModelProbeCache = new Map<string, string[]>();
@@ -1547,6 +1551,7 @@ function App() {
   const workspaceDeletePendingRef = useRef(false);
   const weixinBotQrRef = useRef<WeixinBotQrState | null>(null);
   const weixinBotLoginGenerationRef = useRef(0);
+  const desktopLoginPromiseRef = useRef<Promise<AppConfig | null> | null>(null);
 
   const { i18n } = useTranslation();
   const strings = useAppStrings();
@@ -1766,64 +1771,78 @@ function App() {
     });
     setAuthRefreshRetryAt(null);
     setConfig(nextConfig);
+    return nextConfig;
   }, []);
 
-  const beginDesktopLogin = useCallback(async () => {
-    if (accountLoginState === "polling") {
-      return;
+  const beginDesktopLogin = useCallback(async (): Promise<AppConfig | null> => {
+    if (desktopLoginPromiseRef.current) {
+      return desktopLoginPromiseRef.current;
     }
+
     if (!isTauriRuntime()) {
       setAccountError(strings.desktopRuntimeUnavailableTitle);
-      return;
+      showSettingsError(strings.desktopRuntimeUnavailableTitle);
+      return null;
     }
 
-    setAccountLoginState("polling");
-    setAccountError("");
+    const loginPromise = (async () => {
+      setAccountLoginState("polling");
+      setAccountError("");
 
-    try {
-      const login = await startDesktopLogin(language);
-      const loginUrl = normalizeDesktopLoginUrl(login.loginUrl);
       try {
-        await openUrl(loginUrl);
-      } catch {
-        window.open(loginUrl, "_blank", "noopener,noreferrer");
-      }
-
-      const parsedDeadline = Date.parse(login.expiresAt);
-      const deadline = Number.isFinite(parsedDeadline)
-        ? parsedDeadline
-        : Date.now() + login.expiresIn * 1000;
-
-      while (Date.now() < deadline) {
-        await sleep(1500);
-        const result = await pollDesktopLogin(login.code);
-
-        if (result.status === "pending") {
-          continue;
+        const login = await startDesktopLogin(language);
+        const loginUrl = normalizeDesktopLoginUrl(login.loginUrl);
+        try {
+          await openUrl(loginUrl);
+        } catch {
+          window.open(loginUrl, "_blank", "noopener,noreferrer");
         }
 
-        if (result.status === "authenticated") {
-          await saveRemoteCloudAuth(
-            remoteCloudAuthFromDesktopLogin(result),
-            remoteRelayUrlFromDesktopLogin(result),
-          );
-          setAccountError("");
-          return;
+        const parsedDeadline = Date.parse(login.expiresAt);
+        const deadline = Number.isFinite(parsedDeadline)
+          ? parsedDeadline
+          : Date.now() + login.expiresIn * 1000;
+
+        while (Date.now() < deadline) {
+          await sleep(1500);
+          const result = await pollDesktopLogin(login.code);
+
+          if (result.status === "pending") {
+            continue;
+          }
+
+          if (result.status === "authenticated") {
+            const nextConfig = await saveRemoteCloudAuth(
+              remoteCloudAuthFromDesktopLogin(result),
+              remoteRelayUrlFromDesktopLogin(result),
+            );
+            setAccountError("");
+            return nextConfig;
+          }
+
+          throw new Error(strings.loginExpired);
         }
 
         throw new Error(strings.loginExpired);
+      } catch (error) {
+        const message = `${strings.loginFailed}: ${errorMessage(error)}`;
+        setAccountError(message);
+        showSettingsError(message);
+        return null;
+      } finally {
+        setAccountLoginState("idle");
       }
+    })();
 
-      throw new Error(strings.loginExpired);
-    } catch (error) {
-      const message = `${strings.loginFailed}: ${errorMessage(error)}`;
-      setAccountError(message);
-      showSettingsError(message);
+    desktopLoginPromiseRef.current = loginPromise;
+    try {
+      return await loginPromise;
     } finally {
-      setAccountLoginState("idle");
+      if (desktopLoginPromiseRef.current === loginPromise) {
+        desktopLoginPromiseRef.current = null;
+      }
     }
   }, [
-    accountLoginState,
     language,
     saveRemoteCloudAuth,
     showSettingsError,
@@ -1850,29 +1869,34 @@ function App() {
   }, [showSettingsError]);
 
   const refreshRemoteCloudAuth = useCallback(
-    async (auth: RemoteCloudAuthConfig) => {
+    async (auth: RemoteCloudAuthConfig): Promise<AppConfig | null> => {
       const refreshToken = auth.refresh_token.trim();
       if (!refreshToken) {
         setAuthStatusRefreshTick((current) => current + 1);
-        return;
+        return null;
       }
 
       try {
         const result = await refreshDesktopAuth(refreshToken);
         const refreshedRelayUrl =
           remoteRelayUrlFromDesktopRefresh(result) || config?.remote_relay_url || "";
-        await saveRemoteCloudAuth(remoteCloudAuthFromDesktopRefresh(result), refreshedRelayUrl);
+        const nextConfig = await saveRemoteCloudAuth(
+          remoteCloudAuthFromDesktopRefresh(result, auth),
+          refreshedRelayUrl,
+        );
         setAccountError("");
+        return nextConfig;
       } catch (error) {
         if (error instanceof DesktopAuthHttpError && [401, 403].includes(error.status)) {
           setAccountError(strings.sessionExpired);
           await saveRemoteCloudAuth(emptyRemoteCloudAuth(), "");
-          return;
+          return null;
         }
 
         setAccountError(strings.refreshFailed);
         setAuthRefreshRetryAt(Date.now() + AUTH_REFRESH_RETRY_DELAY_MS);
         console.warn("Desktop auth refresh failed; will retry.", error);
+        return null;
       }
     },
     [config?.remote_relay_url, saveRemoteCloudAuth, strings.refreshFailed, strings.sessionExpired],
@@ -1905,6 +1929,25 @@ function App() {
     authStatusRefreshTick,
     refreshRemoteCloudAuth,
   ]);
+
+  const ensureRemoteCloudAuthForLaunch = useCallback(async () => {
+    const auth = config?.remote_cloud_auth ?? null;
+    if (hasUsableRemoteCloudAccessToken(auth)) {
+      return config;
+    }
+
+    if (auth?.refresh_token.trim()) {
+      const refreshedConfig = await refreshRemoteCloudAuth(auth);
+      if (hasUsableRemoteCloudAccessToken(refreshedConfig?.remote_cloud_auth)) {
+        return refreshedConfig;
+      }
+    }
+
+    const loggedInConfig = await beginDesktopLogin();
+    return hasUsableRemoteCloudAccessToken(loggedInConfig?.remote_cloud_auth)
+      ? loggedInConfig
+      : null;
+  }, [beginDesktopLogin, config, refreshRemoteCloudAuth]);
 
   useEffect(() => {
     document.documentElement.lang = language === "zh" ? "zh-CN" : "en";
@@ -2521,6 +2564,13 @@ function App() {
 
       setWorkspaceOperation({ key, kind: "start" });
       try {
+        if (startCloud) {
+          const cloudAuthConfig = await ensureRemoteCloudAuthForLaunch();
+          if (!cloudAuthConfig) {
+            return;
+          }
+        }
+
         const info = await invoke<LaunchInfo>("launch_codex", {
           cdpPort: config?.cdp_port || null,
           codexPath: config?.codex_path || null,
@@ -2567,6 +2617,7 @@ function App() {
     [
       config?.cdp_port,
       config?.codex_path,
+      ensureRemoteCloudAuthForLaunch,
       refreshStatus,
       showSettingsError,
     ],
@@ -9876,8 +9927,8 @@ function remoteCloudAuthFromDesktopLogin(
       is_pro: result.user.hasSubscription,
       subscription_expires_at: subscriptionExpiresAtFromDesktopLogin(result),
       access_token: result.cloudAuth.accessToken,
-      refresh_token: result.cloudAuth.refreshToken,
-      expires_at: result.cloudAuth.expiresAt,
+      refresh_token: desktopCloudAuthRefreshToken(result.cloudAuth),
+      expires_at: desktopCloudAuthExpiresAt(result.cloudAuth),
     };
   }
 
@@ -9896,6 +9947,7 @@ function remoteCloudAuthFromDesktopLogin(
 
 function remoteCloudAuthFromDesktopRefresh(
   result: Extract<DesktopAuthRefreshResponse, { status: "refreshed" }>,
+  previousAuth?: RemoteCloudAuthConfig | null,
 ): RemoteCloudAuthConfig {
   return {
     user_id: result.cloudAuth.userId,
@@ -9905,9 +9957,25 @@ function remoteCloudAuthFromDesktopRefresh(
     is_pro: result.user.hasSubscription,
     subscription_expires_at: subscriptionExpiresAtFromDesktopAuthPayload(result),
     access_token: result.cloudAuth.accessToken,
-    refresh_token: result.cloudAuth.refreshToken,
-    expires_at: result.cloudAuth.expiresAt,
+    refresh_token: desktopCloudAuthRefreshToken(result.cloudAuth, previousAuth),
+    expires_at: desktopCloudAuthExpiresAt(result.cloudAuth),
   };
+}
+
+function desktopCloudAuthRefreshToken(
+  cloudAuth: DesktopCloudAuth,
+  previousAuth?: RemoteCloudAuthConfig | null,
+) {
+  return (
+    stringValue(cloudAuth.refreshToken, "").trim() ||
+    stringValue(cloudAuth.refresh_token, "").trim() ||
+    previousAuth?.refresh_token.trim() ||
+    ""
+  );
+}
+
+function desktopCloudAuthExpiresAt(cloudAuth: DesktopCloudAuth) {
+  return firstUnixSeconds(cloudAuth.expiresAt, cloudAuth.expires_at);
 }
 
 function subscriptionExpiresAtFromDesktopLogin(
@@ -10004,11 +10072,15 @@ function emptyRemoteCloudAuth(): RemoteCloudAuthConfig {
 }
 
 function hasRemoteCloudIdentity(auth: RemoteCloudAuthConfig | null | undefined) {
-  if (!auth?.user_id.trim()) {
-    return false;
-  }
+  return hasUsableRemoteCloudAccessToken(auth) || hasRefreshableRemoteCloudIdentity(auth);
+}
 
-  if (!auth.access_token.trim()) {
+function hasRefreshableRemoteCloudIdentity(auth: RemoteCloudAuthConfig | null | undefined) {
+  return Boolean(auth?.user_id.trim() && auth.refresh_token.trim());
+}
+
+function hasUsableRemoteCloudAccessToken(auth: RemoteCloudAuthConfig | null | undefined) {
+  if (!auth?.user_id.trim() || !auth.access_token.trim()) {
     return false;
   }
 
@@ -10019,18 +10091,48 @@ function remoteCloudAuthStatusRefreshDelay(
   auth: RemoteCloudAuthConfig | null | undefined,
   retryAtMs: number | null = null,
 ) {
-  if (!auth?.user_id.trim() || !auth.access_token.trim() || auth.expires_at === 0) {
+  if (!auth?.user_id.trim()) {
     return null;
   }
 
   const now = Date.now();
+  const accessToken = auth.access_token.trim();
   const refreshToken = auth.refresh_token.trim();
+  if (!accessToken && !refreshToken) {
+    return null;
+  }
+
   if (refreshToken && retryAtMs && retryAtMs > now) {
     return Math.min(retryAtMs - now, MAX_AUTH_STATUS_REFRESH_DELAY_MS);
   }
 
-  const refreshAtMs = auth.expires_at * 1000 - (refreshToken ? AUTH_REFRESH_SKEW_MS : 60_000);
-  const delayMs = refreshAtMs - Date.now();
+  const refreshCandidates: number[] = [];
+  if (accessToken && auth.expires_at > 0) {
+    refreshCandidates.push(auth.expires_at * 1000 - (refreshToken ? AUTH_REFRESH_SKEW_MS : 60_000));
+  } else if (!accessToken && refreshToken) {
+    refreshCandidates.push(now);
+  }
+
+  if (refreshToken) {
+    const refreshTokenExpiresAt = jwtExpiresAt(refreshToken);
+    if (refreshTokenExpiresAt > 0) {
+      const refreshTokenExpiresAtMs = refreshTokenExpiresAt * 1000;
+      const refreshTokenTtlMs = refreshTokenExpiresAtMs - now;
+      const refreshTokenSkewMs = Math.min(
+        AUTH_REFRESH_TOKEN_SKEW_MS,
+        Math.max(5_000, Math.floor(refreshTokenTtlMs / 4)),
+      );
+      refreshCandidates.push(Math.max(now, refreshTokenExpiresAtMs - refreshTokenSkewMs));
+    }
+    refreshCandidates.push(now + AUTH_REFRESH_MAX_INTERVAL_MS);
+  }
+
+  if (refreshCandidates.length === 0) {
+    return null;
+  }
+
+  const refreshAtMs = Math.min(...refreshCandidates);
+  const delayMs = refreshAtMs - now;
   if (delayMs <= 0 && !refreshToken) {
     return null;
   }
@@ -10074,7 +10176,15 @@ function remoteCloudSubscriptionExpiresAt(auth: RemoteCloudAuthConfig) {
 }
 
 function remoteCloudJwtClaims(auth: RemoteCloudAuthConfig) {
-  const parts = auth.access_token?.split(".") ?? [];
+  return jwtPayloadClaims(auth.access_token);
+}
+
+function jwtExpiresAt(token: string | null | undefined) {
+  return firstUnixSeconds(jwtPayloadClaims(token)?.exp);
+}
+
+function jwtPayloadClaims(token: string | null | undefined) {
+  const parts = token?.split(".") ?? [];
 
   if (parts.length < 2) {
     return null;
