@@ -399,6 +399,83 @@ pub fn stop_all_extension_processes() -> Result<(), String> {
     Ok(())
 }
 
+pub fn stop_next_ai_gateway_processes() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let entries = process_entries()?;
+        let mut pids = BTreeSet::new();
+
+        for entry in entries
+            .iter()
+            .filter(|entry| is_next_ai_gateway_command(&entry.command))
+        {
+            pids.insert(entry.pid);
+            collect_descendant_pids(&entries, entry.pid, &mut pids);
+        }
+
+        terminate_pids(pids);
+    }
+    #[cfg(windows)]
+    {
+        let entries = windows_process_entries()?;
+        let mut pids = BTreeSet::new();
+
+        for entry in entries
+            .iter()
+            .filter(|entry| is_next_ai_gateway_command(&entry.command))
+        {
+            pids.insert(entry.pid);
+            collect_windows_descendant_pids(&entries, entry.pid, &mut pids);
+        }
+
+        terminate_pids_windows(pids);
+    }
+
+    Ok(())
+}
+
+pub fn stop_next_ai_gateway_processes_for_port(port: u16) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        let entries = process_entries()?;
+        let listener_pids = tcp_listener_pids_for_port(port)?;
+        let mut pids = BTreeSet::new();
+
+        for entry in entries.iter().filter(|entry| {
+            listener_pids.contains(&entry.pid) && is_next_ai_gateway_command(&entry.command)
+        }) {
+            pids.insert(entry.pid);
+            collect_descendant_pids(&entries, entry.pid, &mut pids);
+        }
+
+        let stopped = !pids.is_empty();
+        terminate_pids(pids);
+        return Ok(stopped);
+    }
+    #[cfg(windows)]
+    {
+        let entries = windows_process_entries()?;
+        let listener_pids = windows_tcp_listener_pids_for_port(port)?;
+        let mut pids = BTreeSet::new();
+
+        for entry in entries.iter().filter(|entry| {
+            listener_pids.contains(&entry.pid) && is_next_ai_gateway_command(&entry.command)
+        }) {
+            pids.insert(entry.pid);
+            collect_windows_descendant_pids(&entries, entry.pid, &mut pids);
+        }
+
+        let stopped = !pids.is_empty();
+        terminate_pids_windows(pids);
+        return Ok(stopped);
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = port;
+        Ok(false)
+    }
+}
+
 #[cfg(unix)]
 fn send_signal(signal: &str, target: &str) -> std::io::Result<std::process::ExitStatus> {
     Command::new("kill")
@@ -425,6 +502,29 @@ fn terminate_pids(mut pids: BTreeSet<u32>) {
     }
 }
 
+#[cfg(unix)]
+fn tcp_listener_pids_for_port(port: u16) -> Result<BTreeSet<u32>, String> {
+    let output = Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{}", port), "-sTCP:LISTEN", "-Fp"])
+        .output()
+        .map_err(|err| format!("failed to inspect TCP listeners: {}", err))?;
+    if !output.status.success() {
+        return Ok(BTreeSet::new());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_lsof_pid_lines(&stdout))
+}
+
+#[cfg(unix)]
+fn parse_lsof_pid_lines(stdout: &str) -> BTreeSet<u32> {
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix('p'))
+        .filter_map(|pid| pid.trim().parse::<u32>().ok())
+        .collect()
+}
+
 #[cfg(windows)]
 fn terminate_process_tree(pid: u32) -> std::io::Result<std::process::ExitStatus> {
     Command::new("taskkill")
@@ -444,6 +544,52 @@ fn terminate_pids_windows(mut pids: BTreeSet<u32>) {
 
     for pid in &pids {
         let _ = terminate_process_tree(*pid);
+    }
+}
+
+#[cfg(windows)]
+fn windows_tcp_listener_pids_for_port(port: u16) -> Result<BTreeSet<u32>, String> {
+    let script = format!(
+        "Get-NetTCPConnection -LocalPort {} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess | ConvertTo-Json -Compress",
+        port
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|err| format!("failed to inspect TCP listeners: {}", err))?;
+    if !output.status.success() {
+        return Ok(BTreeSet::new());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_windows_listener_pids_json(stdout.trim())
+}
+
+#[cfg(windows)]
+fn parse_windows_listener_pids_json(stdout: &str) -> Result<BTreeSet<u32>, String> {
+    if stdout.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(stdout)
+        .map_err(|err| format!("failed to parse TCP listener pids: {}", err))?;
+    let mut pids = BTreeSet::new();
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                push_json_pid(&item, &mut pids);
+            }
+        }
+        item => push_json_pid(&item, &mut pids),
+    }
+    Ok(pids)
+}
+
+#[cfg(windows)]
+fn push_json_pid(value: &serde_json::Value, pids: &mut BTreeSet<u32>) {
+    if let Some(pid) = value.as_u64().and_then(|value| u32::try_from(value).ok()) {
+        pids.insert(pid);
+    } else if let Some(pid) = value.as_str().and_then(|value| value.parse::<u32>().ok()) {
+        pids.insert(pid);
     }
 }
 
@@ -1415,6 +1561,29 @@ mod tests {
         assert!(!is_codexl_extension_process(
             "/Applications/Codex.app/Contents/Resources/codex app-server"
         ));
+    }
+
+    #[test]
+    fn detects_next_ai_gateway_processes() {
+        assert!(is_next_ai_gateway_command(
+            "/usr/local/bin/node /Users/me/.codexl/extensions/next-ai-gateway/1.0.0/gateway/start.js"
+        ));
+        assert!(is_next_ai_gateway_command(
+            r"C:\Users\me\CodexL\extensions\next-ai-gateway\1.0.0\gateway\start.js"
+        ));
+        assert!(!is_next_ai_gateway_command(
+            "/usr/local/bin/node /Users/me/.codexl/extensions/bot-gateway/1.0.0/stdio/stdio.js"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_lsof_pid_lines() {
+        let pids = parse_lsof_pid_lines("p123\nn*:14589\np456\n");
+
+        assert!(pids.contains(&123));
+        assert!(pids.contains(&456));
+        assert!(!pids.contains(&14589));
     }
 
     #[test]

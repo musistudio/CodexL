@@ -70,6 +70,11 @@ pub fn codex_provider_api_key() -> Result<String, String> {
     Ok(codex_provider_api_key_from_config(&file.config))
 }
 
+pub fn gateway_port() -> Result<u16, String> {
+    let file = read_gateway_config()?;
+    Ok(gateway_port_from_config(&file.config))
+}
+
 pub fn write_codex_model_catalog(selected_model: &str) -> Result<String, String> {
     let mut file = read_gateway_config()?;
     let selected_model = selected_model.trim();
@@ -330,27 +335,36 @@ fn push_unique_model(models: &mut Vec<String>, model: &str) {
     }
 }
 
-fn gateway_origin_from_config(config: &Value) -> String {
-    let host = config
+fn gateway_host_from_config(config: &Value) -> String {
+    config
         .get("host")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("127.0.0.1");
+        .unwrap_or("127.0.0.1")
+        .to_string()
+}
+
+fn gateway_port_from_config(config: &Value) -> u16 {
+    config
+        .get("port")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0 && *value <= u16::MAX as u64)
+        .unwrap_or(14589) as u16
+}
+
+fn gateway_origin_from_config(config: &Value) -> String {
+    let host = gateway_host_from_config(config);
     let connect_host = match host {
-        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        value if value == "0.0.0.0" || value == "::" || value == "[::]" => "127.0.0.1".to_string(),
         value => value,
     };
     let host_part = if connect_host.contains(':') && !connect_host.starts_with('[') {
         format!("[{}]", connect_host)
     } else {
-        connect_host.to_string()
+        connect_host
     };
-    let port = config
-        .get("port")
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0 && *value <= u16::MAX as u64)
-        .unwrap_or(14589);
+    let port = gateway_port_from_config(config);
 
     format!("http://{}:{}", host_part, port)
 }
@@ -711,16 +725,11 @@ fn ensure_codex_model_rewrite_plugin_config_with_target(
                 return true;
             }
 
-            let existing_target_model =
-                target_model.map(str::to_string).or_else(|| {
-                    codex_model_rewrite_target_model_from_plugin(plugin)
-                });
+            let existing_target_model = target_model
+                .map(str::to_string)
+                .or_else(|| codex_model_rewrite_target_model_from_plugin(plugin));
             let plugin_object = plugin.as_object_mut().expect("checked object");
-            changed |= set_json_string(
-                plugin_object,
-                "key",
-                CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY,
-            );
+            changed |= set_json_string(plugin_object, "key", CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY);
             changed |= set_json_bool(plugin_object, "enabled", true);
             if plugin_object.remove("provider").is_some() {
                 changed = true;
@@ -742,7 +751,8 @@ fn ensure_codex_model_rewrite_plugin_config_with_target(
                 changed |= set_json_string(rewrite_object, "targetModel", target_model);
             }
 
-            let request = codex_model_rewrite_plugin_request_config(existing_target_model.as_deref());
+            let request =
+                codex_model_rewrite_plugin_request_config(existing_target_model.as_deref());
             if plugin_object.get("request") != Some(&request) {
                 plugin_object.insert("request".to_string(), request);
                 changed = true;
@@ -1077,7 +1087,10 @@ mod tests {
         let plugins = config["providerPlugins"].as_array().expect("plugins array");
         assert_eq!(plugins.len(), 2);
         assert_eq!(plugins[0]["key"], json!("custom-plugin"));
-        assert_eq!(plugins[1]["key"], json!(CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY));
+        assert_eq!(
+            plugins[1]["key"],
+            json!(CODEXL_CODEX_MODEL_REWRITE_PLUGIN_KEY)
+        );
         assert_eq!(plugins[1]["enabled"], json!(true));
         assert_eq!(plugins[1].get("providerName"), None);
         assert_eq!(plugins[1]["codexModelRewrite"]["enabled"], json!(true));

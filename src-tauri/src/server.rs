@@ -118,7 +118,13 @@ struct StatusResponse {
 
 pub async fn serve(state: AppState) -> Result<(), String> {
     let config = state.config.lock().await.clone();
-    let (listener, actual_port) = bind_http_listener(&config.http_host, config.http_port).await?;
+    let reserved_fallback_ports = reserved_http_fallback_ports(&config);
+    let (listener, actual_port) = bind_http_listener(
+        &config.http_host,
+        config.http_port,
+        &reserved_fallback_ports,
+    )
+    .await?;
     if actual_port != config.http_port {
         eprintln!(
             "CodexL HTTP port {} is unavailable; using {} instead",
@@ -159,7 +165,20 @@ pub async fn serve(state: AppState) -> Result<(), String> {
     }
 }
 
-async fn bind_http_listener(host: &str, preferred_port: u16) -> Result<(TcpListener, u16), String> {
+fn reserved_http_fallback_ports(config: &AppConfig) -> Vec<u16> {
+    if !(config.extensions.enabled && config.extensions.next_ai_gateway_enabled) {
+        return Vec::new();
+    }
+    gateway_config::gateway_port()
+        .map(|port| vec![port])
+        .unwrap_or_default()
+}
+
+async fn bind_http_listener(
+    host: &str,
+    preferred_port: u16,
+    reserved_fallback_ports: &[u16],
+) -> Result<(TcpListener, u16), String> {
     if preferred_port == 0 {
         let listener = TcpListener::bind((host, 0))
             .await
@@ -173,6 +192,9 @@ async fn bind_http_listener(host: &str, preferred_port: u16) -> Result<(TcpListe
         let Some(port) = preferred_port.checked_add(offset) else {
             break;
         };
+        if offset > 0 && reserved_fallback_ports.contains(&port) {
+            continue;
+        }
         match TcpListener::bind((host, port)).await {
             Ok(listener) => return Ok((listener, port)),
             Err(err) => {
@@ -205,6 +227,15 @@ pub async fn launch_codex_instance(
     requested_config.codex_path = executable.clone();
     let cli_executable = launcher::resolve_codex_cli_executable(None, &executable);
     let profile_config_format = config::codex_profile_config_format_for_cli(&cli_executable);
+    let uses_next_ai_gateway = requested_config.extensions.enabled
+        && requested_config.extensions.next_ai_gateway_enabled
+        && requested_config
+            .provider_profile(&requested_config.active_provider)
+            .map(|profile| profile.provider_name == gateway_config::NEXT_AI_GATEWAY_PROVIDER_NAME)
+            .unwrap_or(false);
+    if uses_next_ai_gateway {
+        gateway_service::ensure_running(state).await?;
+    }
     if request.codex_home.is_none() {
         if let Some(profile) = requested_config.provider_profile(&requested_config.active_provider)
         {
@@ -280,15 +311,6 @@ pub async fn launch_codex_instance(
     let active_core_mode = active_provider_profile
         .as_ref()
         .map(|profile| profile.remote_frontend_mode.as_str());
-    if requested_config.extensions.enabled
-        && requested_config.extensions.next_ai_gateway_enabled
-        && active_provider_profile
-            .as_ref()
-            .map(|profile| profile.provider_name == gateway_config::NEXT_AI_GATEWAY_PROVIDER_NAME)
-            .unwrap_or(false)
-    {
-        gateway_service::ensure_running(state).await?;
-    }
     let active_bot_config =
         if requested_config.extensions.enabled && requested_config.extensions.bot_gateway_enabled {
             active_provider_profile.as_ref().map(|profile| &profile.bot)
@@ -1518,11 +1540,31 @@ mod tests {
         let occupied = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind occupied port");
         let preferred_port = occupied.local_addr().expect("occupied addr").port();
 
-        let (listener, actual_port) = bind_http_listener("127.0.0.1", preferred_port)
+        let (listener, actual_port) = bind_http_listener("127.0.0.1", preferred_port, &[])
             .await
             .expect("bind fallback listener");
 
         assert_ne!(actual_port, preferred_port);
+        assert!(actual_port > preferred_port);
+        drop(listener);
+        drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn bind_http_listener_skips_reserved_fallback_port() {
+        let occupied = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind occupied port");
+        let preferred_port = occupied.local_addr().expect("occupied addr").port();
+        let Some(reserved_port) = preferred_port.checked_add(1) else {
+            return;
+        };
+
+        let (listener, actual_port) =
+            bind_http_listener("127.0.0.1", preferred_port, &[reserved_port])
+                .await
+                .expect("bind fallback listener");
+
+        assert_ne!(actual_port, preferred_port);
+        assert_ne!(actual_port, reserved_port);
         assert!(actual_port > preferred_port);
         drop(listener);
         drop(occupied);

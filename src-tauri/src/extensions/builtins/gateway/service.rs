@@ -1,6 +1,7 @@
 use super::config as gateway_config;
 use crate::config::AppConfig;
 use crate::extensions::{self, BuiltinNodeExtension};
+use crate::launcher;
 use crate::AppState;
 use serde::Serialize;
 use serde_json::Value;
@@ -10,6 +11,7 @@ use std::time::Duration;
 const READINESS_TIMEOUT: Duration = Duration::from_secs(15);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_millis(800);
+const STALE_GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub(crate) struct GatewayServiceHandle {
@@ -53,25 +55,16 @@ pub async fn sync_with_config(
 }
 
 pub async fn ensure_running(state: &AppState) -> Result<GatewayServiceStatus, String> {
+    let app_config = state.config.lock().await.clone();
     let health_url = gateway_config::gateway_health_url()?;
     let auth_probe_url = gateway_config::gateway_agent_tools_url()?;
     if let Some(status) = managed_running_status(state, &health_url, &auth_probe_url).await? {
         return Ok(status);
     }
     if gateway_health_ok(&health_url).await {
-        if !gateway_rejects_unauthenticated(&auth_probe_url).await {
-            return Err(format!(
-                "NeXT AI Gateway is already running at {}, but it does not enforce CodexL authentication. Stop that process or change the Gateway port.",
-                health_url
-            ));
+        if gateway_rejects_unauthenticated(&auth_probe_url).await {
+            return Ok(unmanaged_running_status(&health_url));
         }
-        return Ok(GatewayServiceStatus {
-            running: true,
-            managed: false,
-            pid: None,
-            health_url,
-            message: "running".to_string(),
-        });
     }
 
     let extension =
@@ -79,7 +72,6 @@ pub async fn ensure_running(state: &AppState) -> Result<GatewayServiceStatus, St
             .await
             .map_err(|err| err.to_string())??;
     let config_file = gateway_config::read_gateway_config()?;
-    let app_config = state.config.lock().await.clone();
     let auth_introspection_url = codexl_gateway_auth_introspection_url(&app_config);
     let auth_secret = gateway_config::codex_provider_api_key()?;
     let usage_webhook_url = if gateway_usage_capture_enabled(&config_file.config) {
@@ -95,20 +87,10 @@ pub async fn ensure_running(state: &AppState) -> Result<GatewayServiceStatus, St
     {
         return Ok(status);
     }
-    if gateway_health_ok(&health_url).await {
-        if !gateway_rejects_unauthenticated(&auth_probe_url).await {
-            return Err(format!(
-                "NeXT AI Gateway is already running at {}, but it does not enforce CodexL authentication. Stop that process or change the Gateway port.",
-                health_url
-            ));
-        }
-        return Ok(GatewayServiceStatus {
-            running: true,
-            managed: false,
-            pid: None,
-            health_url,
-            message: "running".to_string(),
-        });
+    if let Some(status) =
+        unmanaged_running_status_or_clear_stale(&health_url, &auth_probe_url).await?
+    {
+        return Ok(status);
     }
 
     let mut handle = start_process(
@@ -148,6 +130,93 @@ pub async fn stop(state: &AppState) -> Result<(), String> {
     let handle = state.gateway_service.lock().await.take();
     drop(handle);
     Ok(())
+}
+
+fn unmanaged_running_status(health_url: &str) -> GatewayServiceStatus {
+    GatewayServiceStatus {
+        running: true,
+        managed: false,
+        pid: None,
+        health_url: health_url.to_string(),
+        message: "running".to_string(),
+    }
+}
+
+async fn unmanaged_running_status_or_clear_stale(
+    health_url: &str,
+    auth_probe_url: &str,
+) -> Result<Option<GatewayServiceStatus>, String> {
+    if !gateway_health_ok(health_url).await {
+        return Ok(None);
+    }
+
+    let Some(status) = gateway_unauthenticated_probe_status(auth_probe_url).await else {
+        return Err(format!(
+            "NeXT AI Gateway is healthy at {}, but CodexL could not verify whether it enforces authentication. Stop that process or change the Gateway port.",
+            health_url
+        ));
+    };
+    if gateway_status_rejects_unauthenticated(status) {
+        return Ok(Some(unmanaged_running_status(health_url)));
+    }
+
+    clear_stale_unauthenticated_gateway(health_url, auth_probe_url).await?;
+    Ok(None)
+}
+
+async fn clear_stale_unauthenticated_gateway(
+    health_url: &str,
+    auth_probe_url: &str,
+) -> Result<(), String> {
+    if let Some(port) = gateway_port_from_url(health_url) {
+        let stopped = tokio::task::spawn_blocking(move || {
+            launcher::stop_next_ai_gateway_processes_for_port(port)
+        })
+        .await
+        .map_err(|err| err.to_string())?
+        .unwrap_or(false);
+        if stopped && wait_until_gateway_cleared_or_authenticated(health_url, auth_probe_url).await
+        {
+            return Ok(());
+        }
+    }
+
+    if gateway_is_next_ai_gateway(health_url).await {
+        tokio::task::spawn_blocking(launcher::stop_next_ai_gateway_processes)
+            .await
+            .map_err(|err| err.to_string())??;
+        if wait_until_gateway_cleared_or_authenticated(health_url, auth_probe_url).await {
+            return Ok(());
+        }
+    }
+
+    Err(format!(
+        "{} CodexL tried to stop stale NeXT AI Gateway processes, but the Gateway at this port is still unauthenticated.",
+        unauthenticated_gateway_error(health_url)
+    ))
+}
+
+async fn wait_until_gateway_cleared_or_authenticated(
+    health_url: &str,
+    auth_probe_url: &str,
+) -> bool {
+    let started_at = std::time::Instant::now();
+    while started_at.elapsed() < STALE_GATEWAY_STOP_TIMEOUT {
+        if !gateway_health_ok(health_url).await
+            || gateway_rejects_unauthenticated(auth_probe_url).await
+        {
+            return true;
+        }
+        tokio::time::sleep(READINESS_POLL_INTERVAL).await;
+    }
+    false
+}
+
+fn unauthenticated_gateway_error(health_url: &str) -> String {
+    format!(
+        "NeXT AI Gateway is already running at {}, but it does not enforce CodexL authentication. Stop that process or change the Gateway port.",
+        health_url
+    )
 }
 
 async fn managed_running_status(
@@ -329,6 +398,47 @@ async fn wait_until_ready(handle: &mut GatewayServiceHandle) -> Result<(), Strin
     ))
 }
 
+async fn gateway_is_next_ai_gateway(health_url: &str) -> bool {
+    let Some(root_url) = gateway_root_url_from_health_url(health_url) else {
+        return false;
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(HEALTH_REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+
+    let response = match client.get(root_url).send().await {
+        Ok(response) if response.status().is_success() => response,
+        _ => return false,
+    };
+    let payload = match response.json::<Value>().await {
+        Ok(payload) => payload,
+        Err(_) => return false,
+    };
+
+    payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(|name| name == "next-ai-gateway")
+        .unwrap_or(false)
+}
+
+fn gateway_root_url_from_health_url(health_url: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(health_url).ok()?;
+    url.set_path("/");
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
+fn gateway_port_from_url(url: &str) -> Option<u16> {
+    let url = reqwest::Url::parse(url).ok()?;
+    url.port_or_known_default()
+}
+
 async fn gateway_health_ok(url: &str) -> bool {
     let client = match reqwest::Client::builder()
         .timeout(HEALTH_REQUEST_TIMEOUT)
@@ -347,23 +457,61 @@ async fn gateway_health_ok(url: &str) -> bool {
 }
 
 async fn gateway_rejects_unauthenticated(url: &str) -> bool {
+    gateway_unauthenticated_probe_status(url)
+        .await
+        .map(gateway_status_rejects_unauthenticated)
+        .unwrap_or(false)
+}
+
+async fn gateway_unauthenticated_probe_status(url: &str) -> Option<reqwest::StatusCode> {
     let client = match reqwest::Client::builder()
         .timeout(HEALTH_REQUEST_TIMEOUT)
         .build()
     {
         Ok(client) => client,
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
     client
         .get(url)
         .send()
         .await
-        .map(|response| {
-            matches!(
-                response.status(),
-                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-            )
-        })
-        .unwrap_or(false)
+        .map(|response| response.status())
+        .ok()
+}
+
+fn gateway_status_rejects_unauthenticated(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_root_url_from_health_url_normalizes_to_origin_root() {
+        assert_eq!(
+            gateway_root_url_from_health_url("http://127.0.0.1:14589/health").as_deref(),
+            Some("http://127.0.0.1:14589/")
+        );
+        assert_eq!(
+            gateway_root_url_from_health_url("http://[::1]:14589/health?probe=1").as_deref(),
+            Some("http://[::1]:14589/")
+        );
+    }
+
+    #[test]
+    fn gateway_port_from_url_reads_explicit_and_known_default_ports() {
+        assert_eq!(
+            gateway_port_from_url("http://127.0.0.1:14589/health"),
+            Some(14589)
+        );
+        assert_eq!(
+            gateway_port_from_url("https://example.test/health"),
+            Some(443)
+        );
+    }
 }

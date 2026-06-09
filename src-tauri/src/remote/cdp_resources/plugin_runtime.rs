@@ -1219,7 +1219,7 @@ fn safe_relative_path(value: &str) -> Option<PathBuf> {
 
 const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   const RUNTIME_VERSION = "__CODEXL_PLUGIN_RUNTIME_VERSION__";
-  const RUNTIME_BUILD = "mobile-touch-react-surfaces-model-submenu-overlay";
+  const RUNTIME_BUILD = "settings-nav-shell-gated-fallback";
   const BRIDGE_URL = "__CODEXL_PLUGIN_BRIDGE_URL__";
   const ROOT_ID = "codexl-plugin-runtime-root";
   const CORE_PLUGIN_ID = "codexl.core";
@@ -1228,10 +1228,11 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   const SETTINGS_STYLE_ID = "codexl-plugin-global-style";
   const SETTINGS_NAV_ATTR = "data-codexl-settings-nav";
   const SETTINGS_PANEL_ATTR = "data-codexl-settings-panel";
+  const SETTINGS_FALLBACK_CONTENT_ATTR = "data-codexl-settings-fallback-content";
   const CONTEXT_INDICATOR_ID = "codexl-context-indicator";
   const CONTEXT_TOOLTIP_ID = "codexl-context-indicator-tooltip";
-  const SETTINGS_REFRESH_BURST_DELAYS_MS = [0, 120, 360, 900, 1800];
-  const SETTINGS_INTERACTION_SCAN_WINDOW_MS = 4500;
+  const SETTINGS_REFRESH_BURST_DELAYS_MS = [0, 120, 360, 900, 1800, 3200, 5200];
+  const SETTINGS_INTERACTION_SCAN_WINDOW_MS = 7000;
   const CONTEXT_INDICATOR_BURST_DELAYS_MS = [0, 150, 500, 1200];
   const existing = window.__codexlPluginRuntime;
   if (existing && existing.version === RUNTIME_VERSION && existing.build === RUNTIME_BUILD) {
@@ -3324,6 +3325,14 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
         position: absolute;
         z-index: 20;
       }
+      [${SETTINGS_FALLBACK_CONTENT_ATTR}="1"] {
+        background: var(--color-main-surface-primary, Canvas);
+        box-sizing: border-box;
+        color: inherit;
+        overflow: hidden;
+        position: absolute;
+        z-index: 19;
+      }
       #${CONTEXT_INDICATOR_ID} {
         align-items: center;
         background: transparent;
@@ -3783,49 +3792,87 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     "Appshots",
     "Apps",
     "Archived chats",
+    "Audio",
     "Back to app",
+    "Billing",
     "Browser",
     "Computer use",
     "Configuration",
+    "Connected apps",
     "Connections",
+    "Connectors",
+    "Customization",
     "Data controls",
     "Developer",
     "Environments",
     "Git",
     "General",
     "Hooks",
+    "Integrations",
     "Keyboard shortcuts",
+    "Language",
     "MCP",
     "MCP servers",
     "Memory",
     "Model",
     "Notifications",
     "Personalization",
+    "Preferences",
     "Plugins",
+    "Plan",
+    "Projects",
     "Privacy",
     "Profile",
+    "Security",
     "Settings",
+    "Speech",
+    "Subscription",
+    "Team",
+    "Voice",
     "Usage",
+    "Workspace",
+    "Workspaces",
     "Worktrees",
     "\u5e38\u89c4",
     "\u8d26\u6237",
     "\u5916\u89c2",
     "\u901a\u77e5",
+    "\u97f3\u9891",
+    "\u8d26\u5355",
+    "\u8fde\u63a5\u5668",
+    "\u81ea\u5b9a\u4e49",
     "\u6570\u636e\u63a7\u4ef6",
     "\u5f00\u53d1\u8005",
     "\u9ad8\u7ea7",
     "\u4f7f\u7528\u60c5\u51b5",
     "\u6a21\u578b",
     "\u5e94\u7528",
+    "\u96c6\u6210",
+    "\u8bed\u8a00",
     "\u63d2\u4ef6",
+    "\u8ba1\u5212",
+    "\u9879\u76ee",
     "\u9690\u79c1",
+    "\u504f\u597d\u8bbe\u7f6e",
+    "\u5b89\u5168",
     "\u8bbe\u7f6e",
+    "\u8bed\u97f3",
+    "\u8ba2\u9605",
+    "\u56e2\u961f",
+    "\u5de5\u4f5c\u533a",
     "\u8bb0\u5fc6",
   ]);
 
   const SETTINGS_LABELS_BY_LOWERCASE = new Map(
     Array.from(SETTINGS_NAV_LABELS).map((label) => [label.toLowerCase(), label])
   );
+  const SETTINGS_NAV_NON_CONTENT_LABELS = new Set([
+    "Back to app",
+    "Preferences",
+    "Settings",
+    "\u504f\u597d\u8bbe\u7f6e",
+    "\u8bbe\u7f6e",
+  ]);
 
   function isSettingsNavText(text) {
     const value = text.replace(/\s+/g, " ").trim();
@@ -3860,12 +3907,12 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
 
   function isSettingsRoute() {
     const locationText = `${window.location.pathname} ${window.location.search} ${window.location.hash}`.toLowerCase();
-    return locationText.includes("settings");
+    return locationText.includes("settings") || locationText.includes("preferences");
   }
 
   function isSettingsHeadingText(text) {
     const value = (text || "").replace(/\s+/g, " ").trim();
-    return value === "Settings" || value === "\u8bbe\u7f6e";
+    return value === "Settings" || value === "Preferences" || value === "\u8bbe\u7f6e" || value === "\u504f\u597d\u8bbe\u7f6e";
   }
 
   function hasSettingsHeading(root) {
@@ -3948,16 +3995,93 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   }
 
   const SETTINGS_PAGE_SIGNATURE_LABELS = new Set([
+    "Account",
+    "Advanced",
+    "Appearance",
+    "Apps",
     "Appshots",
     "Archived chats",
+    "Audio",
+    "Billing",
     "Configuration",
+    "Connected apps",
     "Connections",
+    "Connectors",
+    "Customization",
+    "Data controls",
+    "Developer",
     "Environments",
     "Git",
+    "General",
     "Hooks",
+    "Integrations",
+    "Keyboard shortcuts",
+    "Language",
+    "MCP",
     "MCP servers",
+    "Memory",
+    "Model",
+    "Notifications",
     "Personalization",
+    "Preferences",
+    "Plugins",
+    "Plan",
+    "Privacy",
+    "Profile",
+    "Projects",
+    "Security",
+    "Settings",
+    "Speech",
+    "Subscription",
+    "Team",
+    "Usage",
+    "Voice",
+    "Workspace",
+    "Workspaces",
     "Worktrees",
+    "\u5e38\u89c4",
+    "\u8d26\u6237",
+    "\u5916\u89c2",
+    "\u901a\u77e5",
+    "\u97f3\u9891",
+    "\u8d26\u5355",
+    "\u8fde\u63a5\u5668",
+    "\u81ea\u5b9a\u4e49",
+    "\u6570\u636e\u63a7\u4ef6",
+    "\u5f00\u53d1\u8005",
+    "\u9ad8\u7ea7",
+    "\u4f7f\u7528\u60c5\u51b5",
+    "\u6a21\u578b",
+    "\u5e94\u7528",
+    "\u96c6\u6210",
+    "\u8bed\u8a00",
+    "\u63d2\u4ef6",
+    "\u8ba1\u5212",
+    "\u9879\u76ee",
+    "\u9690\u79c1",
+    "\u504f\u597d\u8bbe\u7f6e",
+    "\u5b89\u5168",
+    "\u8bbe\u7f6e",
+    "\u8bed\u97f3",
+    "\u8ba2\u9605",
+    "\u56e2\u961f",
+    "\u5de5\u4f5c\u533a",
+    "\u8bb0\u5fc6",
+  ]);
+  const SETTINGS_PAGE_AMBIGUOUS_SIGNATURE_LABELS = new Set([
+    "Apps",
+    "Archived chats",
+    "Back to app",
+    "Preferences",
+    "Projects",
+    "Settings",
+    "Workspace",
+    "Workspaces",
+    "\u504f\u597d\u8bbe\u7f6e",
+    "\u5de5\u4f5c\u533a",
+    "\u5e94\u7528",
+    "\u8bbe\u7f6e",
+    "\u9879\u76ee",
   ]);
 
   function settingsLabelSet(root) {
@@ -3971,11 +4095,27 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   function settingsMenuSignatureScore(labels) {
     let score = 0;
     for (const label of SETTINGS_PAGE_SIGNATURE_LABELS) {
-      if (labels.has(label)) {
+      if (labels.has(label) && !SETTINGS_PAGE_AMBIGUOUS_SIGNATURE_LABELS.has(label)) {
         score += 1;
       }
     }
     return score;
+  }
+
+  function settingsMenuLooksLikeSettings(labels, { loose = false } = {}) {
+    const signatureScore = settingsMenuSignatureScore(labels);
+    if (loose) {
+      return labels.size >= 3 && signatureScore >= 2;
+    }
+    return labels.size >= 5 && signatureScore >= 3;
+  }
+
+  function looseSettingsNavScanAllowed() {
+    return (
+      isSettingsRoute() ||
+      hasSettingsHeading(document) ||
+      hasCodexLSettingsInjection()
+    );
   }
 
   function isPlausibleSettingsNavContainer(candidate) {
@@ -3984,14 +4124,22 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     }
     const rect = candidate.getBoundingClientRect();
     const labels = settingsLabelSet(candidate);
-    if (labels.size < 8 || settingsMenuSignatureScore(labels) < 5) {
+    const semanticNav = candidate.matches('nav, aside, [role="tablist"], [role="menu"]');
+    const loose = looseSettingsNavScanAllowed();
+    if (!settingsMenuLooksLikeSettings(labels, { loose })) {
       return false;
     }
     const leftSideLimit = Math.max(360, window.innerWidth * 0.35);
-    if (rect.left > leftSideLimit) {
+    if (rect.left > leftSideLimit && !(loose && semanticNav)) {
       return false;
     }
-    if (rect.width > 420 || rect.height < 180) {
+    const maxWidth = loose && semanticNav
+      ? Math.max(420, window.innerWidth - 24)
+      : loose
+        ? Math.max(420, Math.min(window.innerWidth - 24, 560))
+        : 420;
+    const minHeight = loose && semanticNav ? 40 : loose ? 96 : 180;
+    if (rect.width > maxWidth || rect.height < minHeight) {
       return false;
     }
     return true;
@@ -4067,7 +4215,9 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     const routeLooksLikeSettings = isSettingsRoute();
     const documentSettingsLabels = settingsLabelSet(document);
     const documentLooksLikeSettingsMenu =
-      settingsMenuSignatureScore(documentSettingsLabels) >= 5;
+      settingsMenuLooksLikeSettings(documentSettingsLabels, {
+        loose: looseSettingsNavScanAllowed(),
+      });
     if (!routeLooksLikeSettings && !hasSettingsHeading(document) && !documentLooksLikeSettingsMenu) {
       settingsDebugLog(
         "settings shell rejected at document gate",
@@ -4103,10 +4253,10 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       const labels = settingsLabelSet(element);
       const labelCount = labels.size;
       return (
-        labelCount >= 3 &&
+        labelCount >= (routeLooksLikeSettings ? 2 : 3) &&
         (routeLooksLikeSettings ||
           hasSettingsHeading(element) ||
-          settingsMenuSignatureScore(labels) >= 5)
+          settingsMenuLooksLikeSettings(labels, { loose: true }))
       );
     });
     runtime.lastSettingsShellCandidateDiagnostics = candidates.slice(0, 12).map((candidate) => ({
@@ -4381,6 +4531,17 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     return item;
   }
 
+  function settingsNavInsertionReferenceItem(items) {
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      const label = settingsLabelForText(normalizedText(item));
+      if (!SETTINGS_NAV_NON_CONTENT_LABELS.has(label)) {
+        return item;
+      }
+    }
+    return items[items.length - 1] || null;
+  }
+
   function ensureSettingsNavItem(nav) {
     let item = nav.querySelector(`[${SETTINGS_NAV_ATTR}="1"]`);
     if (item) {
@@ -4397,7 +4558,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       return item;
     }
     const items = settingsNavItemElements(nav);
-    const referenceItem = items[items.length - 1] || settingsInteractiveItems(nav)[0];
+    const referenceItem = settingsNavInsertionReferenceItem(items) || settingsInteractiveItems(nav)[0];
     if (!referenceItem) {
       settingsDebugLog(
         "CodexL settings nav insert failed: no reference item",
@@ -4472,6 +4633,43 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     return candidates[0] || null;
   }
 
+  function ensureSettingsContentFallback(shell, nav) {
+    if (!(shell instanceof Element) || !(nav instanceof Element)) {
+      return null;
+    }
+    const shellRect = shell.getBoundingClientRect();
+    const navRect = nav.getBoundingClientRect();
+    if (shellRect.width < 320 || shellRect.height < 220) {
+      return null;
+    }
+    if (window.getComputedStyle(shell).position === "static") {
+      shell.dataset.codexlSettingsPosition = "1";
+      shell.dataset.codexlOriginalPosition = shell.style.position || "";
+      shell.style.position = "relative";
+    }
+    let content = shell.querySelector(`[${SETTINGS_FALLBACK_CONTENT_ATTR}="1"]`);
+    if (!content) {
+      content = document.createElement("section");
+      content.setAttribute(SETTINGS_FALLBACK_CONTENT_ATTR, "1");
+      shell.appendChild(content);
+    }
+    const horizontalNav = navRect.width >= shellRect.width * 0.55 && navRect.height <= 160;
+    const left = horizontalNav ? 0 : Math.max(0, Math.round(navRect.right - shellRect.left));
+    const top = horizontalNav ? Math.max(0, Math.round(navRect.bottom - shellRect.top)) : 0;
+    content.hidden = false;
+    content.style.left = `${left}px`;
+    content.style.top = `${top}px`;
+    content.style.right = "0";
+    content.style.bottom = "0";
+    settingsDebugLog("using CodexL settings content fallback", {
+      content: elementDebugSummary(content),
+      horizontalNav,
+      nav: elementDebugSummary(nav),
+      shell: elementDebugSummary(shell),
+    }, "info", { emit: false });
+    return content;
+  }
+
   function renderCodexLSettingsPanel(panel) {
     panel.className = "codexl-settings-panel scrollbar-stable p-panel";
     panel.setAttribute(SETTINGS_PANEL_ATTR, "1");
@@ -4543,7 +4741,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     }
     removeMisplacedSettingsNavItems(nav);
     const navItem = ensureSettingsNavItem(nav);
-    const content = findSettingsContent(effectiveShell, nav);
+    const content = findSettingsContent(effectiveShell, nav) || ensureSettingsContentFallback(effectiveShell, nav);
     if (!navItem || !content) {
       return;
     }
@@ -4570,6 +4768,11 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       .querySelectorAll(`[${SETTINGS_PANEL_ATTR}="1"]`)
       .forEach((panel) => {
         panel.hidden = true;
+      });
+    document
+      .querySelectorAll(`[${SETTINGS_FALLBACK_CONTENT_ATTR}="1"]`)
+      .forEach((content) => {
+        content.hidden = true;
       });
     document
       .querySelectorAll(`[${SETTINGS_NAV_ATTR}="1"]`)
@@ -4617,6 +4820,9 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     document
       .querySelectorAll(`[${SETTINGS_PANEL_ATTR}="1"]`)
       .forEach((panel) => panel.remove());
+    document
+      .querySelectorAll(`[${SETTINGS_FALLBACK_CONTENT_ATTR}="1"]`)
+      .forEach((content) => content.remove());
     document
       .querySelectorAll('[data-codexl-settings-position="1"]')
       .forEach((content) => {
@@ -4757,7 +4963,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
 
   function targetLooksLikeSettingsTrigger(target) {
     const text = settingsTriggerText(target);
-    return /\bsettings\b|\u8bbe\u7f6e/.test(text);
+    return /\b(settings|preferences)\b|\u8bbe\u7f6e|\u504f\u597d\u8bbe\u7f6e/.test(text);
   }
 
   function refreshCodexLSettingsNav({ diagnostics = false, force = false } = {}) {
@@ -6127,6 +6333,12 @@ mod tests {
         assert!(script.contains("tokenUsageInfo"));
         assert!(script.contains("threadIdFromLocation"));
         assert!(script.contains("scheduleSettingsRefreshBurst"));
+        assert!(script.contains("settings-nav-shell-gated-fallback"));
+        assert!(script.contains("SETTINGS_FALLBACK_CONTENT_ATTR"));
+        assert!(script.contains("ensureSettingsContentFallback"));
+        assert!(script.contains("settingsMenuLooksLikeSettings"));
+        assert!(script.contains("Preferences"));
+        assert!(script.contains("preferences"));
         assert!(script.contains("syncContextIndicator"));
         assert!(script.contains("toLocaleString(\"en-US\")"));
         assert!(script.contains("data-codexl-context-title"));
@@ -6135,7 +6347,7 @@ mod tests {
         assert!(script.contains("clearActiveContextUsage"));
         assert!(script.contains("clearActiveContextUsage(\"thread-start\")"));
         assert!(script.contains("const usage = runtime.contextUsageByThread.get(threadId) || null"));
-        assert!(script.contains("mobile-touch-react-surfaces-model-submenu-overlay"));
+        assert!(script.contains("settings-nav-shell-gated-fallback"));
         assert!(script.contains("installMobileSidebarTriggerTouchGuard"));
         assert!(script.contains("installReactHook();\n  installMobileSidebarTriggerTouchGuard();"));
         assert!(script.contains("scheduleMobileTouchReactSurfaceSync(root);"));
