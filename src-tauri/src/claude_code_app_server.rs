@@ -5,8 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -1194,7 +1192,6 @@ struct TurnWork {
     thread_id: String,
     turn_id: String,
     agent_item_id: String,
-    cli_item_id: String,
     claude_session_id: String,
     cwd: String,
     prompt: String,
@@ -6498,7 +6495,6 @@ impl ClaudeAppServerState {
         let turn_id = turn.id.clone();
         let user_item = turn.user_item_json();
         let agent_item_id = agent_item_id_for_turn(&turn_id);
-        let cli_item_id = cli_item_id_for_turn(&turn_id);
         let response_turn = turn.to_json(false);
         let instruction_context = claude_thread_instruction_context(thread);
         thread.updated_at = now;
@@ -6507,7 +6503,6 @@ impl ClaudeAppServerState {
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
             agent_item_id,
-            cli_item_id,
             claude_session_id: thread.claude_session_id.clone(),
             cwd: thread.cwd.clone(),
             prompt,
@@ -8705,34 +8700,6 @@ fn read_claude_transcript_tail(path: &Path, max_bytes: u64) -> Option<String> {
 
 fn strip_local_thread_prefix(thread_id: &str) -> &str {
     thread_id.strip_prefix("local:").unwrap_or(thread_id)
-}
-
-fn load_claude_threads(workspace_name: Option<String>) -> BTreeMap<String, ClaudeThread> {
-    let mut threads = BTreeMap::new();
-    let mut generated_titles = Vec::new();
-    for path in claude_transcript_files() {
-        if let Some(generated_title) = load_claude_generated_title_from_transcript_path(&path) {
-            generated_titles.push(generated_title);
-            continue;
-        }
-        if let Some(thread) = load_claude_thread_from_transcript_path(&path, workspace_name.clone())
-        {
-            threads
-                .entry(thread.id.clone())
-                .and_modify(|existing: &mut ClaudeThread| {
-                    if thread.updated_at > existing.updated_at {
-                        *existing = thread.clone();
-                    }
-                })
-                .or_insert(thread);
-        }
-    }
-    apply_generated_titles_to_claude_threads(
-        &mut threads,
-        &generated_titles,
-        workspace_name.as_deref(),
-    );
-    threads
 }
 
 fn load_claude_thread_from_transcript_path(
@@ -13704,860 +13671,6 @@ fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
-#[cfg(not(unix))]
-fn run_claude_code_turn_piped<W>(
-    mut command: Command,
-    work: &TurnWork,
-    state: SharedState,
-    output: SharedOutput<W>,
-    started: Instant,
-) -> ClaudeRunResult
-where
-    W: Write,
-{
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            return ClaudeRunResult {
-                text: String::new(),
-                error: Some(format!("failed to launch Claude Code: {}", err)),
-                duration_ms: elapsed_millis(started),
-                tool_items: Vec::new(),
-                agent_item_streamed: false,
-                latest_token_usage_info: None,
-            };
-        }
-    };
-    emit_command_execution_started(&output, work, Some(child.id()));
-    if let Ok(mut state) = lock_state(&state) {
-        state
-            .active_processes
-            .insert((work.thread_id.clone(), work.turn_id.clone()), child.id());
-    }
-
-    let mut child_stdin = match child.stdin.take() {
-        Some(stdin) => stdin,
-        None => {
-            terminate_process_group(child.id());
-            let _ = child.wait();
-            if let Ok(mut state) = lock_state(&state) {
-                state
-                    .active_processes
-                    .remove(&(work.thread_id.clone(), work.turn_id.clone()));
-            }
-            return ClaudeRunResult {
-                text: String::new(),
-                error: Some("failed to open Claude Code stdin".to_string()),
-                duration_ms: elapsed_millis(started),
-                tool_items: Vec::new(),
-                agent_item_streamed: false,
-                latest_token_usage_info: None,
-            };
-        }
-    };
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            terminate_process_group(child.id());
-            let _ = child.wait();
-            if let Ok(mut state) = lock_state(&state) {
-                state
-                    .active_processes
-                    .remove(&(work.thread_id.clone(), work.turn_id.clone()));
-            }
-            return ClaudeRunResult {
-                text: String::new(),
-                error: Some("failed to capture Claude Code stdout".to_string()),
-                duration_ms: elapsed_millis(started),
-                tool_items: Vec::new(),
-                agent_item_streamed: false,
-                latest_token_usage_info: None,
-            };
-        }
-    };
-    let stderr_handle = child.stderr.take().map(|stderr| {
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut text = String::new();
-            let _ = reader.read_to_string(&mut text);
-            text
-        })
-    });
-
-    if let Err(err) = child_stdin
-        .write_all(work.prompt.as_bytes())
-        .and_then(|_| child_stdin.write_all(b"\n"))
-        .and_then(|_| child_stdin.flush())
-    {
-        terminate_process_group(child.id());
-        let _ = child.wait();
-        if let Ok(mut state) = lock_state(&state) {
-            state
-                .active_processes
-                .remove(&(work.thread_id.clone(), work.turn_id.clone()));
-        }
-        return ClaudeRunResult {
-            text: String::new(),
-            error: Some(format!(
-                "failed to write prompt to Claude Code stdin: {}",
-                err
-            )),
-            duration_ms: elapsed_millis(started),
-            tool_items: Vec::new(),
-            agent_item_streamed: false,
-            latest_token_usage_info: None,
-        };
-    }
-    drop(child_stdin);
-
-    let mut emitted_text = String::new();
-    let mut agent_item_started = false;
-    let mut command_output = String::new();
-    let mut raw_stdout = String::new();
-    let mut reader = stdout;
-    let mut buffer = [0u8; 4096];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(size) => {
-                let chunk = String::from_utf8_lossy(&buffer[..size]).to_string();
-                raw_stdout.push_str(&chunk);
-                emit_command_execution_output_delta(
-                    &output,
-                    &work.thread_id,
-                    &work.turn_id,
-                    &work.cli_item_id,
-                    &chunk,
-                    &work.prompt,
-                    &mut command_output,
-                );
-                let text = clean_interactive_cli_output(&raw_stdout, &work.prompt);
-                emit_agent_delta(
-                    &output,
-                    &work.thread_id,
-                    &work.turn_id,
-                    &work.agent_item_id,
-                    &mut agent_item_started,
-                    &mut emitted_text,
-                    &text,
-                );
-            }
-            Err(err) => {
-                terminate_process_group(child.id());
-                let _ = child.wait();
-                if let Ok(mut state) = lock_state(&state) {
-                    state
-                        .active_processes
-                        .remove(&(work.thread_id.clone(), work.turn_id.clone()));
-                }
-                let agent_item_streamed = !emitted_text.is_empty();
-                return ClaudeRunResult {
-                    text: emitted_text,
-                    error: Some(format!("failed to read Claude Code stdout: {}", err)),
-                    duration_ms: elapsed_millis(started),
-                    tool_items: Vec::new(),
-                    agent_item_streamed,
-                    latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
-                };
-            }
-        }
-    }
-
-    let status = child.wait();
-    if let Ok(mut state) = lock_state(&state) {
-        state
-            .active_processes
-            .remove(&(work.thread_id.clone(), work.turn_id.clone()));
-    }
-    let stderr = stderr_handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let cleaned_stdout = clean_interactive_cli_output(&raw_stdout, &work.prompt);
-    let cleaned_stderr = clean_interactive_cli_output(&stderr, &work.prompt);
-    let final_text = latest_claude_transcript_assistant_text(work).unwrap_or_else(|| {
-        if !cleaned_stdout.is_empty() {
-            cleaned_stdout.clone()
-        } else if !cleaned_stderr.is_empty() {
-            cleaned_stderr.clone()
-        } else {
-            emitted_text.clone()
-        }
-    });
-    if emitted_text.is_empty() && !final_text.is_empty() {
-        emit_agent_delta(
-            &output,
-            &work.thread_id,
-            &work.turn_id,
-            &work.agent_item_id,
-            &mut agent_item_started,
-            &mut emitted_text,
-            &final_text,
-        );
-    }
-
-    let agent_item_streamed = !emitted_text.is_empty();
-    let duration_ms = elapsed_millis(started);
-    match status {
-        Ok(status) => {
-            emit_command_execution_completed(
-                &output,
-                work,
-                Some(child.id()),
-                status.success(),
-                &command_output,
-                status.code(),
-                duration_ms,
-            );
-            if status.success() {
-                ClaudeRunResult {
-                    text: if emitted_text.is_empty() {
-                        final_text
-                    } else {
-                        emitted_text
-                    },
-                    error: None,
-                    duration_ms,
-                    tool_items: Vec::new(),
-                    agent_item_streamed,
-                    latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
-                }
-            } else {
-                ClaudeRunResult {
-                    text: emitted_text,
-                    error: Some(non_empty_join(
-                        &[
-                            format!("Claude Code exited with status {}", status),
-                            cleaned_stderr,
-                            final_text,
-                        ],
-                        "\n",
-                    )),
-                    duration_ms,
-                    tool_items: Vec::new(),
-                    agent_item_streamed,
-                    latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
-                }
-            }
-        }
-        Err(err) => {
-            emit_command_execution_completed(
-                &output,
-                work,
-                Some(child.id()),
-                false,
-                &command_output,
-                None,
-                duration_ms,
-            );
-            ClaudeRunResult {
-                text: emitted_text,
-                error: Some(format!("failed to wait for Claude Code: {}", err)),
-                duration_ms,
-                tool_items: Vec::new(),
-                agent_item_streamed,
-                latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn run_claude_code_turn_pty<W>(
-    mut command: Command,
-    work: &TurnWork,
-    state: SharedState,
-    output: SharedOutput<W>,
-    started: Instant,
-) -> ClaudeRunResult
-where
-    W: Write,
-{
-    let (mut master, slave) = match open_unix_pty() {
-        Ok(pair) => pair,
-        Err(err) => return run_claude_code_turn_piped(command, work, state, output, started, err),
-    };
-
-    let stdin = match slave.try_clone() {
-        Ok(file) => file,
-        Err(err) => return run_claude_code_turn_piped(command, work, state, output, started, err),
-    };
-    let stdout = match slave.try_clone() {
-        Ok(file) => file,
-        Err(err) => return run_claude_code_turn_piped(command, work, state, output, started, err),
-    };
-    let stderr = match slave.try_clone() {
-        Ok(file) => file,
-        Err(err) => return run_claude_code_turn_piped(command, work, state, output, started, err),
-    };
-
-    unsafe {
-        command
-            .stdin(Stdio::from(stdin))
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .pre_exec(|| {
-                for signo in [
-                    libc::SIGCHLD,
-                    libc::SIGHUP,
-                    libc::SIGINT,
-                    libc::SIGQUIT,
-                    libc::SIGTERM,
-                    libc::SIGALRM,
-                ] {
-                    libc::signal(signo, libc::SIG_DFL);
-                }
-
-                let empty_set: libc::sigset_t = std::mem::zeroed();
-                libc::sigprocmask(libc::SIG_SETMASK, &empty_set, std::ptr::null_mut());
-
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-
-                #[allow(clippy::cast_lossless)]
-                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-    }
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            return ClaudeRunResult {
-                text: String::new(),
-                error: Some(format!("failed to launch Claude Code: {}", err)),
-                duration_ms: elapsed_millis(started),
-                tool_items: Vec::new(),
-                agent_item_streamed: false,
-                latest_token_usage_info: None,
-            };
-        }
-    };
-    drop(slave);
-
-    emit_command_execution_started(&output, work, Some(child.id()));
-    if let Ok(mut state) = lock_state(&state) {
-        state
-            .active_processes
-            .insert((work.thread_id.clone(), work.turn_id.clone()), child.id());
-    }
-
-    let mut writer = match master.try_clone() {
-        Ok(file) => file,
-        Err(err) => {
-            terminate_process_group(child.id());
-            let _ = child.wait();
-            remove_active_process(&state, work);
-            return ClaudeRunResult {
-                text: String::new(),
-                error: Some(format!("failed to clone Claude Code PTY: {}", err)),
-                duration_ms: elapsed_millis(started),
-                tool_items: Vec::new(),
-                agent_item_streamed: false,
-                latest_token_usage_info: None,
-            };
-        }
-    };
-
-    if let Err(err) = set_nonblocking(master.as_raw_fd()) {
-        terminate_process_group(child.id());
-        let _ = child.wait();
-        remove_active_process(&state, work);
-        return ClaudeRunResult {
-            text: String::new(),
-            error: Some(format!("failed to configure Claude Code PTY: {}", err)),
-            duration_ms: elapsed_millis(started),
-            tool_items: Vec::new(),
-            agent_item_streamed: false,
-            latest_token_usage_info: None,
-        };
-    }
-
-    let idle_timeout = claude_turn_idle_timeout();
-    let mut exit_requested_at: Option<Instant> = None;
-    let mut last_meaningful_output_at = Instant::now();
-    let mut trust_confirmed = false;
-    let mut trust_confirmed_at: Option<Instant> = None;
-    let mut prompt_sent = false;
-    let mut saw_turn_content = false;
-    let mut last_raw_output_at = Instant::now();
-    let mut raw_output = String::new();
-    let mut command_output = String::new();
-    let mut buffer = [0u8; 4096];
-    let status = loop {
-        match master.read(&mut buffer) {
-            Ok(0) => {
-                if let Ok(Some(exit_status)) = child.try_wait() {
-                    break Some(exit_status);
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-            Ok(size) => {
-                let chunk = String::from_utf8_lossy(&buffer[..size]).to_string();
-                last_raw_output_at = Instant::now();
-                raw_output.push_str(&chunk);
-                if !trust_confirmed && looks_like_claude_trust_prompt(&raw_output) {
-                    if let Err(err) = writer.write_all(b"\r").and_then(|_| writer.flush()) {
-                        terminate_process_group(child.id());
-                        let _ = child.wait();
-                        remove_active_process(&state, work);
-                        return ClaudeRunResult {
-                            text: String::new(),
-                            error: Some(format!(
-                                "failed to write prompt to Claude Code PTY: {}",
-                                err
-                            )),
-                            duration_ms: elapsed_millis(started),
-                            tool_items: Vec::new(),
-                            agent_item_streamed: false,
-                            latest_token_usage_info: None,
-                        };
-                    }
-                    trust_confirmed = true;
-                    trust_confirmed_at = Some(Instant::now());
-                }
-                let emitted = emit_command_execution_output_delta(
-                    &output,
-                    &work.thread_id,
-                    &work.turn_id,
-                    &work.cli_item_id,
-                    &chunk,
-                    &work.prompt,
-                    &mut command_output,
-                );
-                if emitted && prompt_sent {
-                    saw_turn_content = true;
-                    last_meaningful_output_at = Instant::now();
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                if let Ok(Some(exit_status)) = child.try_wait() {
-                    break Some(exit_status);
-                }
-                match exit_requested_at {
-                    Some(requested_at)
-                        if requested_at.elapsed() >= Duration::from_millis(1_200) =>
-                    {
-                        terminate_process_group(child.id());
-                        break child.wait().ok();
-                    }
-                    Some(_) => {}
-                    None if !prompt_sent
-                        && should_send_prompt_to_claude(
-                            started,
-                            trust_confirmed_at,
-                            &raw_output,
-                            last_raw_output_at,
-                        ) =>
-                    {
-                        match writer
-                            .write_all(b"\x1b[200~")
-                            .and_then(|_| writer.write_all(work.prompt.as_bytes()))
-                            .and_then(|_| writer.write_all(b"\x1b[201~\r"))
-                            .and_then(|_| writer.flush())
-                        {
-                            Ok(()) => {
-                                prompt_sent = true;
-                                last_meaningful_output_at = Instant::now();
-                            }
-                            Err(err) => {
-                                terminate_process_group(child.id());
-                                let _ = child.wait();
-                                remove_active_process(&state, work);
-                                emit_command_execution_completed(
-                                    &output,
-                                    work,
-                                    Some(child.id()),
-                                    false,
-                                    &command_output,
-                                    None,
-                                    elapsed_millis(started),
-                                );
-                                return ClaudeRunResult {
-                                    text: String::new(),
-                                    error: Some(format!(
-                                        "failed to write prompt to Claude Code PTY: {}",
-                                        err
-                                    )),
-                                    duration_ms: elapsed_millis(started),
-                                    tool_items: Vec::new(),
-                                    agent_item_streamed: false,
-                                    latest_token_usage_info: None,
-                                };
-                            }
-                        }
-                    }
-                    None if prompt_sent
-                        && saw_turn_content
-                        && last_meaningful_output_at.elapsed() >= idle_timeout =>
-                    {
-                        let _ = writer.write_all(b"/exit\r").and_then(|_| writer.flush());
-                        exit_requested_at = Some(Instant::now());
-                    }
-                    None => {}
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(err) => {
-                terminate_process_group(child.id());
-                let _ = child.wait();
-                remove_active_process(&state, work);
-                emit_command_execution_completed(
-                    &output,
-                    work,
-                    Some(child.id()),
-                    false,
-                    &command_output,
-                    None,
-                    elapsed_millis(started),
-                );
-                return ClaudeRunResult {
-                    text: String::new(),
-                    error: Some(format!("failed to read Claude Code PTY: {}", err)),
-                    duration_ms: elapsed_millis(started),
-                    tool_items: Vec::new(),
-                    agent_item_streamed: false,
-                    latest_token_usage_info: None,
-                };
-            }
-        }
-    };
-
-    remove_active_process(&state, work);
-    let duration_ms = elapsed_millis(started);
-    let success = status.as_ref().is_some_and(|status| status.success());
-    let exit_code = status.as_ref().and_then(|status| status.code());
-    emit_command_execution_completed(
-        &output,
-        work,
-        Some(child.id()),
-        success,
-        &command_output,
-        exit_code,
-        duration_ms,
-    );
-
-    let final_text = latest_claude_transcript_assistant_text(work)
-        .unwrap_or_else(|| clean_interactive_cli_output(&raw_output, &work.prompt));
-    let mut emitted_text = String::new();
-    let mut agent_item_started = false;
-    if !final_text.is_empty() {
-        emit_agent_delta(
-            &output,
-            &work.thread_id,
-            &work.turn_id,
-            &work.agent_item_id,
-            &mut agent_item_started,
-            &mut emitted_text,
-            &final_text,
-        );
-    }
-
-    if success {
-        ClaudeRunResult {
-            text: final_text,
-            error: None,
-            duration_ms,
-            tool_items: Vec::new(),
-            agent_item_streamed: !emitted_text.is_empty(),
-            latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
-        }
-    } else {
-        ClaudeRunResult {
-            text: final_text.clone(),
-            error: Some(non_empty_join(
-                &[
-                    status
-                        .as_ref()
-                        .map(|status| format!("Claude Code exited with status {}", status))
-                        .unwrap_or_else(|| "Claude Code did not exit cleanly".to_string()),
-                    final_text,
-                ],
-                "\n",
-            )),
-            duration_ms,
-            tool_items: Vec::new(),
-            agent_item_streamed: !emitted_text.is_empty(),
-            latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
-        }
-    }
-}
-
-#[cfg(unix)]
-fn run_claude_code_turn_piped<W>(
-    mut command: Command,
-    work: &TurnWork,
-    state: SharedState,
-    output: SharedOutput<W>,
-    started: Instant,
-    pty_error: std::io::Error,
-) -> ClaudeRunResult
-where
-    W: Write,
-{
-    eprintln!(
-        "[codexl-claude-code] failed to start PTY, falling back to pipes: {}",
-        pty_error
-    );
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            return ClaudeRunResult {
-                text: String::new(),
-                error: Some(format!("failed to launch Claude Code: {}", err)),
-                duration_ms: elapsed_millis(started),
-                tool_items: Vec::new(),
-                agent_item_streamed: false,
-                latest_token_usage_info: None,
-            };
-        }
-    };
-    emit_command_execution_started(&output, work, Some(child.id()));
-    if let Ok(mut state) = lock_state(&state) {
-        state
-            .active_processes
-            .insert((work.thread_id.clone(), work.turn_id.clone()), child.id());
-    }
-
-    let mut child_stdin = match child.stdin.take() {
-        Some(stdin) => stdin,
-        None => {
-            terminate_process_group(child.id());
-            let _ = child.wait();
-            if let Ok(mut state) = lock_state(&state) {
-                state
-                    .active_processes
-                    .remove(&(work.thread_id.clone(), work.turn_id.clone()));
-            }
-            return ClaudeRunResult {
-                text: String::new(),
-                error: Some("failed to open Claude Code stdin".to_string()),
-                duration_ms: elapsed_millis(started),
-                tool_items: Vec::new(),
-                agent_item_streamed: false,
-                latest_token_usage_info: None,
-            };
-        }
-    };
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            terminate_process_group(child.id());
-            let _ = child.wait();
-            if let Ok(mut state) = lock_state(&state) {
-                state
-                    .active_processes
-                    .remove(&(work.thread_id.clone(), work.turn_id.clone()));
-            }
-            return ClaudeRunResult {
-                text: String::new(),
-                error: Some("failed to capture Claude Code stdout".to_string()),
-                duration_ms: elapsed_millis(started),
-                tool_items: Vec::new(),
-                agent_item_streamed: false,
-                latest_token_usage_info: None,
-            };
-        }
-    };
-    let stderr_handle = child.stderr.take().map(|stderr| {
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut text = String::new();
-            let _ = reader.read_to_string(&mut text);
-            text
-        })
-    });
-
-    if let Err(err) = child_stdin
-        .write_all(work.prompt.as_bytes())
-        .and_then(|_| child_stdin.write_all(b"\n"))
-        .and_then(|_| child_stdin.flush())
-    {
-        terminate_process_group(child.id());
-        let _ = child.wait();
-        if let Ok(mut state) = lock_state(&state) {
-            state
-                .active_processes
-                .remove(&(work.thread_id.clone(), work.turn_id.clone()));
-        }
-        return ClaudeRunResult {
-            text: String::new(),
-            error: Some(format!(
-                "failed to write prompt to Claude Code stdin: {}",
-                err
-            )),
-            duration_ms: elapsed_millis(started),
-            tool_items: Vec::new(),
-            agent_item_streamed: false,
-            latest_token_usage_info: None,
-        };
-    }
-    drop(child_stdin);
-
-    let mut emitted_text = String::new();
-    let mut agent_item_started = false;
-    let mut command_output = String::new();
-    let mut raw_stdout = String::new();
-    let mut reader = stdout;
-    let mut buffer = [0u8; 4096];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(size) => {
-                let chunk = String::from_utf8_lossy(&buffer[..size]).to_string();
-                raw_stdout.push_str(&chunk);
-                emit_command_execution_output_delta(
-                    &output,
-                    &work.thread_id,
-                    &work.turn_id,
-                    &work.cli_item_id,
-                    &chunk,
-                    &work.prompt,
-                    &mut command_output,
-                );
-                let text = clean_interactive_cli_output(&raw_stdout, &work.prompt);
-                emit_agent_delta(
-                    &output,
-                    &work.thread_id,
-                    &work.turn_id,
-                    &work.agent_item_id,
-                    &mut agent_item_started,
-                    &mut emitted_text,
-                    &text,
-                );
-            }
-            Err(err) => {
-                terminate_process_group(child.id());
-                let _ = child.wait();
-                if let Ok(mut state) = lock_state(&state) {
-                    state
-                        .active_processes
-                        .remove(&(work.thread_id.clone(), work.turn_id.clone()));
-                }
-                let agent_item_streamed = !emitted_text.is_empty();
-                return ClaudeRunResult {
-                    text: emitted_text,
-                    error: Some(format!("failed to read Claude Code stdout: {}", err)),
-                    duration_ms: elapsed_millis(started),
-                    tool_items: Vec::new(),
-                    agent_item_streamed,
-                    latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
-                };
-            }
-        }
-    }
-
-    let status = child.wait();
-    if let Ok(mut state) = lock_state(&state) {
-        state
-            .active_processes
-            .remove(&(work.thread_id.clone(), work.turn_id.clone()));
-    }
-    let stderr = stderr_handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let cleaned_stdout = clean_interactive_cli_output(&raw_stdout, &work.prompt);
-    let cleaned_stderr = clean_interactive_cli_output(&stderr, &work.prompt);
-    let final_text = latest_claude_transcript_assistant_text(work).unwrap_or_else(|| {
-        if !cleaned_stdout.is_empty() {
-            cleaned_stdout.clone()
-        } else if !cleaned_stderr.is_empty() {
-            cleaned_stderr.clone()
-        } else {
-            emitted_text.clone()
-        }
-    });
-    if emitted_text.is_empty() && !final_text.is_empty() {
-        emit_agent_delta(
-            &output,
-            &work.thread_id,
-            &work.turn_id,
-            &work.agent_item_id,
-            &mut agent_item_started,
-            &mut emitted_text,
-            &final_text,
-        );
-    }
-
-    let agent_item_streamed = !emitted_text.is_empty();
-    let duration_ms = elapsed_millis(started);
-    match status {
-        Ok(status) => {
-            emit_command_execution_completed(
-                &output,
-                work,
-                Some(child.id()),
-                status.success(),
-                &command_output,
-                status.code(),
-                duration_ms,
-            );
-            if status.success() {
-                ClaudeRunResult {
-                    text: if emitted_text.is_empty() {
-                        final_text
-                    } else {
-                        emitted_text
-                    },
-                    error: None,
-                    duration_ms,
-                    tool_items: Vec::new(),
-                    agent_item_streamed,
-                    latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
-                }
-            } else {
-                ClaudeRunResult {
-                    text: emitted_text,
-                    error: Some(non_empty_join(
-                        &[
-                            format!("Claude Code exited with status {}", status),
-                            cleaned_stderr,
-                            final_text,
-                        ],
-                        "\n",
-                    )),
-                    duration_ms,
-                    tool_items: Vec::new(),
-                    agent_item_streamed,
-                    latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
-                }
-            }
-        }
-        Err(err) => {
-            emit_command_execution_completed(
-                &output,
-                work,
-                Some(child.id()),
-                false,
-                &command_output,
-                None,
-                duration_ms,
-            );
-            ClaudeRunResult {
-                text: emitted_text,
-                error: Some(format!("failed to wait for Claude Code: {}", err)),
-                duration_ms,
-                tool_items: Vec::new(),
-                agent_item_streamed,
-                latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
-            }
-        }
-    }
-}
-
 fn claude_command(work: &TurnWork) -> Command {
     let bin = std::env::var(BIN_ENV)
         .ok()
@@ -14725,94 +13838,11 @@ fn claude_permission_prompt_tool_arg() -> Option<String> {
     }
 }
 
-#[cfg(unix)]
-fn open_unix_pty() -> std::io::Result<(File, File)> {
-    let mut master: RawFd = -1;
-    let mut slave: RawFd = -1;
-    let mut size = libc::winsize {
-        ws_row: 40,
-        ws_col: 120,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let result = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::addr_of_mut!(size),
-        )
-    };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    set_cloexec(master)?;
-    set_cloexec(slave)?;
-    Ok(unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) })
-}
-
-#[cfg(unix)]
-fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 fn claude_model_arg() -> Option<String> {
     std::env::var(MODEL_ENV)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty() && value != DEFAULT_MODEL)
-}
-
-fn should_send_prompt_to_claude(
-    started: Instant,
-    trust_confirmed_at: Option<Instant>,
-    raw_output: &str,
-    last_raw_output_at: Instant,
-) -> bool {
-    if last_raw_output_at.elapsed() < Duration::from_millis(600) {
-        return false;
-    }
-    let input_ready = looks_like_claude_input_ready(raw_output);
-    if let Some(confirmed_at) = trust_confirmed_at {
-        return (input_ready && confirmed_at.elapsed() >= Duration::from_millis(500))
-            || confirmed_at.elapsed() >= Duration::from_millis(10_000);
-    }
-    if looks_like_claude_trust_prompt(raw_output) {
-        return false;
-    }
-    (input_ready && started.elapsed() >= Duration::from_millis(500))
-        || started.elapsed() >= Duration::from_millis(10_000)
-}
-
-fn looks_like_claude_input_ready(raw_output: &str) -> bool {
-    let plain = strip_ansi_and_control(raw_output).to_lowercase();
-    plain.contains("welcome back")
-        || plain.contains("tips for getting started")
-        || plain.contains("run /init")
-        || plain.contains("/effort")
-        || plain.contains("claude code v")
 }
 
 fn configure_claude_path_env(command: &mut Command, ccr_bin: &str) {
@@ -15022,148 +14052,6 @@ fn split_env_args(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn emit_command_execution_started<W>(output: &SharedOutput<W>, work: &TurnWork, pid: Option<u32>)
-where
-    W: Write,
-{
-    let _ = write_notification(
-        output,
-        json!({
-            "method": "item/started",
-            "params": {
-                "threadId": work.thread_id,
-                "turnId": work.turn_id,
-                "item": command_execution_item(work, pid, "inProgress", Value::Null, Value::Null, Value::Null),
-                "startedAtMs": now_millis(),
-            },
-        }),
-    );
-}
-
-fn emit_command_execution_completed<W>(
-    output: &SharedOutput<W>,
-    work: &TurnWork,
-    pid: Option<u32>,
-    success: bool,
-    aggregated_output: &str,
-    exit_code: Option<i32>,
-    duration_ms: i64,
-) where
-    W: Write,
-{
-    let status = if success { "completed" } else { "failed" };
-    let _ = write_notification(
-        output,
-        json!({
-            "method": "item/completed",
-            "params": {
-                "threadId": work.thread_id,
-                "turnId": work.turn_id,
-                "item": command_execution_item(
-                    work,
-                    pid,
-                    status,
-                    json!(truncate_for_protocol(aggregated_output, 200_000)),
-                    exit_code.map(Value::from).unwrap_or(Value::Null),
-                    json!(duration_ms),
-                ),
-                "completedAtMs": now_millis(),
-            },
-        }),
-    );
-}
-
-fn emit_command_execution_output_delta<W>(
-    output: &SharedOutput<W>,
-    thread_id: &str,
-    turn_id: &str,
-    item_id: &str,
-    raw_delta: &str,
-    prompt: &str,
-    aggregated_output: &mut String,
-) -> bool
-where
-    W: Write,
-{
-    let delta = clean_command_output_delta(raw_delta, prompt);
-    if delta.trim().is_empty() {
-        return false;
-    }
-    aggregated_output.push_str(&delta);
-    let _ = write_notification(
-        output,
-        json!({
-            "method": "item/commandExecution/outputDelta",
-            "params": {
-                "threadId": thread_id,
-                "turnId": turn_id,
-                "itemId": item_id,
-                "delta": delta,
-            },
-        }),
-    );
-    true
-}
-
-fn emit_command_execution_structured_delta<W>(
-    output: &SharedOutput<W>,
-    thread_id: &str,
-    turn_id: &str,
-    item_id: &str,
-    delta: &str,
-    aggregated_output: &mut String,
-) -> bool
-where
-    W: Write,
-{
-    if delta.trim().is_empty() {
-        return false;
-    }
-    aggregated_output.push_str(delta);
-    let _ = write_notification(
-        output,
-        json!({
-            "method": "item/commandExecution/outputDelta",
-            "params": {
-                "threadId": thread_id,
-                "turnId": turn_id,
-                "itemId": item_id,
-                "delta": delta,
-            },
-        }),
-    );
-    true
-}
-
-fn command_execution_item(
-    work: &TurnWork,
-    pid: Option<u32>,
-    status: &str,
-    aggregated_output: Value,
-    exit_code: Value,
-    duration_ms: Value,
-) -> Value {
-    let command = claude_command_display(work);
-    json!({
-        "type": "commandExecution",
-        "id": work.cli_item_id,
-        "command": command,
-        "cwd": work.cwd,
-        "processId": pid.map(|value| value.to_string()),
-        "source": "agent",
-        "status": status,
-        "commandActions": [
-            {
-                "type": "unknown",
-                "command": command,
-            }
-        ],
-        "aggregatedOutput": aggregated_output,
-        "exitCode": exit_code,
-        "durationMs": duration_ms,
-    })
-}
-
 fn claude_command_display(work: &TurnWork) -> String {
     let bin = std::env::var(BIN_ENV)
         .ok()
@@ -15369,33 +14257,6 @@ fn assistant_text_from_transcript_entry(value: &Value) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn clean_command_output_delta(raw_delta: &str, prompt: &str) -> String {
-    let prompt_compact = compact_cli_text(prompt);
-    let lines = strip_ansi_and_control(raw_delta)
-        .lines()
-        .map(normalize_cli_line)
-        .filter(|line| !line.is_empty())
-        .filter(|line| !is_cli_chrome_line(line))
-        .filter(|line| !is_claude_noise_line(line))
-        .filter(|line| {
-            let compact = compact_plain_text(line);
-            !compact.is_empty() && (prompt_compact.is_empty() || !compact.contains(&prompt_compact))
-        })
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", lines.join("\n"))
-    }
-}
-
-fn looks_like_claude_trust_prompt(raw: &str) -> bool {
-    let compact = compact_cli_text(raw);
-    compact.contains("quicksafetycheck")
-        || compact.contains("yes,itrustthisfolder")
-        || compact.contains("no,exit")
-}
-
 fn compact_cli_text(raw: &str) -> String {
     compact_plain_text(&strip_ansi_and_control(raw))
 }
@@ -15405,103 +14266,6 @@ fn compact_plain_text(raw: &str) -> String {
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>()
         .to_ascii_lowercase()
-}
-
-fn is_claude_noise_line(line: &str) -> bool {
-    let compact = compact_plain_text(line);
-    let has_spinner = line.chars().any(|ch| {
-        matches!(
-            ch,
-            '✻' | '✽'
-                | '✶'
-                | '✳'
-                | '✢'
-                | '·'
-                | '◐'
-                | '◓'
-                | '◑'
-                | '◒'
-                | '⠋'
-                | '⠙'
-                | '⠹'
-                | '⠸'
-                | '⠼'
-                | '⠴'
-                | '⠦'
-                | '⠧'
-                | '⠇'
-                | '⠏'
-        )
-    });
-    let has_banner_block = line
-        .chars()
-        .any(|ch| matches!(ch, '▐' | '▛' | '█' | '▜' | '▌' | '▝' | '▘'));
-    let has_status_glyph = line.chars().any(|ch| matches!(ch, '󰉋' | '' | '󰚩' | '⚡'));
-    let has_cjk = line.chars().any(is_cjk);
-    compact.is_empty()
-        || (has_spinner && compact.chars().count() <= 40)
-        || (has_spinner && compact.contains("brewing"))
-        || (has_spinner && compact.contains("drizzling"))
-        || (has_spinner && compact.contains("bakedfor"))
-        || (has_banner_block && !has_cjk)
-        || (has_status_glyph && !has_cjk)
-        || (compact.chars().count() <= 2 && !has_cjk)
-        || compact.chars().all(|ch| ch.is_ascii_digit())
-        || compact.contains("claudecodev")
-        || compact.contains("welcomeback")
-        || compact.contains("tipsforgettingstarted")
-        || compact.contains("what'snew")
-        || compact.contains("opus4")
-        || compact.contains("1mcontext")
-        || compact.contains("internalinfrastructureimprovements")
-        || compact.contains("release-notes")
-        || compact.contains("/usage")
-        || compact.contains("/diff")
-        || compact.contains("apiusagebilling")
-        || compact.contains("/effort")
-        || compact.contains("tok/s")
-        || compact.contains("tokens)")
-        || compact.contains("↑")
-        || compact.contains("↓")
-        || compact.contains("brewing")
-        || compact.contains("drizzling")
-        || compact.contains("bakedfor")
-        || compact.contains("auto-updating")
-        || compact.contains("auto-updatefailed")
-        || compact.contains("accessingworkspace")
-        || compact.contains("quicksafetycheck")
-        || compact.contains("securityguide")
-        || compact.contains("securityguid")
-        || compact.contains("project,orworkfromyourteam")
-        || compact.contains("ifnot,takeamomenttoreview")
-        || compact.contains("claudecode'llbeabletoread")
-        || compact.contains("edit,andexecutefileshere")
-        || compact.contains("doyoutrustthefiles")
-        || compact.contains("yes,itrustthisfolder")
-        || compact.contains("no,exit")
-        || compact.contains("entertoconfirm")
-        || compact.contains("esctocancel")
-        || compact.contains("pressctrl-d")
-        || compact.contains("resumethissessionwith:")
-        || compact.starts_with("claude--resume")
-        || compact.starts_with("ccrcode--resume")
-        || compact.contains("codexl-claude-code-")
-        || compact.contains("coxl-claude-code-")
-}
-
-fn is_cjk(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{3400}'..='\u{4DBF}'
-            | '\u{4E00}'..='\u{9FFF}'
-            | '\u{F900}'..='\u{FAFF}'
-            | '\u{20000}'..='\u{2A6DF}'
-            | '\u{2A700}'..='\u{2B73F}'
-            | '\u{2B740}'..='\u{2B81F}'
-            | '\u{2B820}'..='\u{2CEAF}'
-            | '\u{3000}'..='\u{303F}'
-            | '\u{FF00}'..='\u{FFEF}'
-    )
 }
 
 fn truncate_for_protocol(value: &str, max_bytes: usize) -> String {
@@ -15672,113 +14436,6 @@ fn agent_item_id_for_turn(turn_id: &str) -> String {
 
 fn reasoning_item_id_for_turn(turn_id: &str) -> String {
     format!("reasoning-{}", turn_id)
-}
-
-fn cli_item_id_for_turn(turn_id: &str) -> String {
-    format!("claude-cli-{}", turn_id)
-}
-
-fn clean_interactive_cli_output(raw: &str, prompt: &str) -> String {
-    let plain = strip_ansi_and_control(raw);
-    let prompt_compact = compact_cli_text(prompt);
-    let prompt_lines = prompt
-        .lines()
-        .map(normalize_cli_line)
-        .filter(|line| !line.is_empty())
-        .collect::<BTreeSet<_>>();
-    let mut lines = Vec::new();
-    for line in plain.lines().map(normalize_cli_line) {
-        let compact = compact_plain_text(&line);
-        if line.is_empty()
-            || prompt_lines.contains(&line)
-            || (!prompt_compact.is_empty() && compact.contains(&prompt_compact))
-            || is_cli_chrome_line(&line)
-            || is_claude_noise_line(&line)
-        {
-            continue;
-        }
-        if lines.last().map(String::as_str) != Some(line.as_str()) {
-            lines.push(line);
-        }
-    }
-    lines.join("\n")
-}
-
-fn normalize_cli_line(line: &str) -> String {
-    let normalized = line
-        .trim()
-        .trim_matches(|ch| matches!(ch, '│' | '┃' | '║' | '╎' | '┆' | '╭' | '╮' | '╰' | '╯'))
-        .trim()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    normalized
-        .strip_prefix('⏺')
-        .map(str::trim)
-        .unwrap_or(&normalized)
-        .to_string()
-}
-
-fn is_cli_chrome_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    line == ">"
-        || line == "❯"
-        || line == "..."
-        || lower == "claude code"
-        || lower.contains("esc to interrupt")
-        || lower.contains("ctrl+c")
-        || lower.contains("ctrl+d")
-        || lower.contains("? for shortcuts")
-        || lower.contains("press enter")
-        || line.chars().all(|ch| {
-            ch.is_whitespace()
-                || matches!(
-                    ch,
-                    '─' | '━'
-                        | '═'
-                        | '╭'
-                        | '╮'
-                        | '╰'
-                        | '╯'
-                        | '┌'
-                        | '┐'
-                        | '└'
-                        | '┘'
-                        | '│'
-                        | '┃'
-                        | '║'
-                        | '╎'
-                        | '┆'
-                        | '>'
-                        | '_'
-                        | '-'
-                        | ' '
-                        | '·'
-                        | '•'
-                        | '✻'
-                        | '✽'
-                        | '✶'
-                        | '⠋'
-                        | '⠙'
-                        | '⠹'
-                        | '⠸'
-                        | '⠼'
-                        | '⠴'
-                        | '⠦'
-                        | '⠧'
-                        | '⠇'
-                        | '⠏'
-                        | '❯'
-                        | '�'
-                        | '▐'
-                        | '▛'
-                        | '█'
-                        | '▜'
-                        | '▌'
-                        | '▝'
-                        | '▘'
-                )
-        })
 }
 
 fn strip_ansi_and_control(input: &str) -> String {
@@ -16622,14 +15279,6 @@ fn required_thread_id_param(params: &Value) -> Result<&str, String> {
         .or_else(|| params.get("conversationId"))
         .and_then(Value::as_str)
         .ok_or_else(|| "missing required param: threadId".to_string())
-}
-
-fn uuid_from_thread_id(value: &str) -> String {
-    if is_uuid_like(value) {
-        value.to_string()
-    } else {
-        new_uuid_v4()
-    }
 }
 
 fn is_uuid_like(value: &str) -> bool {
@@ -17805,7 +16454,6 @@ args = ["server.js", "--stdio"]
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: root.to_string_lossy().to_string(),
             prompt: "hello".to_string(),
@@ -17868,7 +16516,6 @@ args = ["server.js", "--stdio"]
             thread_id: "title-thread".to_string(),
             turn_id: "title-turn".to_string(),
             agent_item_id: "title-agent".to_string(),
-            cli_item_id: "title-cli".to_string(),
             claude_session_id: "22222222-2222-4222-8222-222222222222".to_string(),
             cwd: root.to_string_lossy().to_string(),
             prompt: "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\nGenerate a concise UI title (up to 36 characters) for this task.\n\nUser prompt:\nhello".to_string(),
@@ -18004,7 +16651,6 @@ args = ["server.js", "--stdio"]
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "session".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
@@ -19770,75 +18416,6 @@ done
     }
 
     #[test]
-    fn filters_claude_code_tui_noise_from_streamed_and_final_text() {
-        let prompt = "该项目都有哪些功能";
-        let raw = r#"
-▐▛███▜▌ClaudeCodev2.1.149
-▝▜█████▛▘Opus4.7(1Mcontext)withmediumeffort·APIUsageBilling
-▘▘▝▝~/baishan/llm-spec
-◐medium·/effort
-❯ 该项目都有哪些功能
-✽ Brewing…
-󰉋 llm-spec  feat/sdk-tester 󰚩 glm-5 ↑0 ↓0 ⚡ 0 tok/s
-i…
-✻n
-25
-✻50
-✶Brewing…663
-Brewing…101 tokens)
-↑4
-/private/var/folders/9r/example/T/codexl-claude-code-real-ccr-1
-project,orworkfromyourteam).Ifnot,takeamomenttoreviewwhat'sinthisfolderfirst.
-ClaudeCode'llbeabletoread,edit,andexecutefileshere.
-Securityguid
-Read 1 file, listed 1 directory (ctrl+o to expand)
-⏺让我先了解一下项目结构和功能。
-⏺ Reading 1 file, listing 1 directory… (ctrl+o to expand)
-⎿ $ cat /Users/jinhuilee/baishan/llm-spec/README.md 2>/dev/null || echo "No README found"
-⏺根据README和项目结构，该项目是一个LLM SDK API 兼容性测试工具，主要功能如下：
-核心功能
-1.多 SDK API 测试—验证三类SDK的API格式/参数/特性支持情况：
--GoogleGemini(@google/genai)
-✻Baked for 22s
-Resume this session with:
-claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
-"#;
-
-        let streamed = clean_command_output_delta(raw, prompt);
-        let final_text = clean_interactive_cli_output(raw, prompt);
-
-        for cleaned in [&streamed, &final_text] {
-            assert!(!cleaned.contains("ClaudeCodev"), "{cleaned}");
-            assert!(!cleaned.contains("Opus4"), "{cleaned}");
-            assert!(!cleaned.contains("Brewing"), "{cleaned}");
-            assert!(!cleaned.contains("tok/s"), "{cleaned}");
-            assert!(!cleaned.contains("󰉋"), "{cleaned}");
-            assert!(!cleaned.contains("claude --resume"), "{cleaned}");
-            assert!(!cleaned.contains("project,orworkfromyourteam"), "{cleaned}");
-            assert!(!cleaned.contains("ClaudeCode'llbeabletoread"), "{cleaned}");
-            assert!(
-                !cleaned.contains("codexl-claude-code-real-ccr"),
-                "{cleaned}"
-            );
-            assert!(!cleaned.contains(prompt), "{cleaned}");
-            assert!(
-                cleaned.contains("让我先了解一下项目结构和功能"),
-                "{cleaned}"
-            );
-            assert!(cleaned.contains("Reading 1 file"), "{cleaned}");
-            assert!(
-                cleaned.contains("cat /Users/jinhuilee/baishan/llm-spec/README.md"),
-                "{cleaned}"
-            );
-            assert!(cleaned.contains("核心功能"), "{cleaned}");
-            assert!(
-                cleaned.contains("-GoogleGemini(@google/genai)"),
-                "{cleaned}"
-            );
-        }
-    }
-
-    #[test]
     fn extracts_latest_assistant_text_from_claude_transcript() {
         let transcript = r#"
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"old"}]}}
@@ -21309,7 +19886,6 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
@@ -21331,7 +19907,6 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
@@ -21352,7 +19927,6 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
@@ -21437,7 +20011,6 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
@@ -21463,7 +20036,6 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
@@ -21524,7 +20096,6 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp/workspace".to_string(),
             prompt: "hello".to_string(),
@@ -21618,7 +20189,6 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp/workspace".to_string(),
             prompt: "hello".to_string(),
@@ -21672,7 +20242,6 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp/workspace".to_string(),
             prompt: "hello".to_string(),
@@ -21767,7 +20336,6 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
@@ -21825,7 +20393,6 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "inspect images".to_string(),
@@ -21882,7 +20449,6 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "visible prompt".to_string(),
@@ -22018,7 +20584,6 @@ sleep 60
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: root.to_string_lossy().to_string(),
             prompt: "hello".to_string(),
@@ -22081,7 +20646,6 @@ sleep 60
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
@@ -22350,7 +20914,6 @@ sleep 60
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
@@ -22449,7 +21012,6 @@ sleep 60
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
@@ -22528,7 +21090,6 @@ sleep 60
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
@@ -22593,7 +21154,6 @@ sleep 60
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
@@ -22727,7 +21287,6 @@ sleep 60
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),
@@ -22799,7 +21358,6 @@ sleep 60
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: root.to_string_lossy().to_string(),
             prompt: "edit a file".to_string(),
@@ -22962,7 +21520,6 @@ sleep 60
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
             agent_item_id: "agent".to_string(),
-            cli_item_id: "cli".to_string(),
             claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
             cwd: "/tmp".to_string(),
             prompt: "hello".to_string(),

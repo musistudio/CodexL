@@ -685,6 +685,7 @@ impl AppConfig {
                 );
                 let mut config = AppConfig::default();
                 config.normalize();
+                config.detect_default_codex_path();
                 return config;
             }
         };
@@ -692,6 +693,7 @@ impl AppConfig {
             config.apply_initial_extension_defaults();
         }
         config.normalize();
+        config.detect_default_codex_path();
         let _ = config.save();
         config
     }
@@ -712,6 +714,16 @@ impl AppConfig {
         }
         let content = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         write_app_config(&path, &content)
+    }
+
+    pub fn detect_default_codex_path(&mut self) {
+        let configured = self.codex_path.trim();
+        if !configured.is_empty() && Path::new(configured).is_file() {
+            return;
+        }
+        if let Some(path) = crate::launcher::find_codex_app() {
+            self.codex_path = path;
+        }
     }
 
     pub fn normalize(&mut self) {
@@ -1279,10 +1291,6 @@ pub fn generated_bot_gateway_state_dir(profile_name: &str) -> PathBuf {
     codexl_home_dir().join("bot-gateway").join(slug)
 }
 
-pub fn ensure_provider_codex_home(profile: &ProviderProfile) -> Result<String, String> {
-    ensure_provider_codex_home_with_format(profile, requested_codex_profile_config_format())
-}
-
 pub fn ensure_provider_codex_home_with_format(
     profile: &ProviderProfile,
     profile_config_format: CodexProfileConfigFormat,
@@ -1415,12 +1423,6 @@ pub fn sync_workspace_profiles_for_default_provider(
     Ok(())
 }
 
-pub fn add_existing_provider_profile(
-    input: ExistingProviderRequest,
-) -> Result<ProviderProfile, String> {
-    add_existing_provider_profile_with_format(input, requested_codex_profile_config_format())
-}
-
 pub fn add_existing_provider_profile_with_format(
     input: ExistingProviderRequest,
     profile_config_format: CodexProfileConfigFormat,
@@ -1518,12 +1520,6 @@ pub fn update_workspace_profile(input: UpdateWorkspaceRequest) -> Result<Provide
     Ok(profile)
 }
 
-pub fn update_existing_provider_profile(
-    input: UpdateProviderRequest,
-) -> Result<ProviderProfile, String> {
-    update_existing_provider_profile_with_format(input, requested_codex_profile_config_format())
-}
-
 pub fn update_existing_provider_profile_with_format(
     input: UpdateProviderRequest,
     profile_config_format: CodexProfileConfigFormat,
@@ -1566,10 +1562,6 @@ pub fn update_existing_provider_profile_with_format(
     Ok(profile)
 }
 
-pub fn update_default_provider_selection(input: ExistingProviderRequest) -> Result<(), String> {
-    update_default_provider_selection_with_format(input, requested_codex_profile_config_format())
-}
-
 pub fn update_default_provider_selection_with_format(
     input: ExistingProviderRequest,
     profile_config_format: CodexProfileConfigFormat,
@@ -1586,10 +1578,6 @@ pub fn update_default_provider_selection_with_format(
     };
     let updated = set_next_ai_gateway_model_catalog_config(&updated, &profile)?;
     std::fs::write(path, updated).map_err(|e| e.to_string())
-}
-
-pub fn create_default_provider(input: NewProviderRequest) -> Result<ProviderProfile, String> {
-    create_default_provider_with_format(input, requested_codex_profile_config_format())
 }
 
 pub fn create_default_provider_with_format(
@@ -1657,12 +1645,6 @@ pub fn create_default_provider_with_format(
     Ok(profile)
 }
 
-pub fn create_next_ai_gateway_provider(
-    input: NextAiGatewayProviderRequest,
-) -> Result<ProviderProfile, String> {
-    create_next_ai_gateway_provider_with_format(input, requested_codex_profile_config_format())
-}
-
 pub fn create_next_ai_gateway_provider_with_format(
     input: NextAiGatewayProviderRequest,
     profile_config_format: CodexProfileConfigFormat,
@@ -1694,15 +1676,6 @@ pub fn create_next_ai_gateway_provider_with_format(
         profile_config_format,
     )?;
     Ok(profile)
-}
-
-pub fn update_next_ai_gateway_provider_profile(
-    input: UpdateNextAiGatewayProviderRequest,
-) -> Result<ProviderProfile, String> {
-    update_next_ai_gateway_provider_profile_with_format(
-        input,
-        requested_codex_profile_config_format(),
-    )
 }
 
 pub fn update_next_ai_gateway_provider_profile_with_format(
@@ -3807,10 +3780,6 @@ fn env_bool(name: &str, fallback: bool) -> bool {
         .unwrap_or(fallback)
 }
 
-fn requested_codex_profile_config_format() -> CodexProfileConfigFormat {
-    codex_profile_config_format_from_env().unwrap_or_else(default_codex_profile_config_format)
-}
-
 fn default_codex_profile_config_format() -> CodexProfileConfigFormat {
     if cfg!(test) {
         CodexProfileConfigFormat::LegacyProfilesTable
@@ -4041,18 +4010,21 @@ requires_openai_auth = true
         std::env::set_var("HOME", &root);
         std::env::remove_var("CODEXL_CODEX_HOME");
 
-        let profile = add_existing_provider_profile(ExistingProviderRequest {
-            workspace_name: "workspace".to_string(),
-            profile_name: "custom".to_string(),
-            base_url: Some(String::new()),
-            api_key: None,
-            model: "gpt-5.6".to_string(),
-            proxy_url: String::new(),
-            remote_frontend_mode: String::new(),
-            remote_web_asset_registry_url: String::new(),
-            remote_web_asset_version: String::new(),
-            bot: BotProfileConfig::default(),
-        })
+        let profile = add_existing_provider_profile_with_format(
+            ExistingProviderRequest {
+                workspace_name: "workspace".to_string(),
+                profile_name: "custom".to_string(),
+                base_url: Some(String::new()),
+                api_key: None,
+                model: "gpt-5.6".to_string(),
+                proxy_url: String::new(),
+                remote_frontend_mode: String::new(),
+                remote_web_asset_registry_url: String::new(),
+                remote_web_asset_version: String::new(),
+                bot: BotProfileConfig::default(),
+            },
+            default_codex_profile_config_format(),
+        )
         .expect("add ccs provider");
 
         assert_eq!(
@@ -4127,16 +4099,19 @@ requires_openai_auth = true
         std::env::set_var("CODEXL_NEXT_AI_GATEWAY_CONFIG_PATH", &gateway_config_path);
         std::env::remove_var("GATEWAY_CONFIG_PATH");
 
-        let profile = create_next_ai_gateway_provider(NextAiGatewayProviderRequest {
-            workspace_name: "gateway-workspace".to_string(),
-            name: "nextai".to_string(),
-            model: "zhipu/glm-4.6".to_string(),
-            proxy_url: String::new(),
-            remote_frontend_mode: String::new(),
-            remote_web_asset_registry_url: String::new(),
-            remote_web_asset_version: String::new(),
-            bot: BotProfileConfig::default(),
-        })
+        let profile = create_next_ai_gateway_provider_with_format(
+            NextAiGatewayProviderRequest {
+                workspace_name: "gateway-workspace".to_string(),
+                name: "nextai".to_string(),
+                model: "zhipu/glm-4.6".to_string(),
+                proxy_url: String::new(),
+                remote_frontend_mode: String::new(),
+                remote_web_asset_registry_url: String::new(),
+                remote_web_asset_version: String::new(),
+                bot: BotProfileConfig::default(),
+            },
+            default_codex_profile_config_format(),
+        )
         .expect("create next ai gateway provider");
 
         let workspace_config_path = generated_codex_home(&profile).join("config.toml");
@@ -4796,18 +4771,21 @@ model_provider = "nextai"
         std::env::set_var("HOME", &root);
         std::env::remove_var("CODEXL_CODEX_HOME");
 
-        let profile = add_existing_provider_profile(ExistingProviderRequest {
-            workspace_name: "workspace-a".to_string(),
-            profile_name: "nextai".to_string(),
-            base_url: None,
-            api_key: None,
-            model: "glm-4.6".to_string(),
-            proxy_url: String::new(),
-            remote_frontend_mode: String::new(),
-            remote_web_asset_registry_url: String::new(),
-            remote_web_asset_version: String::new(),
-            bot: BotProfileConfig::default(),
-        })
+        let profile = add_existing_provider_profile_with_format(
+            ExistingProviderRequest {
+                workspace_name: "workspace-a".to_string(),
+                profile_name: "nextai".to_string(),
+                base_url: None,
+                api_key: None,
+                model: "glm-4.6".to_string(),
+                proxy_url: String::new(),
+                remote_frontend_mode: String::new(),
+                remote_web_asset_registry_url: String::new(),
+                remote_web_asset_version: String::new(),
+                bot: BotProfileConfig::default(),
+            },
+            default_codex_profile_config_format(),
+        )
         .expect("create workspace profile");
 
         assert_eq!(profile.name, "workspace-a");
@@ -5258,7 +5236,9 @@ model_provider = "bs"
             remote_e2ee_password: String::new(),
             bot: BotProfileConfig::default(),
         };
-        let path = ensure_provider_codex_home(&profile).expect("ensure provider home");
+        let path =
+            ensure_provider_codex_home_with_format(&profile, default_codex_profile_config_format())
+                .expect("ensure provider home");
         let content = std::fs::read_to_string(PathBuf::from(path).join("config.toml"))
             .expect("read generated config");
 
@@ -5413,7 +5393,9 @@ model_provider = "nextai"
             },
         };
 
-        let path = ensure_provider_codex_home(&profile).expect("ensure provider home");
+        let path =
+            ensure_provider_codex_home_with_format(&profile, default_codex_profile_config_format())
+                .expect("ensure provider home");
         let content = std::fs::read_to_string(PathBuf::from(path).join("config.toml"))
             .expect("read generated config");
 

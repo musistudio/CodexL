@@ -131,15 +131,6 @@ where
 }
 
 #[cfg(test)]
-pub(super) fn web_plugin_runtime_script_response() -> WebResourceResponse {
-    WebResourceResponse {
-        status: StatusCode::OK,
-        content_type: "application/javascript; charset=utf-8".to_string(),
-        body: Bytes::from(web_plugin_runtime_script()),
-    }
-}
-
-#[cfg(test)]
 pub(super) fn web_plugin_runtime_version() -> &'static str {
     CODEXL_PLUGIN_RUNTIME_VERSION
 }

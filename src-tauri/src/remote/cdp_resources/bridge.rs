@@ -1,7 +1,6 @@
 use super::cdp::{connect_target, list_targets, select_target};
 use super::file_picker::{dispatch_web_file_picker_message, is_web_file_picker_message};
 use super::*;
-use crate::remote::crypto::RemoteCrypto;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -64,8 +63,6 @@ struct WebBridgeEvent {
     seq: u64,
     message: Value,
     bytes: usize,
-    #[allow(dead_code)]
-    received_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -217,7 +214,6 @@ impl WebBridgeEventHub {
                     seq,
                     message,
                     bytes,
-                    received_at: Instant::now(),
                 });
             }
             while state.events.len() > WEB_BRIDGE_EVENT_HUB_CAPACITY {
@@ -850,100 +846,6 @@ fn clear_cached_web_bridge_target(cdp_host: &str, cdp_port: u16) {
     clear_cached_web_bridge_cdp_client(cdp_host, cdp_port);
 }
 
-pub async fn handle_web_bridge_websocket<S>(
-    websocket: WebSocketStream<S>,
-    cdp_host: String,
-    cdp_port: u16,
-    crypto: Option<Arc<RemoteCrypto>>,
-) -> Result<(), String>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    eprintln!(
-        "[codex-web] bridge websocket opened: cdp=http://{}:{}",
-        cdp_host, cdp_port
-    );
-    let (mut write, mut read) = websocket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    let pump_tx = tx.clone();
-    let pump_crypto = crypto.clone();
-    let pump_active = Arc::new(AtomicBool::new(true));
-    spawn_web_bridge_notification_pump_for_connection(
-        cdp_host.clone(),
-        cdp_port,
-        pump_active.clone(),
-        move |partial| {
-            if let Some(text) =
-                encrypt_bridge_socket_text(pump_crypto.as_deref(), partial.to_string())
-            {
-                let _ = pump_tx.send(Message::Text(text));
-            }
-        },
-    );
-
-    let writer = async {
-        while let Some(message) = rx.recv().await {
-            write.send(message).await.map_err(|e| e.to_string())?;
-        }
-        Ok::<(), String>(())
-    };
-
-    let reader = async {
-        while let Some(message) = read.next().await {
-            match message.map_err(|e| e.to_string())? {
-                Message::Text(raw) => {
-                    handle_web_bridge_socket_text(
-                        &tx,
-                        cdp_host.clone(),
-                        cdp_port,
-                        raw,
-                        crypto.clone(),
-                    );
-                }
-                Message::Binary(bytes) => match String::from_utf8(bytes) {
-                    Ok(raw) => {
-                        handle_web_bridge_socket_text(
-                            &tx,
-                            cdp_host.clone(),
-                            cdp_port,
-                            raw,
-                            crypto.clone(),
-                        );
-                    }
-                    Err(err) => {
-                        let response = web_bridge_socket_response(None, Err(err.to_string()));
-                        if let Some(text) =
-                            encrypt_bridge_socket_text(crypto.as_deref(), response.to_string())
-                        {
-                            let _ = tx.send(Message::Text(text));
-                        }
-                    }
-                },
-                Message::Ping(payload) => {
-                    let _ = tx.send(Message::Pong(payload));
-                }
-                Message::Close(frame) => {
-                    let _ = tx.send(Message::Close(frame));
-                    break;
-                }
-                _ => {}
-            }
-        }
-        Ok::<(), String>(())
-    };
-
-    let result = tokio::select! {
-        result = writer => result,
-        result = reader => result,
-    };
-    pump_active.store(false, Ordering::Relaxed);
-    eprintln!(
-        "[codex-web] bridge websocket closed: cdp=http://{}:{}",
-        cdp_host, cdp_port
-    );
-    result
-}
-
 pub fn spawn_web_bridge_notification_pump<F>(cdp_host: String, cdp_port: u16, emit: F)
 where
     F: Fn(Value) + Send + Sync + 'static,
@@ -957,17 +859,6 @@ where
         )),
         emit,
     );
-}
-
-fn spawn_web_bridge_notification_pump_for_connection<F>(
-    cdp_host: String,
-    cdp_port: u16,
-    active: Arc<AtomicBool>,
-    emit: F,
-) where
-    F: Fn(Value) + Send + Sync + 'static,
-{
-    spawn_web_bridge_notification_pump_with_options(cdp_host, cdp_port, Some(active), None, emit);
 }
 
 fn spawn_web_bridge_notification_pump_with_options<F>(
@@ -1376,68 +1267,6 @@ fn web_bridge_fetch_stream_error(request_id: &str, error: &str) -> Value {
         "requestId": request_id,
         "error": error,
     })
-}
-
-fn handle_web_bridge_socket_text(
-    tx: &mpsc::UnboundedSender<Message>,
-    cdp_host: String,
-    cdp_port: u16,
-    raw: String,
-    crypto: Option<Arc<RemoteCrypto>>,
-) {
-    let tx = tx.clone();
-    tokio::spawn(async move {
-        let raw = match decrypt_bridge_socket_text(crypto.as_deref(), &raw) {
-            Ok(raw) => raw,
-            Err(err) => {
-                let response = web_bridge_socket_response(None, Err(err));
-                if let Some(text) =
-                    encrypt_bridge_socket_text(crypto.as_deref(), response.to_string())
-                {
-                    let _ = tx.send(Message::Text(text));
-                }
-                return;
-            }
-        };
-        let partial_tx = tx.clone();
-        let partial_crypto = crypto.clone();
-        let response = dispatch_web_bridge_socket_payload_with_emitter(
-            &cdp_host,
-            cdp_port,
-            &raw,
-            move |partial| {
-                if let Some(text) =
-                    encrypt_bridge_socket_text(partial_crypto.as_deref(), partial.to_string())
-                {
-                    let _ = partial_tx.send(Message::Text(text));
-                }
-            },
-        )
-        .await;
-        if let Some(text) = encrypt_bridge_socket_text(crypto.as_deref(), response.to_string()) {
-            let _ = tx.send(Message::Text(text));
-        }
-    });
-}
-
-fn encrypt_bridge_socket_text(crypto: Option<&RemoteCrypto>, raw: String) -> Option<String> {
-    match crypto {
-        Some(crypto) => match crypto.encrypt_text(&raw) {
-            Ok(encrypted) => Some(encrypted),
-            Err(err) => {
-                eprintln!("[codex-web] bridge payload encryption failed: {}", err);
-                None
-            }
-        },
-        None => Some(raw),
-    }
-}
-
-fn decrypt_bridge_socket_text(crypto: Option<&RemoteCrypto>, raw: &str) -> Result<String, String> {
-    match crypto {
-        Some(crypto) => crypto.decrypt_text(raw),
-        None => Ok(raw.to_string()),
-    }
 }
 
 pub(crate) fn parse_web_bridge_socket_message(

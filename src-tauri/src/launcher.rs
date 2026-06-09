@@ -8,10 +8,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 const DEFAULT_MAC_APP_NAMES: &[&str] = &["Codex.app", "OpenAI Codex.app"];
-const DEFAULT_WINDOWS_APP_DIRS: &[&str] = &["Codex", "OpenAI Codex"];
-const DEFAULT_WINDOWS_EXE_NAMES: &[&str] = &["Codex.exe", "OpenAI Codex.exe"];
+const DEFAULT_WINDOWS_APP_DIRS: &[&str] = &["Codex", "OpenAI Codex", "OpenAICodex"];
+const DEFAULT_WINDOWS_EXE_NAMES: &[&str] = &[
+    "Codex.exe",
+    "codex.exe",
+    "OpenAI Codex.exe",
+    "OpenAICodex.exe",
+];
 #[cfg(windows)]
-const DEFAULT_WINDOWS_PACKAGE_PREFIXES: &[&str] = &["OpenAI.Codex_"];
+const DEFAULT_WINDOWS_PACKAGE_PREFIXES: &[&str] = &[
+    "OpenAI.Codex_",
+    "OpenAI.CodexApp_",
+    "OpenAICodex_",
+    "OpenAI.OpenAICodex_",
+];
 
 #[derive(Debug)]
 pub struct CodexLaunch {
@@ -634,7 +644,19 @@ fn find_windows_app() -> Option<String> {
         }
     }
 
+    for candidate in windows_appx_package_candidates_from_powershell() {
+        if let Some(path) = normalize_windows_codex_app_candidate(candidate) {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+
     for candidate in windows_appx_package_candidates() {
+        if let Some(path) = normalize_windows_codex_app_candidate(candidate) {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+
+    for candidate in windows_registry_app_candidates() {
         if let Some(path) = normalize_windows_codex_app_candidate(candidate) {
             return Some(path.to_string_lossy().to_string());
         }
@@ -654,10 +676,9 @@ fn find_windows_app() -> Option<String> {
     None
 }
 
-#[cfg(windows)]
 fn normalize_windows_codex_app_candidate(path: PathBuf) -> Option<PathBuf> {
-    if !path.is_file() {
-        return None;
+    if path.is_dir() {
+        return windows_codex_executable_in_app_dir(&path);
     }
 
     if let Some(parent) = path.parent() {
@@ -675,20 +696,69 @@ fn normalize_windows_codex_app_candidate(path: PathBuf) -> Option<PathBuf> {
     }
 
     let file_name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
-    DEFAULT_WINDOWS_EXE_NAMES
-        .iter()
-        .any(|name| file_name == name.to_ascii_lowercase())
-        .then_some(path)
+    if !windows_codex_exe_name_matches(&file_name) {
+        return None;
+    }
+
+    path.is_file().then_some(path)
 }
 
-#[cfg(not(windows))]
-fn normalize_windows_codex_app_candidate(path: PathBuf) -> Option<PathBuf> {
-    path.is_file().then_some(path)
+fn windows_codex_executable_in_app_dir(dir: &Path) -> Option<PathBuf> {
+    if let Some(path) = windows_codex_executable_direct_child(dir) {
+        return Some(path);
+    }
+
+    let nested_roots = ["app", "current", "Current"];
+    for nested in nested_roots {
+        if let Some(path) = windows_codex_executable_direct_child(&dir.join(nested)) {
+            return Some(path);
+        }
+    }
+
+    let mut versioned_dirs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.starts_with("app-") {
+                versioned_dirs.push(path);
+            }
+        }
+    }
+    versioned_dirs.sort();
+    versioned_dirs.reverse();
+
+    for versioned_dir in versioned_dirs {
+        if let Some(path) = windows_codex_executable_direct_child(&versioned_dir) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn windows_codex_executable_direct_child(dir: &Path) -> Option<PathBuf> {
+    for exe_name in DEFAULT_WINDOWS_EXE_NAMES {
+        let candidate = dir.join(exe_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn windows_codex_exe_name_matches(file_name: &str) -> bool {
+    DEFAULT_WINDOWS_EXE_NAMES
+        .iter()
+        .any(|name| file_name.eq_ignore_ascii_case(name))
 }
 
 #[cfg(windows)]
 fn windows_where_codex_candidates() -> Vec<PathBuf> {
-    ["Codex", "codex"]
+    ["Codex", "codex", "OpenAI Codex"]
         .iter()
         .flat_map(|name| where_command_candidates(name))
         .collect()
@@ -738,22 +808,53 @@ fn windows_app_candidates() -> Vec<PathBuf> {
         roots.push(home.join("AppData").join("Roaming"));
     }
 
+    windows_app_candidates_from_roots(roots)
+}
+
+fn windows_app_candidates_from_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     for root in roots {
         let install_roots = [
             root.clone(),
             root.join("Programs"),
             root.join("Programs").join("OpenAI"),
+            root.join("OpenAI"),
+            root.join("Microsoft").join("WindowsApps"),
         ];
         for install_root in install_roots {
+            for exe_name in DEFAULT_WINDOWS_EXE_NAMES {
+                push_unique_path(&mut candidates, install_root.join(exe_name));
+            }
             for dir_name in DEFAULT_WINDOWS_APP_DIRS {
+                push_unique_path(&mut candidates, install_root.join(dir_name));
                 for exe_name in DEFAULT_WINDOWS_EXE_NAMES {
-                    candidates.push(install_root.join(dir_name).join(exe_name));
+                    push_unique_path(&mut candidates, install_root.join(dir_name).join(exe_name));
                 }
             }
         }
     }
     candidates
+}
+
+#[cfg(windows)]
+fn windows_appx_package_candidates_from_powershell() -> Vec<PathBuf> {
+    let script = r#"
+$packages = Get-AppxPackage -Name '*Codex*' -ErrorAction SilentlyContinue
+foreach ($package in $packages) {
+  if ($package.Name -match 'Codex|OpenAI' -or $package.PackageFullName -match 'Codex|OpenAI') {
+    $package.InstallLocation
+  }
+}
+"#;
+    powershell_lines(script)
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn windows_appx_package_candidates_from_powershell() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 #[cfg(windows)]
@@ -776,8 +877,11 @@ fn windows_appx_package_candidates() -> Vec<PathBuf> {
         {
             continue;
         }
+        candidates.push(path.clone());
+        candidates.push(path.join("app"));
         for exe_name in DEFAULT_WINDOWS_EXE_NAMES {
             candidates.push(path.join("app").join(exe_name));
+            candidates.push(path.join(exe_name));
         }
     }
 
@@ -789,6 +893,81 @@ fn windows_appx_package_candidates() -> Vec<PathBuf> {
 #[cfg(not(windows))]
 fn windows_appx_package_candidates() -> Vec<PathBuf> {
     Vec::new()
+}
+
+#[cfg(windows)]
+fn windows_registry_app_candidates() -> Vec<PathBuf> {
+    let script = r#"
+$roots = @(
+  'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+  'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+  'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+)
+foreach ($item in Get-ItemProperty $roots -ErrorAction SilentlyContinue) {
+  if ($item.DisplayName -match '(^|\s)(OpenAI\s+)?Codex(\s|$)') {
+    $item.DisplayIcon
+    $item.InstallLocation
+    $item.UninstallString
+  }
+}
+"#;
+    powershell_lines(script)
+        .into_iter()
+        .filter_map(|line| windows_path_from_registry_value(&line))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn windows_registry_app_candidates() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn powershell_lines(script: &str) -> Vec<String> {
+    let Ok(output) = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(windows)]
+fn windows_path_from_registry_value(value: &str) -> Option<PathBuf> {
+    let value = value.trim().trim_matches('"').trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let lower = value.to_ascii_lowercase();
+    if let Some(index) = lower.find(".exe") {
+        let end = index + ".exe".len();
+        let executable = value[..end].trim().trim_matches('"').trim();
+        if executable.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(executable));
+    }
+
+    Some(PathBuf::from(value))
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -815,6 +994,17 @@ fn expand_home_path(value: String) -> PathBuf {
         }
     }
     PathBuf::from(trimmed)
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    let key = path.to_string_lossy().to_ascii_lowercase();
+    if paths
+        .iter()
+        .any(|existing| existing.to_string_lossy().to_ascii_lowercase() == key)
+    {
+        return;
+    }
+    paths.push(path);
 }
 
 fn user_home_dir() -> Option<PathBuf> {
@@ -1242,6 +1432,40 @@ mod tests {
         entry.ppid = 1;
         entry.command = "/usr/local/bin/node /tmp/other/stdio.js".to_string();
         assert!(!is_orphaned_codexl_extension_process(&entry));
+    }
+
+    #[test]
+    fn normalizes_windows_squirrel_app_directory_to_versioned_executable() {
+        let root = unique_test_dir("windows-squirrel-codex-app");
+        let app_dir = root.join("Codex");
+        let versioned_dir = app_dir.join("app-1.2.3");
+        let executable = versioned_dir.join("Codex.exe");
+        std::fs::create_dir_all(&versioned_dir).expect("create app dir");
+        std::fs::write(&executable, "").expect("write executable");
+
+        assert_eq!(
+            normalize_windows_codex_app_candidate(app_dir),
+            Some(executable)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_app_candidates_include_alias_and_openai_install_roots() {
+        let root = unique_test_dir("windows-app-candidates");
+        let candidates = windows_app_candidates_from_roots(vec![root.clone()]);
+
+        let windows_apps = root.join("Microsoft").join("WindowsApps");
+        assert!(candidates.iter().any(|candidate| {
+            candidate.parent() == Some(windows_apps.as_path())
+                && candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("codex.exe"))
+        }));
+        assert!(candidates.contains(&root.join("Programs").join("OpenAI").join("Codex")));
+        assert!(candidates.contains(&root.join("OpenAI").join("OpenAI Codex")));
     }
 
     #[test]

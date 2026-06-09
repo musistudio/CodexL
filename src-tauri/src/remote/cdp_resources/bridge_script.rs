@@ -1,13 +1,3 @@
-use super::*;
-
-pub(super) fn web_bridge_script_response() -> WebResourceResponse {
-    WebResourceResponse {
-        status: StatusCode::OK,
-        content_type: "application/javascript; charset=utf-8".to_string(),
-        body: Bytes::from_static(WEB_BRIDGE_SCRIPT.as_bytes()),
-    }
-}
-
 pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
   installCryptoRandomUuidPolyfill();
 

@@ -351,8 +351,9 @@ pub async fn launch_codex_instance(
 }
 
 fn resolve_codex_executable(config: &mut AppConfig) -> Result<String, String> {
-    if !config.codex_path.is_empty() {
-        return Ok(config.codex_path.clone());
+    let configured = config.codex_path.trim();
+    if !configured.is_empty() && std::path::Path::new(configured).is_file() {
+        return Ok(configured.to_string());
     }
 
     let detected = launcher::find_codex_app().ok_or_else(|| "Codex app not found".to_string())?;

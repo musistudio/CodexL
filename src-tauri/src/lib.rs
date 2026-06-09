@@ -75,7 +75,14 @@ async fn find_codex(state: tauri::State<'_, AppState>) -> Result<String, String>
     if !configured_path.is_empty() && std::path::Path::new(&configured_path).is_file() {
         return Ok(configured_path);
     }
-    launcher::find_codex_app().ok_or_else(|| "Codex app not found".to_string())
+    let detected = launcher::find_codex_app().ok_or_else(|| "Codex app not found".to_string())?;
+    let mut config = state.config.lock().await;
+    let current = config.codex_path.trim();
+    if current.is_empty() || !std::path::Path::new(current).is_file() {
+        config.codex_path = detected.clone();
+        config.save()?;
+    }
+    Ok(detected)
 }
 
 #[derive(Debug, Clone, Serialize)]

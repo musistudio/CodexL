@@ -2,11 +2,7 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 #[cfg(test)]
-use http_body_util::Full;
-#[cfg(test)]
-use hyper::header::CONTENT_TYPE;
-#[cfg(test)]
-use hyper::{Response, StatusCode};
+use hyper::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -69,8 +65,6 @@ use resource::{
 
 const CDP_COMMAND_TIMEOUT_MS: u64 = 15000;
 #[cfg(test)]
-const DEBUG_RESOURCE_SAMPLE_LIMIT: usize = 12;
-#[cfg(test)]
 const WEB_BRIDGE_SCRIPT_PATH: &str = "_bridge.js";
 #[cfg(test)]
 const WEB_PLUGIN_RUNTIME_SCRIPT_PATH: &str = "_codexl_plugin.js";
@@ -84,20 +78,10 @@ const WEB_RESOURCE_VERSION_PATH: &str = "_version";
 const WEB_PATH_PREFIX: &str = "/web";
 
 #[cfg(test)]
-struct LoadedResourceContent {
-    content_type: Option<String>,
-    result: Value,
-    source: &'static str,
-    url: String,
-}
-
-#[cfg(test)]
 #[derive(Debug, Clone)]
 struct WebResourceSocketRequest {
-    request_type: String,
     path: String,
     query: Option<String>,
-    url: String,
 }
 
 #[cfg(test)]
@@ -106,18 +90,6 @@ pub struct WebResourceResponse {
     status: StatusCode,
     content_type: String,
     body: Bytes,
-}
-
-#[cfg(test)]
-impl WebResourceResponse {
-    pub fn into_response(self) -> Result<Response<Full<Bytes>>, String> {
-        Response::builder()
-            .status(self.status)
-            .header("Cache-Control", "no-store")
-            .header(CONTENT_TYPE, self.content_type)
-            .body(Full::new(self.body))
-            .map_err(|e| e.to_string())
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
