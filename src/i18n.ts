@@ -264,6 +264,12 @@ export const resources = {
         removeCodexHome: "Also delete the codex home directory",
         title: "Delete Workspace",
       },
+      quitDialog: {
+        action: "Close Codex and Quit",
+        description:
+          "There are {{count}} Codex instances still running. Quitting CodexL will close them first.",
+        title: "Quit CodexL?",
+      },
       errors: {
         apiKeyRequired: "apikey is required",
         baseUrlRequired: "base_url is required",
@@ -707,6 +713,11 @@ export const resources = {
         confirm: "确定要删除“{{name}}”吗？此操作无法撤销。",
         removeCodexHome: "同时删除 Codex home 目录",
         title: "删除工作空间",
+      },
+      quitDialog: {
+        action: "关闭 Codex 并退出",
+        description: "当前有 {{count}} 个 Codex 实例正在运行。退出 CodexL 会先关闭这些实例。",
+        title: "退出 CodexL？",
       },
       errors: {
         apiKeyRequired: "请输入 apikey",

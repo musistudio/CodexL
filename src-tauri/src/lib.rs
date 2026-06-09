@@ -26,7 +26,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
+
+const QUIT_CONFIRMATION_REQUESTED_EVENT: &str = "codexl://quit-confirmation-requested";
 
 pub fn run_cli_middleware_if_requested() -> bool {
     cli_middleware::run_if_requested()
@@ -43,6 +46,8 @@ pub struct AppState {
     pub(crate) bot_login_sessions: Arc<Mutex<HashMap<String, Arc<bot_bridge::BotQrLoginSession>>>>,
     pub(crate) gateway_service: Arc<Mutex<Option<gateway_service::GatewayServiceHandle>>>,
     pub(crate) config: Arc<Mutex<AppConfig>>,
+    quit_confirmed: Arc<AtomicBool>,
+    quit_confirmation_pending: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -53,8 +58,15 @@ impl AppState {
             bot_login_sessions: Arc::new(Mutex::new(HashMap::new())),
             gateway_service: Arc::new(Mutex::new(None)),
             config: Arc::new(Mutex::new(config)),
+            quit_confirmed: Arc::new(AtomicBool::new(false)),
+            quit_confirmation_pending: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QuitConfirmationPayload {
+    running_instance_count: usize,
 }
 
 async fn profile_config_format_for_state(state: &AppState) -> CodexProfileConfigFormat {
@@ -511,6 +523,27 @@ async fn stop_codex(
     server::stop_codex_instance(state.inner(), profile_name).await?;
     let config = state.config.lock().await.clone();
     refresh_macos_tray_menu(&app, state.inner(), &config).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn confirm_app_quit(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    state.quit_confirmed.store(true, Ordering::SeqCst);
+    state
+        .quit_confirmation_pending
+        .store(false, Ordering::SeqCst);
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_app_quit(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state
+        .quit_confirmation_pending
+        .store(false, Ordering::SeqCst);
     Ok(())
 }
 
@@ -1312,6 +1345,65 @@ async fn refresh_macos_tray_menu(app: &tauri::AppHandle, state: &AppState, confi
     let _ = (app, state, config);
 }
 
+#[cfg(target_os = "macos")]
+fn hide_main_window_on_close<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+    event: &tauri::WindowEvent,
+) {
+    if window.label() != "main" {
+        return;
+    }
+    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        api.prevent_close();
+        if let Err(err) = window.hide() {
+            eprintln!("Failed to hide main window on close: {}", err);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hide_main_window_on_close<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+    event: &tauri::WindowEvent,
+) {
+    let _ = (window, event);
+}
+
+fn request_quit_confirmation(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    running_instance_count: usize,
+) {
+    state
+        .quit_confirmation_pending
+        .store(true, Ordering::SeqCst);
+
+    if let Err(err) = show_main_window(app) {
+        eprintln!("Failed to show main window for quit confirmation: {}", err);
+    }
+    if let Err(err) = app.emit_to(
+        "main",
+        QUIT_CONFIRMATION_REQUESTED_EVENT,
+        QuitConfirmationPayload {
+            running_instance_count,
+        },
+    ) {
+        state
+            .quit_confirmation_pending
+            .store(false, Ordering::SeqCst);
+        eprintln!("Failed to request quit confirmation: {}", err);
+    }
+}
+
+fn show_main_window(app: &tauri::AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("main") else {
+        return Err("main window not found".to_string());
+    };
+    window.show().map_err(|err| err.to_string())?;
+    window.unminimize().map_err(|err| err.to_string())?;
+    window.set_focus().map_err(|err| err.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = AppState::new(AppConfig::load());
@@ -1328,6 +1420,9 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state)
+        .on_window_event(|window, event| {
+            hide_main_window_on_close(window, event);
+        })
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             if let Err(err) = macos_tray::install(app, tray_state.clone()) {
@@ -1425,6 +1520,8 @@ pub fn run() {
             probe_provider_models,
             launch_codex,
             stop_codex,
+            confirm_app_quit,
+            cancel_app_quit,
             get_status,
             get_instance_statuses,
             get_config,
@@ -1463,14 +1560,46 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(move |_app_handle, event| {
-        if matches!(
-            event,
-            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-        ) && !shutdown_started_for_run.swap(true, Ordering::SeqCst)
-        {
-            cleanup_on_app_shutdown(&shutdown_state);
+    app.run(move |app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { code, api, .. } => {
+            let restart_requested = code == Some(tauri::RESTART_EXIT_CODE);
+            let quit_confirmed = shutdown_state.quit_confirmed.load(Ordering::SeqCst);
+            if !restart_requested && !quit_confirmed {
+                let running_instance_count = tauri::async_runtime::block_on(
+                    server::running_codex_instance_count(&shutdown_state),
+                )
+                .unwrap_or_else(|err| {
+                    eprintln!("Failed to check running Codex instances before quit: {}", err);
+                    1
+                });
+
+                if running_instance_count > 0 {
+                    api.prevent_exit();
+                    request_quit_confirmation(app_handle, &shutdown_state, running_instance_count);
+                    return;
+                }
+            }
+
+            if !shutdown_started_for_run.swap(true, Ordering::SeqCst) {
+                cleanup_on_app_shutdown(&shutdown_state);
+            }
         }
+        tauri::RunEvent::Exit => {
+            if !shutdown_started_for_run.swap(true, Ordering::SeqCst) {
+                cleanup_on_app_shutdown(&shutdown_state);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen {
+            has_visible_windows, ..
+        } => {
+            if !has_visible_windows {
+                if let Err(err) = show_main_window(app_handle) {
+                    eprintln!("Failed to show main window on reopen: {}", err);
+                }
+            }
+        }
+        _ => {}
     });
 }
 

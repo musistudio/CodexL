@@ -494,6 +494,17 @@ pub async fn stop_codex_instance(
     Ok(())
 }
 
+pub async fn running_codex_instance_count(state: &AppState) -> Result<usize, String> {
+    let mut instances = state.instances.lock().await;
+    let mut count = 0;
+    for instance in instances.values_mut() {
+        if running_child_pid(&mut instance.child)?.is_some() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 pub async fn current_launch_info(state: &AppState) -> Result<LaunchInfo, String> {
     let active_provider = {
         let config = state.config.lock().await;

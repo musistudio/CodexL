@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -278,6 +279,7 @@ const NEXT_AI_GATEWAY_PROVIDER_NAME = "next-ai-gateway";
 const DEFAULT_CODEX_WEB_ASSET_REGISTRY_URL = "https://web.codexl.io";
 const DEFAULT_CODEX_WEB_ASSET_VERSION = "latest";
 const DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
+const QUIT_CONFIRMATION_REQUESTED_EVENT = "codexl://quit-confirmation-requested";
 
 type RemoteFrontendMode = "app" | "cli" | "claude-code";
 
@@ -611,6 +613,12 @@ type ToastState = {
   id: number;
   status: "loading" | "success" | "error";
   message: string;
+};
+type QuitConfirmationPayload = {
+  running_instance_count?: number;
+};
+type QuitConfirmationState = {
+  runningInstanceCount: number;
 };
 type Language = "en" | "zh";
 type Appearance = "system" | "light" | "dark";
@@ -1226,6 +1234,9 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     deleteInstance: t("deleteDialog.title"),
     deleteInstanceConfirm: (name: string) => t("deleteDialog.confirm", { name }),
     alsoDeleteCodexHome: t("deleteDialog.removeCodexHome"),
+    quitConfirmTitle: t("quitDialog.title"),
+    quitConfirmDescription: (count: number) => t("quitDialog.description", { count }),
+    quitConfirmAction: t("quitDialog.action"),
     delete: t("actions.delete"),
     deleteProfileConfig: t("settings.deleteProfileConfig"),
     deleteProfileConfigConfirm: (name: string) => t("settings.deleteProfileConfigConfirm", { name }),
@@ -1524,6 +1535,8 @@ function App() {
   const [gatewayModels, setGatewayModels] = useState<string[]>([]);
   const [pendingDeleteProfile, setPendingDeleteProfile] = useState<ProviderProfile | null>(null);
   const [removeCodexHome, setRemoveCodexHome] = useState(false);
+  const [quitConfirmation, setQuitConfirmation] = useState<QuitConfirmationState | null>(null);
+  const [quitPending, setQuitPending] = useState(false);
   const [remoteQr, setRemoteQr] = useState<RemoteQrState | null>(null);
   const [workspaceOperation, setWorkspaceOperation] = useState<WorkspaceOperation | null>(null);
   const [remotePasswordDialog, setRemotePasswordDialog] = useState<RemotePasswordDialogState | null>(null);
@@ -1549,6 +1562,7 @@ function App() {
   const gatewayModelTriggerRef = useRef<HTMLButtonElement>(null);
   const workspaceSavePendingRef = useRef(false);
   const workspaceDeletePendingRef = useRef(false);
+  const quitPendingRef = useRef(false);
   const weixinBotQrRef = useRef<WeixinBotQrState | null>(null);
   const weixinBotLoginGenerationRef = useRef(0);
   const desktopLoginPromiseRef = useRef<Promise<AppConfig | null> | null>(null);
@@ -1603,6 +1617,61 @@ function App() {
     setSettingsError(message);
     console.error(error);
   }, [strings]);
+
+  const cancelAppQuit = useCallback(() => {
+    if (quitPendingRef.current) {
+      return;
+    }
+    setQuitConfirmation(null);
+    invoke("cancel_app_quit").catch(console.error);
+  }, []);
+
+  const confirmAppQuit = useCallback(async () => {
+    if (quitPendingRef.current) {
+      return;
+    }
+    quitPendingRef.current = true;
+    setQuitPending(true);
+    try {
+      await invoke("confirm_app_quit");
+    } catch (error) {
+      quitPendingRef.current = false;
+      setQuitPending(false);
+      showSettingsError(error);
+    }
+  }, [showSettingsError]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      return;
+    }
+
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+
+    listen<QuitConfirmationPayload>(QUIT_CONFIRMATION_REQUESTED_EVENT, (event) => {
+      const requestedCount = Number(event.payload?.running_instance_count);
+      const runningInstanceCount = Number.isFinite(requestedCount)
+        ? Math.max(1, Math.floor(requestedCount))
+        : 1;
+      quitPendingRef.current = false;
+      setQuitPending(false);
+      setQuitConfirmation({ runningInstanceCount });
+    })
+      .then((nextUnlisten) => {
+        if (cancelled) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(console.error);
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     const showRuntimeError = (error: unknown) => {
@@ -3048,6 +3117,15 @@ function App() {
             setRemoveCodexHome(false);
           }}
           onConfirm={() => confirmDelete().catch(showSettingsError)}
+        />
+      ) : null}
+
+      {quitConfirmation ? (
+        <QuitConfirmationDialog
+          runningInstanceCount={quitConfirmation.runningInstanceCount}
+          busy={quitPending}
+          onCancel={cancelAppQuit}
+          onConfirm={() => confirmAppQuit().catch(showSettingsError)}
         />
       ) : null}
 
@@ -9507,6 +9585,52 @@ function DeleteDialog({
           >
             {busy ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : null}
             {strings.delete}
+          </Button>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+function QuitConfirmationDialog({
+  runningInstanceCount,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  runningInstanceCount: number;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const strings = useAppStrings();
+  return (
+    <AlertDialog
+      open
+      onOpenChange={(open) => {
+        if (!open && !busy) {
+          onCancel();
+        }
+      }}
+    >
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{strings.quitConfirmTitle}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {strings.quitConfirmDescription(runningInstanceCount)}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={busy} onClick={onCancel}>
+            {strings.cancel}
+          </AlertDialogCancel>
+          <Button
+            type="button"
+            variant="destructive"
+            disabled={busy}
+            onClick={onConfirm}
+          >
+            {strings.quitConfirmAction}
           </Button>
         </AlertDialogFooter>
       </AlertDialogContent>
