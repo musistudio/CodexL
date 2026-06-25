@@ -916,7 +916,10 @@ fn tighten_gateway_config_permissions_once(path: &Path) -> Result<(), String> {
 fn tighten_gateway_config_permissions_windows(path: &Path) -> Result<(), String> {
     let script = r#"
 $ErrorActionPreference = 'Stop'
-$target = $args[0]
+$target = $env:CODEXL_GATEWAY_CONFIG_ACL_TARGET
+if ([string]::IsNullOrWhiteSpace($target) -and $args.Count -gt 0) {
+    $target = $args[0]
+}
 if ([string]::IsNullOrWhiteSpace($target)) {
     throw 'missing Gateway config path'
 }
@@ -950,7 +953,7 @@ Set-Acl -LiteralPath $item.FullName -AclObject $acl
     let mut command = std::process::Command::new("powershell.exe");
     command
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .arg(path);
+        .env("CODEXL_GATEWAY_CONFIG_ACL_TARGET", path);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

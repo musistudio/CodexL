@@ -509,6 +509,9 @@ async fn launch_codex(
         },
     )
     .await?;
+    if let Err(err) = focus_codex_app_window(&info) {
+        eprintln!("Failed to focus Codex App window: {}", err);
+    }
     let config = state.config.lock().await.clone();
     refresh_macos_tray_menu(&app, state.inner(), &config).await;
     Ok(info)
@@ -1404,6 +1407,108 @@ fn show_main_window(app: &tauri::AppHandle) -> Result<(), String> {
     window.set_focus().map_err(|err| err.to_string())
 }
 
+fn focus_codex_app_window(info: &server::LaunchInfo) -> Result<(), String> {
+    if info.core_mode != config::REMOTE_FRONTEND_MODE_APP {
+        return Ok(());
+    }
+    focus_codex_app_window_for_platform(info)
+}
+
+#[cfg(target_os = "macos")]
+fn focus_codex_app_window_for_platform(info: &server::LaunchInfo) -> Result<(), String> {
+    if let Some(pid) = info.pid {
+        match raise_process_window(pid) {
+            Ok(()) => return Ok(()),
+            Err(err) => return open_codex_app_bundle(info, Some(err)),
+        }
+    }
+    open_codex_app_bundle(info, None)
+}
+
+#[cfg(target_os = "macos")]
+fn open_codex_app_bundle(
+    info: &server::LaunchInfo,
+    previous_error: Option<String>,
+) -> Result<(), String> {
+    let Some(app_path) = codex_app_bundle_path(&info.codex_path) else {
+        return Err(previous_error.unwrap_or_else(|| {
+            format!(
+                "workspace {} does not expose a process id",
+                info.profile_name
+            )
+        }));
+    };
+    let output = std::process::Command::new("/usr/bin/open")
+        .arg(app_path)
+        .output()
+        .map_err(|open_err| open_err.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else if let Some(err) = previous_error {
+        Err(format!(
+            "{}; open fallback failed: {}",
+            err,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    } else {
+        Err(format!(
+            "open fallback failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn focus_codex_app_window_for_platform(_info: &server::LaunchInfo) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn raise_process_window(pid: u32) -> Result<(), String> {
+    let script = format!(
+        r#"tell application "System Events"
+  set targetProcess to first application process whose unix id is {}
+  set frontmost of targetProcess to true
+  if (count of windows of targetProcess) > 0 then
+    perform action "AXRaise" of window 1 of targetProcess
+  end if
+end tell"#,
+        pid
+    );
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn codex_app_bundle_path(codex_path: &str) -> Option<String> {
+    let path = std::path::Path::new(codex_path);
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.extension().and_then(|ext| ext.to_str()) == Some("app") {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+        current = candidate.parent();
+    }
+    launcher::find_codex_app().and_then(|value| {
+        let path = std::path::Path::new(&value);
+        let mut current = Some(path);
+        while let Some(candidate) = current {
+            if candidate.extension().and_then(|ext| ext.to_str()) == Some("app") {
+                return Some(candidate.to_string_lossy().to_string());
+            }
+            current = candidate.parent();
+        }
+        None
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = AppState::new(AppConfig::load());
@@ -1569,7 +1674,10 @@ pub fn run() {
                     server::running_codex_instance_count(&shutdown_state),
                 )
                 .unwrap_or_else(|err| {
-                    eprintln!("Failed to check running Codex instances before quit: {}", err);
+                    eprintln!(
+                        "Failed to check running Codex instances before quit: {}",
+                        err
+                    );
                     1
                 });
 
@@ -1591,7 +1699,8 @@ pub fn run() {
         }
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen {
-            has_visible_windows, ..
+            has_visible_windows,
+            ..
         } => {
             if !has_visible_windows {
                 if let Err(err) = show_main_window(app_handle) {

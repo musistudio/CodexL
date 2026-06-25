@@ -1298,6 +1298,9 @@ pub(crate) fn codexl_home_dir() -> PathBuf {
         return path;
     }
     if cfg!(windows) {
+        if let Some(local_app_data) = env_path("LOCALAPPDATA") {
+            return local_app_data.join("CodexL");
+        }
         if let Some(app_data) = env_path("APPDATA") {
             return app_data.join("CodexL");
         }

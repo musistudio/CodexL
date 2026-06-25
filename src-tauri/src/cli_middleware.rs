@@ -123,7 +123,7 @@ pub fn prepare(
     let codex_home = normalize_profile(codex_home);
     let profile = normalize_profile(codex_profile);
     let workspace_name = normalize_profile(stdio_name).or_else(|| profile.clone());
-    let model_provider = normalize_profile(codex_model_provider);
+    let model_provider = normalize_model_provider(codex_model_provider, profile.as_deref());
     let core_mode = normalize_profile(core_mode);
     write_stdio_export(
         &export_stdio_path,
@@ -477,6 +477,21 @@ fn normalize_profile(profile: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn normalize_model_provider(model_provider: Option<&str>, profile: Option<&str>) -> Option<String> {
+    let model_provider = normalize_profile(model_provider)?;
+    let profile = profile.map(str::trim).filter(|value| !value.is_empty());
+
+    if model_provider.eq_ignore_ascii_case("default")
+        && profile
+            .map(|value| value.eq_ignore_ascii_case(crate::config::DEFAULT_PROVIDER_PROFILE_NAME))
+            .unwrap_or(true)
+    {
+        return None;
+    }
+
+    Some(model_provider)
+}
+
 fn codexl_home_dir() -> PathBuf {
     std::env::var("CODEXL_HOME")
         .ok()
@@ -485,6 +500,9 @@ fn codexl_home_dir() -> PathBuf {
         .map(|value| expand_home_path(&value))
         .unwrap_or_else(|| {
             if cfg!(windows) {
+                if let Some(local_app_data) = env_path_without_home_expansion("LOCALAPPDATA") {
+                    return local_app_data.join("CodexL");
+                }
                 if let Some(app_data) = env_path_without_home_expansion("APPDATA") {
                     return app_data.join("CodexL");
                 }
@@ -672,10 +690,12 @@ where
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let model_provider = std::env::var(CODEX_MODEL_PROVIDER_ENV)
+    let raw_model_provider = std::env::var(CODEX_MODEL_PROVIDER_ENV)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let model_provider =
+        normalize_model_provider(raw_model_provider.as_deref(), profile.as_deref());
     let profile_config_format = crate::config::codex_profile_config_format_from_env()
         .unwrap_or_else(|| {
             crate::config::codex_profile_config_format_for_cli(&real_cli.to_string_lossy())
@@ -806,11 +826,13 @@ pub(crate) fn real_cli_args(
         }
     }
     if let Some(model_provider) = model_provider {
-        real_args.push(OsString::from("-c"));
-        real_args.push(OsString::from(cli_config_string(
-            "model_provider",
-            model_provider,
-        )));
+        if let Some(model_provider) = normalize_model_provider(Some(model_provider), profile) {
+            real_args.push(OsString::from("-c"));
+            real_args.push(OsString::from(cli_config_string(
+                "model_provider",
+                &model_provider,
+            )));
+        }
     }
     real_args.extend(args);
     real_args
@@ -2702,6 +2724,7 @@ fn stdio_export_script(
     profile_config_format: CodexProfileConfigFormat,
 ) -> String {
     let mut script = String::from("@echo off\r\n");
+    let model_provider = normalize_model_provider(model_provider, profile);
     push_cmd_env(
         &mut script,
         CODEX_CLI_PATH_ENV,
@@ -2718,7 +2741,7 @@ fn stdio_export_script(
     if let Some(profile) = profile {
         push_cmd_env(&mut script, CODEX_PROFILE_ENV, profile);
     }
-    if let Some(model_provider) = model_provider {
+    if let Some(model_provider) = model_provider.as_deref() {
         push_cmd_env(&mut script, CODEX_MODEL_PROVIDER_ENV, model_provider);
     }
     if let Some(core_mode) = core_mode {
@@ -2909,6 +2932,39 @@ printf ':stdin=%s\n' "$first_line"
     }
 
     #[test]
+    fn default_model_provider_placeholder_is_not_forwarded_to_real_cli() {
+        let args = real_cli_args(
+            None,
+            Some("default"),
+            CodexProfileConfigFormat::SeparateProfileFiles,
+            vec![OsString::from("app-server")],
+        );
+
+        assert_eq!(args, vec![OsString::from("app-server")]);
+    }
+
+    #[test]
+    fn default_model_provider_name_is_preserved_for_explicit_profile() {
+        let args = real_cli_args(
+            Some("custom-profile"),
+            Some("default"),
+            CodexProfileConfigFormat::SeparateProfileFiles,
+            vec![OsString::from("exec")],
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--profile"),
+                OsString::from("custom-profile"),
+                OsString::from("-c"),
+                OsString::from("model_provider=\"default\""),
+                OsString::from("exec"),
+            ]
+        );
+    }
+
+    #[test]
     fn profile_flag_detection_handles_global_options() {
         assert!(!codex_args_accept_profile_flag(&[
             OsString::from("-c"),
@@ -3046,6 +3102,26 @@ printf ':stdin=%s\n' "$first_line"
             script.contains("export CODEXL_CODEX_PROFILE_CONFIG_FORMAT='separate_profile_files'\n")
         );
         assert!(script.contains("exec '/tmp/CodexL Host' --codexl-cli-stdio \"$@\"\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_stdio_export_skips_default_model_provider_placeholder() {
+        let script = stdio_export_script(
+            Path::new("/tmp/CodexL Host"),
+            Path::new("/tmp/codexl-codex-cli-middleware"),
+            Path::new("/tmp/Real Codex"),
+            Path::new("/tmp/middleware.log"),
+            Some("/tmp/codex home"),
+            Some("default-instance"),
+            Some(crate::config::DEFAULT_PROVIDER_PROFILE_NAME),
+            Some("default"),
+            Some("app"),
+            CodexProfileConfigFormat::SeparateProfileFiles,
+        );
+
+        assert!(!script.contains("CODEXL_CODEX_MODEL_PROVIDER"));
+        assert!(script.contains("export CODEXL_CODEX_PROFILE='Default'\n"));
     }
 
     #[test]
@@ -3605,6 +3681,7 @@ fn stdio_export_script(
     profile_config_format: CodexProfileConfigFormat,
 ) -> String {
     let mut script = String::from("#!/bin/sh\n");
+    let model_provider = normalize_model_provider(model_provider, profile);
     push_shell_export(
         &mut script,
         CODEX_CLI_PATH_ENV,
@@ -3621,7 +3698,7 @@ fn stdio_export_script(
     if let Some(profile) = profile {
         push_shell_export(&mut script, CODEX_PROFILE_ENV, profile);
     }
-    if let Some(model_provider) = model_provider {
+    if let Some(model_provider) = model_provider.as_deref() {
         push_shell_export(&mut script, CODEX_MODEL_PROVIDER_ENV, model_provider);
     }
     if let Some(core_mode) = core_mode {

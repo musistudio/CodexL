@@ -343,7 +343,7 @@ impl BotProfileConfig {
         let saved_config_selected = !self.saved_config_id.is_empty();
         let explicit_tenant_id = self.tenant_id.trim().to_string();
         let explicit_integration_id = self.integration_id.trim().to_string();
-        let explicit_state_dir = normalize_home_path(&self.state_dir);
+        let explicit_state_dir = normalize_bot_state_dir(&self.state_dir);
 
         if !self.enabled || self.platform == BOT_PLATFORM_NONE {
             self.enabled = false;
@@ -851,11 +851,11 @@ impl AppConfig {
     }
 
     pub fn active_cli_profile(&self) -> Option<String> {
-        if self.active_provider.trim() == DEFAULT_PROVIDER_PROFILE_NAME {
+        let profile = self.provider_profile(&self.active_provider)?;
+        if is_default_provider(&profile) {
             return None;
         }
 
-        let profile = self.provider_profile(&self.active_provider)?;
         if is_providerless_workspace(&profile) {
             return None;
         }
@@ -874,11 +874,11 @@ impl AppConfig {
     }
 
     pub fn active_cli_model_provider(&self) -> Option<String> {
-        if self.active_provider.trim() == DEFAULT_PROVIDER_PROFILE_NAME {
+        let profile = self.provider_profile(&self.active_provider)?;
+        if is_default_provider(&profile) {
             return None;
         }
 
-        let profile = self.provider_profile(&self.active_provider)?;
         if provider_profile_uses_next_ai_gateway(&profile) {
             return None;
         }
@@ -1230,7 +1230,24 @@ fn config_path() -> PathBuf {
         }
     }
 
-    codexl_home_dir().join("config.json")
+    #[cfg(test)]
+    {
+        std::env::temp_dir().join(format!("codexl-test-config-{}.json", std::process::id()))
+    }
+
+    #[cfg(not(test))]
+    {
+        let path = codexl_home_dir().join("config.json");
+        if cfg!(windows) && std::env::var("CODEXL_HOME").is_err() && !path.exists() {
+            if let Some(legacy_path) = legacy_windows_roaming_codexl_home_dir()
+                .map(|home| home.join("config.json"))
+                .filter(|legacy_path| legacy_path.exists() && legacy_path != &path)
+            {
+                return legacy_path;
+            }
+        }
+        path
+    }
 }
 
 pub fn default_codex_home() -> String {
@@ -2383,6 +2400,35 @@ pub fn normalize_home_path(path: &str) -> String {
     trimmed.to_string()
 }
 
+fn normalize_bot_state_dir(path: &str) -> String {
+    let normalized = normalize_home_path(path);
+    if cfg!(windows) {
+        if let Some(relocated) = relocate_legacy_windows_roaming_codexl_path(Path::new(&normalized))
+        {
+            return relocated.to_string_lossy().to_string();
+        }
+    }
+    normalized
+}
+
+fn relocate_legacy_windows_roaming_codexl_path(path: &Path) -> Option<PathBuf> {
+    let legacy_home = legacy_windows_roaming_codexl_home_dir()?;
+    relocate_path_from_legacy_codexl_home(path, &legacy_home, &codexl_home_dir())
+}
+
+fn relocate_path_from_legacy_codexl_home(
+    path: &Path,
+    legacy_home: &Path,
+    target_home: &Path,
+) -> Option<PathBuf> {
+    if legacy_home == target_home {
+        return None;
+    }
+    path.strip_prefix(legacy_home)
+        .ok()
+        .map(|relative| target_home.join(relative))
+}
+
 fn codexl_home_dir() -> PathBuf {
     std::env::var("CODEXL_HOME")
         .ok()
@@ -2391,6 +2437,9 @@ fn codexl_home_dir() -> PathBuf {
         .map(|value| PathBuf::from(normalize_home_path(&value)))
         .unwrap_or_else(|| {
             if cfg!(windows) {
+                if let Some(local_app_data) = env_path_without_home_expansion("LOCALAPPDATA") {
+                    return local_app_data.join("CodexL");
+                }
                 if let Some(app_data) = env_path_without_home_expansion("APPDATA") {
                     return app_data.join("CodexL");
                 }
@@ -2399,6 +2448,13 @@ fn codexl_home_dir() -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".codexl")
         })
+}
+
+fn legacy_windows_roaming_codexl_home_dir() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    env_path_without_home_expansion("APPDATA").map(|app_data| app_data.join("CodexL"))
 }
 
 fn user_home_dir() -> Option<PathBuf> {
@@ -4416,6 +4472,26 @@ requires_openai_auth = true
     }
 
     #[test]
+    fn default_provider_selected_by_id_does_not_inject_cli_profile_overrides() {
+        let id = "11111111-1111-4111-8111-111111111111".to_string();
+        let config = AppConfig {
+            active_provider: id.clone(),
+            provider_profiles: vec![ProviderProfile {
+                id,
+                name: DEFAULT_PROVIDER_PROFILE_NAME.to_string(),
+                codex_profile_name: DEFAULT_PROVIDER_PROFILE_NAME.to_string(),
+                provider_name: "default".to_string(),
+                model: "custom-model".to_string(),
+                ..ProviderProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        assert_eq!(config.active_cli_profile(), None);
+        assert_eq!(config.active_cli_model_provider(), None);
+    }
+
+    #[test]
     fn app_config_normalize_populates_device_uuid() {
         let mut config = AppConfig {
             device_uuid: "not-a-uuid".to_string(),
@@ -5046,6 +5122,26 @@ model_reasoning_effort = "high"
         assert_eq!(bot.tenant_id, "tenant-1");
         assert_eq!(bot.integration_id, "integration-1");
         assert!(bot.state_dir.ends_with("bot-state"));
+    }
+
+    #[test]
+    fn relocates_bot_state_dir_from_legacy_codexl_home() {
+        let legacy_home = PathBuf::from(r"C:\Users\me\AppData\Roaming\CodexL");
+        let target_home = PathBuf::from(r"C:\Users\me\AppData\Local\CodexL");
+        let legacy_state_dir = legacy_home.join("bot-gateway").join("workspace");
+
+        assert_eq!(
+            relocate_path_from_legacy_codexl_home(&legacy_state_dir, &legacy_home, &target_home),
+            Some(target_home.join("bot-gateway").join("workspace"))
+        );
+        assert_eq!(
+            relocate_path_from_legacy_codexl_home(
+                Path::new(r"D:\bot-state"),
+                &legacy_home,
+                &target_home,
+            ),
+            None
+        );
     }
 
     #[test]
