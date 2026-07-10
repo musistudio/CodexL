@@ -7,9 +7,25 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-const DEFAULT_MAC_APP_NAMES: &[&str] = &["Codex.app", "OpenAI Codex.app"];
-const DEFAULT_WINDOWS_APP_DIRS: &[&str] = &["Codex", "OpenAI Codex", "OpenAICodex"];
+const DEFAULT_MAC_APP_NAMES: &[&str] = &[
+    "ChatGPT.app",
+    "OpenAI ChatGPT.app",
+    "Codex.app",
+    "OpenAI Codex.app",
+];
+const DEFAULT_WINDOWS_APP_DIRS: &[&str] = &[
+    "ChatGPT",
+    "OpenAI ChatGPT",
+    "OpenAIChatGPT",
+    "Codex",
+    "OpenAI Codex",
+    "OpenAICodex",
+];
 const DEFAULT_WINDOWS_EXE_NAMES: &[&str] = &[
+    "ChatGPT.exe",
+    "chatgpt.exe",
+    "OpenAI ChatGPT.exe",
+    "OpenAIChatGPT.exe",
     "Codex.exe",
     "codex.exe",
     "OpenAI Codex.exe",
@@ -17,6 +33,11 @@ const DEFAULT_WINDOWS_EXE_NAMES: &[&str] = &[
 ];
 #[cfg(windows)]
 const DEFAULT_WINDOWS_PACKAGE_PREFIXES: &[&str] = &[
+    "OpenAI.ChatGPT_",
+    "OpenAI.ChatGPTApp_",
+    "OpenAI.OpenAIChatGPT_",
+    "OpenAIChatGPT_",
+    "ChatGPT_",
     "OpenAI.Codex_",
     "OpenAI.CodexApp_",
     "OpenAICodex_",
@@ -759,6 +780,19 @@ fn safe_path_segment(value: &str) -> String {
 }
 
 fn find_mac_app() -> Option<String> {
+    for key in [
+        "CODEXL_CHATGPT_PATH",
+        "CHATGPT_APP_PATH",
+        "CODEXL_CODEX_PATH",
+        "CODEX_APP_PATH",
+    ] {
+        if let Some(path) = env_path(key) {
+            if let Some(exe) = normalize_mac_app_candidate(&path) {
+                return Some(exe);
+            }
+        }
+    }
+
     let home = user_home_dir();
     let candidates: Vec<PathBuf> = DEFAULT_MAC_APP_NAMES
         .iter()
@@ -772,17 +806,30 @@ fn find_mac_app() -> Option<String> {
         .collect();
 
     for app_path in &candidates {
-        if app_path.is_dir() {
-            if let Some(exe) = executable_from_app_bundle(app_path) {
-                return Some(exe);
-            }
+        if let Some(exe) = normalize_mac_app_candidate(app_path) {
+            return Some(exe);
         }
     }
     None
 }
 
+fn normalize_mac_app_candidate(path: &Path) -> Option<String> {
+    if path.is_file() {
+        return Some(path.to_string_lossy().to_string());
+    }
+    if path.is_dir() {
+        return executable_from_app_bundle(path);
+    }
+    None
+}
+
 fn find_windows_app() -> Option<String> {
-    for key in ["CODEXL_CODEX_PATH", "CODEX_APP_PATH"] {
+    for key in [
+        "CODEXL_CHATGPT_PATH",
+        "CHATGPT_APP_PATH",
+        "CODEXL_CODEX_PATH",
+        "CODEX_APP_PATH",
+    ] {
         if let Some(path) = env_path(key) {
             if let Some(path) = normalize_windows_codex_app_candidate(path) {
                 return Some(path.to_string_lossy().to_string());
@@ -904,10 +951,17 @@ fn windows_codex_exe_name_matches(file_name: &str) -> bool {
 
 #[cfg(windows)]
 fn windows_where_codex_candidates() -> Vec<PathBuf> {
-    ["Codex", "codex", "OpenAI Codex"]
-        .iter()
-        .flat_map(|name| where_command_candidates(name))
-        .collect()
+    [
+        "ChatGPT",
+        "chatgpt",
+        "OpenAI ChatGPT",
+        "Codex",
+        "codex",
+        "OpenAI Codex",
+    ]
+    .iter()
+    .flat_map(|name| where_command_candidates(name))
+    .collect()
 }
 
 #[cfg(not(windows))]
@@ -985,9 +1039,12 @@ fn windows_app_candidates_from_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
 #[cfg(windows)]
 fn windows_appx_package_candidates_from_powershell() -> Vec<PathBuf> {
     let script = r#"
-$packages = Get-AppxPackage -Name '*Codex*' -ErrorAction SilentlyContinue
+$packages = @(
+  Get-AppxPackage -Name '*ChatGPT*' -ErrorAction SilentlyContinue
+  Get-AppxPackage -Name '*Codex*' -ErrorAction SilentlyContinue
+)
 foreach ($package in $packages) {
-  if ($package.Name -match 'Codex|OpenAI' -or $package.PackageFullName -match 'Codex|OpenAI') {
+  if ($package.Name -match 'ChatGPT|Codex|OpenAI' -or $package.PackageFullName -match 'ChatGPT|Codex|OpenAI') {
     $package.InstallLocation
   }
 }
@@ -1050,7 +1107,7 @@ $roots = @(
   'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
 )
 foreach ($item in Get-ItemProperty $roots -ErrorAction SilentlyContinue) {
-  if ($item.DisplayName -match '(^|\s)(OpenAI\s+)?Codex(\s|$)') {
+  if ($item.DisplayName -match '(^|\s)(OpenAI\s+)?(ChatGPT|Codex)(\s|$)') {
     $item.DisplayIcon
     $item.InstallLocation
     $item.UninstallString
@@ -1325,10 +1382,12 @@ fn is_codex_electron_app_for_profile(command: &str, profile_name: &str) -> bool 
 #[cfg(any(unix, windows))]
 fn command_looks_like_codex_electron_app(command: &str) -> bool {
     let normalized = command.replace('\\', "/").to_ascii_lowercase();
-    (normalized.contains(".app/contents/macos/codex")
-        || normalized.contains("/codex.exe")
-        || normalized.ends_with("codex.exe"))
-        && normalized.contains("--remote-debugging-port=")
+    normalized.contains("--remote-debugging-port=")
+        && (normalized.contains(".app/contents/macos/")
+            || DEFAULT_WINDOWS_EXE_NAMES.iter().any(|name| {
+                let name = name.to_ascii_lowercase();
+                normalized.contains(&format!("/{name}")) || normalized.ends_with(&name)
+            }))
 }
 
 #[cfg(any(unix, windows))]
@@ -1502,6 +1561,24 @@ mod tests {
     }
 
     #[test]
+    fn resolves_cli_from_chatgpt_app_resources_without_launching_app_binary() {
+        let root = unique_test_dir("chatgpt-cli-resources");
+        let macos_dir = root.join("ChatGPT.app").join("Contents").join("MacOS");
+        let resources_dir = root.join("ChatGPT.app").join("Contents").join("Resources");
+        std::fs::create_dir_all(&macos_dir).expect("create MacOS dir");
+        std::fs::create_dir_all(&resources_dir).expect("create Resources dir");
+        let app_executable = macos_dir.join("ChatGPT");
+        let cli_executable = resources_dir.join("codex");
+        std::fs::write(&app_executable, "").expect("write app executable");
+        std::fs::write(&cli_executable, "").expect("write cli executable");
+
+        let resolved = resolve_codex_cli_executable(None, &app_executable.to_string_lossy());
+        assert_eq!(resolved, cli_executable.to_string_lossy().to_string());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn cli_resolver_never_falls_back_to_macos_app_executable() {
         let app_executable = "/tmp/MissingCodex.app/Contents/MacOS/Codex";
 
@@ -1528,6 +1605,14 @@ mod tests {
             "/Applications/Codex.app/Contents/Resources/codex app-server",
             "17fd99a1"
         ));
+    }
+
+    #[test]
+    fn detects_chatgpt_electron_app_for_profile() {
+        let command = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=9227 --user-data-dir=/Users/me/.codex/.codexl/codex-app-user-data/17fd99a1";
+
+        assert!(is_codex_electron_app_for_profile(command, "17fd99a1"));
+        assert!(!is_codex_electron_app_for_profile(command, "other"));
     }
 
     #[test]

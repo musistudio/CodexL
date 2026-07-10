@@ -378,7 +378,7 @@ fn resolve_codex_executable(config: &mut AppConfig) -> Result<String, String> {
         return Ok(configured.to_string());
     }
 
-    let detected = launcher::find_codex_app().ok_or_else(|| "Codex app not found".to_string())?;
+    let detected = launcher::find_codex_app().ok_or_else(|| "ChatGPT app not found".to_string())?;
     config.codex_path = detected.clone();
     Ok(detected)
 }

@@ -3823,6 +3823,8 @@ fn codex_cli_app_server_executable() -> Option<String> {
         }
     }
     for app in [
+        "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+        "/Applications/OpenAI ChatGPT.app/Contents/MacOS/OpenAI ChatGPT",
         "/Applications/Codex.app/Contents/MacOS/Codex",
         "/Applications/OpenAI Codex.app/Contents/MacOS/OpenAI Codex",
     ] {
@@ -4996,9 +4998,10 @@ fn computer_use_node_relay_node_path() -> Option<PathBuf> {
 }
 
 fn computer_use_node_relay_node_candidates() -> Vec<PathBuf> {
-    let mut candidates = vec![PathBuf::from(
-        "/Applications/Codex.app/Contents/Resources/node",
-    )];
+    let mut candidates = vec![
+        PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/node"),
+        PathBuf::from("/Applications/Codex.app/Contents/Resources/node"),
+    ];
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
             candidates.push(dir.join(if cfg!(windows) { "node.exe" } else { "node" }));
@@ -11235,7 +11238,7 @@ fn wait_for_codex_app_response_with_events(
         }),
     );
     Err(format!(
-        "timed out waiting for Codex App {} response: {}",
+        "timed out waiting for ChatGPT app {} response: {}",
         request_kind, request_id
     ))
 }
@@ -11567,7 +11570,7 @@ fn claude_control_response_for_permission(
         permission_response.insert("updatedInput".to_string(), input);
     } else {
         permission_response.insert("behavior".to_string(), json!("deny"));
-        permission_response.insert("message".to_string(), json!("Denied in Codex App"));
+        permission_response.insert("message".to_string(), json!("Denied in ChatGPT app"));
     }
     claude_control_response_success(request_id, Value::Object(permission_response))
 }

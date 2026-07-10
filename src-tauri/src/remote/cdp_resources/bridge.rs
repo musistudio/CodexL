@@ -1432,7 +1432,7 @@ pub(super) fn web_bridge_dispatch_expression(message: &Value) -> String {
               if (thread.modelProvider === "claude-code" || thread.source === "claude-code") {{
                 return;
               }}
-              // Remote-created threads did not run Codex App's local createConversation()
+              // Remote-created threads did not run ChatGPT app's local createConversation()
               // path, so seed local conversation state before turn stream notifications arrive.
               dispatchLocalCodexAppMessage({{
                 type: "mcp-notification",

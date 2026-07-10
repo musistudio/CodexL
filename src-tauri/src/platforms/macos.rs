@@ -109,7 +109,7 @@ fn is_automation_denied(stderr: &str) -> bool {
 #[cfg(target_os = "macos")]
 fn automation_denied_message(target: &str, stderr: &str) -> String {
     format!(
-        "macOS Automation permission is denied for CodexL to control {}. Enable CodexL in System Settings > Privacy & Security > Automation, then start Codex again.{}",
+        "macOS Automation permission is denied for CodexL to control {}. Enable CodexL in System Settings > Privacy & Security > Automation, then start ChatGPT again.{}",
         target,
         if stderr.is_empty() {
             String::new()

@@ -1,6 +1,6 @@
 # CodexL
 
-CodexL 是 Codex App 的全功能启动器与体验增强套件。它把 Codex 变成一个多 workspace 的 AI 开发控制台：启动更快、项目隔离更清晰、供应商和代理配置更好管、手机可远控，还能通过内置网关扩展把 Codex 接入更多工作流。
+CodexL 是 ChatGPT 桌面端 Codex 体验的全功能启动器与增强套件。它把 Codex 变成一个多 workspace 的 AI 开发控制台：启动更快、项目隔离更清晰、供应商和代理配置更好管、手机可远控，还能通过内置网关扩展把 Codex 接入更多工作流。
 
 ![https://codexl.io/_next/static/media/ui-preview.0-xm_pna~f-hv.webp](https://codexl.io/_next/static/media/ui-preview.0-xm_pna~f-hv.webp)
 
@@ -10,14 +10,14 @@ English documentation is available in [README.md](README.md).
 
 ## 为什么选择 CodexL
 
-CodexL 为高频 AI 开发者提供一个集中管理 Codex App 的桌面控制台。每个项目都可以拥有独立 workspace 配置、模型供应商设置、代理链路和远控入口，并通过桌面端集中启动、停止、切换和管理。
+CodexL 为高频 AI 开发者提供一个集中管理 ChatGPT 中 Codex 体验的桌面控制台。每个项目都可以拥有独立 workspace 配置、模型供应商设置、代理链路和远控入口，并通过桌面端集中启动、停止、切换和管理。
 
-用 CodexL 告别反复改配置、混用工作空间、供应商切换混乱和离开电脑就失联的体验。一次配置，多空间起飞，让 Codex App 从本地工具升级为可管理、可远控、可扩展的 AI 开发中枢。
+用 CodexL 告别反复改配置、混用工作空间、供应商切换混乱和离开电脑就失联的体验。一次配置，多空间起飞，让 ChatGPT 中的 Codex 从本地工具升级为可管理、可远控、可扩展的 AI 开发中枢。
 
 ## 项目亮点
 
 - 一个启动器管住所有 Codex workspace，项目隔离更干净，切换上下文更轻松。
-- 一键启动 Codex App，提前带好供应商、代理、语言和 workspace 配置，少折腾，多产出。
+- 一键启动 ChatGPT，提前带好供应商、代理、语言和 workspace 配置，少折腾，多产出。
 - 每个 workspace 都能开启手机远控，离开电脑也能持续跟进 Codex 任务。
 - 内置 Bot Gateway 和 NeXT AI Gateway，把 Codex 接入 IM 平台和更灵活的供应商工作流。
 - 自带移动控制体验，扫码或打开会话链接即可把手机变成 Codex 的移动控制面板。

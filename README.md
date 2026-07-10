@@ -1,6 +1,6 @@
 # CodexL
 
-CodexL is the all-in-one launcher and enhancement suite for Codex App. It turns Codex into a multi-workspace command center where you can launch faster, keep projects isolated, manage provider and proxy profiles, control Codex from your phone, and extend your AI workflow with built-in gateway power.
+CodexL is the all-in-one launcher and enhancement suite for the ChatGPT desktop app's Codex experience. It turns Codex into a multi-workspace command center where you can launch faster, keep projects isolated, manage provider and proxy profiles, control Codex from your phone, and extend your AI workflow with built-in gateway power.
 
 ![https://codexl.io/_next/static/media/ui-preview.0-xm_pna~f-hv.webp](https://codexl.io/_next/static/media/ui-preview.0-xm_pna~f-hv.webp)
 
@@ -10,7 +10,7 @@ Detailed documentation: [https://codexl.io/docs](https://codexl.io/docs).
 
 ## Why CodexL
 
-CodexL gives developers a focused control center for Codex App. Every project can have its own workspace profile, model-provider setup, proxy route, and remote-control access, all managed from one polished desktop cockpit.
+CodexL gives developers a focused control center for Codex in ChatGPT. Every project can have its own workspace profile, model-provider setup, proxy route, and remote-control access, all managed from one polished desktop cockpit.
 
 Use CodexL to remove config juggling, protect workspace boundaries, switch model providers with confidence, and keep Codex reachable from your phone when you step away from your desk.
 

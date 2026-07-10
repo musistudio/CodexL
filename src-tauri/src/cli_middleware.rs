@@ -268,7 +268,7 @@ fn resolve_real_cli_path(
     bundled_cli_path(codex_app_executable)
         .ok_or_else(|| {
             format!(
-                "Could not resolve bundled Codex CLI from Codex app executable: {}",
+                "Could not resolve bundled Codex CLI from ChatGPT app executable: {}",
                 codex_app_executable
             )
         })

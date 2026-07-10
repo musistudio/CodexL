@@ -1,6 +1,6 @@
 use crate::{
     config::{self, AppConfig, ProviderProfile},
-    launcher, remote, server, AppState,
+    remote, server, AppState,
 };
 use std::collections::HashSet;
 use std::process::Command;
@@ -292,28 +292,7 @@ fn raise_codex_app_window(info: &server::LaunchInfo) -> Result<(), String> {
     let Some(pid) = info.pid else {
         return Err(format!("workspace {} is not running", info.profile_name));
     };
-    match raise_process_window(pid) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            if let Some(app_path) = codex_app_bundle_path(&info.codex_path) {
-                let output = Command::new("/usr/bin/open")
-                    .arg(app_path)
-                    .output()
-                    .map_err(|open_err| open_err.to_string())?;
-                if output.status.success() {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "{}; open fallback failed: {}",
-                        err,
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ))
-                }
-            } else {
-                Err(err)
-            }
-        }
-    }
+    raise_process_window(pid)
 }
 
 fn raise_process_window(pid: u32) -> Result<(), String> {
@@ -336,26 +315,4 @@ end tell"#,
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
-}
-
-fn codex_app_bundle_path(codex_path: &str) -> Option<String> {
-    let path = std::path::Path::new(codex_path);
-    let mut current = Some(path);
-    while let Some(candidate) = current {
-        if candidate.extension().and_then(|ext| ext.to_str()) == Some("app") {
-            return Some(candidate.to_string_lossy().to_string());
-        }
-        current = candidate.parent();
-    }
-    launcher::find_codex_app().and_then(|value| {
-        let path = std::path::Path::new(&value);
-        let mut current = Some(path);
-        while let Some(candidate) = current {
-            if candidate.extension().and_then(|ext| ext.to_str()) == Some("app") {
-                return Some(candidate.to_string_lossy().to_string());
-            }
-            current = candidate.parent();
-        }
-        None
-    })
 }

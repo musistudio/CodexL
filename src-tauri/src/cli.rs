@@ -345,7 +345,7 @@ fn run_codex_app_command(args: &[String]) -> Result<i32, String> {
     match args.first().map(String::as_str) {
         Some("find") | None => {
             let path =
-                launcher::find_codex_app().ok_or_else(|| "Codex app not found".to_string())?;
+                launcher::find_codex_app().ok_or_else(|| "ChatGPT app not found".to_string())?;
             println!("{}", path);
             Ok(0)
         }

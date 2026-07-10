@@ -80,9 +80,9 @@ const CONTROL_STRINGS = {
     qualityMedium: "Smooth",
     remoteMode: "Remote mode",
     retry: "Retry",
-    screenLabel: "Codex app screen",
+    screenLabel: "ChatGPT app screen",
     secureWeb: "Use HTTPS",
-    webAssetVersion: "Codex app version",
+    webAssetVersion: "ChatGPT app version",
     webFrameTitle: "Remote workspace view",
     webMode: "Workspace",
     status: {
@@ -141,9 +141,9 @@ const CONTROL_STRINGS = {
     qualityMedium: "流畅",
     remoteMode: "远程模式",
     retry: "重试",
-    screenLabel: "Codex 应用画面",
+    screenLabel: "ChatGPT 应用画面",
     secureWeb: "使用 HTTPS",
-    webAssetVersion: "Codex App 版本",
+    webAssetVersion: "ChatGPT app 版本",
     webFrameTitle: "远程工作区视图",
     webMode: "工作区",
     status: {

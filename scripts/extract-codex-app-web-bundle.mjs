@@ -12,7 +12,7 @@ import {
 import { dirname, join, posix, relative, resolve } from "node:path";
 
 const repoRoot = resolve(import.meta.dirname, "..");
-const defaultAppPath = process.env.CODEX_APP_PATH || "/Applications/Codex.app";
+const defaultAppPath = defaultHostAppPath();
 const defaultOutDir = "dist/codex-app-web";
 const defaultBridgeScriptPath = "src-tauri/src/remote/cdp_resources/bridge_script.rs";
 const defaultPluginRuntimeScriptPath = "src-tauri/src/remote/cdp_resources/plugin_runtime.rs";
@@ -39,7 +39,7 @@ const writeLatestAlias = args.latest !== false;
 const writeHeaders = args.headers !== false;
 
 if (!existsSync(asarPath)) {
-  fail(`Codex App ASAR not found: ${asarPath}`);
+  fail(`ChatGPT app ASAR not found: ${asarPath}`);
 }
 
 if (!existsSync(bridgeScriptPath)) {
@@ -55,7 +55,7 @@ const packageJson = JSON.parse(readAsarFileText(asar, "package.json"));
 const detectedVersion = String(packageJson.version || "").trim();
 const version = normalizeVersion(args.version || detectedVersion);
 if (!version) {
-  fail("Could not determine Codex App version. Pass --version <version>.");
+  fail("Could not determine ChatGPT app version. Pass --version <version>.");
 }
 
 const versionDir = join(outDir, version);
@@ -103,8 +103,8 @@ const buildId = sha256(
 );
 const manifest = {
   schemaVersion: registrySchemaVersion,
-  product: packageJson.productName || "Codex",
-  packageName: packageJson.name || "openai-codex-electron",
+  product: packageJson.productName || "ChatGPT",
+  packageName: packageJson.name || "chatgpt",
   appVersion: version,
   buildId,
   entry: "index.html",
@@ -143,9 +143,35 @@ if (writeHeaders) {
   writeCloudflareHeaders(outDir, runtimeDirName);
 }
 
-console.log(`Extracted Codex App web bundle ${version}`);
+console.log(`Extracted ChatGPT app web bundle ${version}`);
 console.log(`Registry directory: ${outDir}`);
 console.log(`Entry: ${join(versionDir, "index.html")}`);
+
+function defaultHostAppPath() {
+  for (const value of [
+    process.env.CODEXL_CHATGPT_PATH,
+    process.env.CHATGPT_APP_PATH,
+    process.env.CODEXL_CODEX_PATH,
+    process.env.CODEX_APP_PATH,
+  ]) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  for (const candidate of [
+    "/Applications/ChatGPT.app",
+    "/Applications/OpenAI ChatGPT.app",
+    "/Applications/Codex.app",
+    "/Applications/OpenAI Codex.app",
+  ]) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return "/Applications/ChatGPT.app";
+}
 
 function parseArgs(argv) {
   const parsed = {
@@ -228,10 +254,10 @@ function printUsage() {
   pnpm run extract:codex-web -- [options]
 
 Options:
-  --app <path>            Codex.app path. Default: ${defaultAppPath}
+  --app <path>            ChatGPT.app path. Default: ${defaultAppPath}
   --asar <path>           app.asar path. Defaults to <app>/Contents/Resources/app.asar
   --out-dir <path>        Static registry output directory. Default: ${defaultOutDir}
-  --version <version>     Override detected Codex App version
+  --version <version>     Override detected ChatGPT app version
   --bridge-script <path>  Rust bridge script source. Default: ${defaultBridgeScriptPath}
   --plugin-runtime-script <path>
                            Rust plugin runtime source. Default: ${defaultPluginRuntimeScriptPath}
@@ -534,14 +560,14 @@ function writeLatestIndex(root, version) {
     join(latestDir, "index.html"),
     `<!doctype html>
 <meta charset="utf-8">
-<title>Codex App Web Bundle</title>
+<title>ChatGPT App Web Bundle</title>
 <script>
   const target = new URL("../${escapeHtml(version)}/index.html", location.href);
   target.search = location.search;
   target.hash = location.hash;
   location.replace(target);
 </script>
-<noscript><a href="../${escapeHtml(version)}/index.html">Open latest Codex App web bundle</a></noscript>
+<noscript><a href="../${escapeHtml(version)}/index.html">Open latest ChatGPT app web bundle</a></noscript>
 `,
   );
 }

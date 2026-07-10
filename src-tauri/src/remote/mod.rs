@@ -4502,7 +4502,7 @@ async fn cli_desktop_api_fetch_response(
     let auth_token = cli_chatgpt_auth_token(codex_home, workspace_name).ok_or_else(|| {
         (
             432,
-            "Sign in to ChatGPT in Codex Desktop to transcribe audio.".to_string(),
+            "Sign in to ChatGPT in the ChatGPT desktop app to transcribe audio.".to_string(),
         )
     })?;
 

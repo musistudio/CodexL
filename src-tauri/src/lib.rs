@@ -87,7 +87,7 @@ async fn find_codex(state: tauri::State<'_, AppState>) -> Result<String, String>
     if !configured_path.is_empty() && std::path::Path::new(&configured_path).is_file() {
         return Ok(configured_path);
     }
-    let detected = launcher::find_codex_app().ok_or_else(|| "Codex app not found".to_string())?;
+    let detected = launcher::find_codex_app().ok_or_else(|| "ChatGPT app not found".to_string())?;
     let mut config = state.config.lock().await;
     let current = config.codex_path.trim();
     if current.is_empty() || !std::path::Path::new(current).is_file() {
@@ -510,7 +510,7 @@ async fn launch_codex(
     )
     .await?;
     if let Err(err) = focus_codex_app_window(&info) {
-        eprintln!("Failed to focus Codex App window: {}", err);
+        eprintln!("Failed to focus ChatGPT app window: {}", err);
     }
     let config = state.config.lock().await.clone();
     refresh_macos_tray_menu(&app, state.inner(), &config).await;
@@ -1417,26 +1417,18 @@ fn focus_codex_app_window(info: &server::LaunchInfo) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn focus_codex_app_window_for_platform(info: &server::LaunchInfo) -> Result<(), String> {
     if let Some(pid) = info.pid {
-        match raise_process_window(pid) {
-            Ok(()) => return Ok(()),
-            Err(err) => return open_codex_app_bundle(info, Some(err)),
-        }
+        return raise_process_window(pid);
     }
-    open_codex_app_bundle(info, None)
+    open_codex_app_bundle(info)
 }
 
 #[cfg(target_os = "macos")]
-fn open_codex_app_bundle(
-    info: &server::LaunchInfo,
-    previous_error: Option<String>,
-) -> Result<(), String> {
+fn open_codex_app_bundle(info: &server::LaunchInfo) -> Result<(), String> {
     let Some(app_path) = codex_app_bundle_path(&info.codex_path) else {
-        return Err(previous_error.unwrap_or_else(|| {
-            format!(
-                "workspace {} does not expose a process id",
-                info.profile_name
-            )
-        }));
+        return Err(format!(
+            "workspace {} does not expose a process id",
+            info.profile_name
+        ));
     };
     let output = std::process::Command::new("/usr/bin/open")
         .arg(app_path)
@@ -1444,15 +1436,9 @@ fn open_codex_app_bundle(
         .map_err(|open_err| open_err.to_string())?;
     if output.status.success() {
         Ok(())
-    } else if let Some(err) = previous_error {
-        Err(format!(
-            "{}; open fallback failed: {}",
-            err,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
     } else {
         Err(format!(
-            "open fallback failed: {}",
+            "open ChatGPT app failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }

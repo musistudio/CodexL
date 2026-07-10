@@ -37,16 +37,16 @@ iframe load the cached `/web/index.html` from the PWA's own service worker
 scope. The cached iframe receives the authenticated web bridge URL in its query
 string.
 
-## Codex App web asset registry
+## ChatGPT app web asset registry
 
-For environments that can run Codex CLI but do not have Codex App installed,
-CodexL can load the Codex App frontend from a hosted static registry instead of
+For environments that can run Codex CLI but do not have ChatGPT installed,
+CodexL can load the ChatGPT frontend from a hosted static registry instead of
 mirroring `/web/` resources from the local app.
 
-Extract the webview bundle from an installed Codex App package:
+Extract the webview bundle from an installed ChatGPT package:
 
 ```sh
-pnpm run extract:codex-web -- --app /Applications/Codex.app --clean
+pnpm run extract:codex-web -- --app /Applications/ChatGPT.app --clean
 ```
 
 The script writes a versioned static registry to `dist/codex-app-web`:
@@ -68,7 +68,7 @@ CodexL plugin runtime from the same stable runtime base. `latest/index.html`
 redirects to the newest extracted version while preserving the remote bridge
 query string.
 
-The injected CodexL runtime is intentionally outside the versioned Codex App
+The injected CodexL runtime is intentionally outside the versioned ChatGPT app
 bundle. By default, versioned pages load `../codexl-runtime/_codexl_bridge.js`,
 which in turn loads `../codexl-runtime/_codexl_plugin.js`, so bridge or plugin
 fixes can be published by replacing only the small `codexl-runtime/` files. To
