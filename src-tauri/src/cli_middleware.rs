@@ -18,6 +18,7 @@ use serde_json::{json, Map, Value};
 
 const DISABLE_ENV: &str = "CODEXL_DISABLE_CLI_MIDDLEWARE";
 const REAL_CLI_ENV: &str = "CODEXL_REAL_CODEX_CLI_PATH";
+const BUNDLED_REAL_CLI_ENV: &str = "CODEXL_BUNDLED_CODEX_CLI_PATH";
 const MIDDLEWARE_LOG_ENV: &str = "CODEXL_CLI_MIDDLEWARE_LOG";
 pub const CODEX_PROFILE_ENV: &str = "CODEXL_CODEX_PROFILE";
 pub const CODEX_MODEL_PROVIDER_ENV: &str = "CODEXL_CODEX_MODEL_PROVIDER";
@@ -27,6 +28,22 @@ const CODEX_PROFILE_CONFIG_FORMAT_ENV: &str = "CODEXL_CODEX_PROFILE_CONFIG_FORMA
 const LEGACY_CODEX_INSTANCE_NAME_ENV: &str = "CODEXL_CODEX_INSTANCE_NAME";
 const CODEX_CLI_PATH_ENV: &str = "CODEX_CLI_PATH";
 const CODEX_HOME_ENV: &str = "CODEX_HOME";
+#[cfg(target_os = "macos")]
+const SIGNED_SUPERVISOR_NODE_ENV: &str = "CODEXL_SIGNED_CODEX_SUPERVISOR_NODE_PATH";
+#[cfg(target_os = "macos")]
+const SIGNED_SUPERVISOR_SOURCE: &str = r#"const { spawn } = require("node:child_process");
+const executable = process.argv[1];
+const args = process.argv.slice(2);
+const child = spawn(executable, args, { env: process.env, stdio: "inherit" });
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.once(signal, () => child.kill(signal));
+}
+child.once("error", (error) => {
+  console.error(`Failed to launch supervised Codex CLI: ${error.message}`);
+  process.exit(1);
+});
+child.once("exit", (code) => process.exit(code ?? 1));
+"#;
 const RUN_MODE_ARG: &str = "--codexl-cli-middleware";
 const STDIO_RUN_MODE_ARG: &str = "--codexl-cli-stdio";
 const BOT_MEDIA_MCP_RUN_MODE_ARG: &str = "--codexl-bot-media-mcp";
@@ -118,7 +135,8 @@ pub fn prepare(
     let profile_config_format =
         crate::config::codex_profile_config_format_for_cli(&real_cli_path.to_string_lossy());
     let host_executable = std::env::current_exe().map_err(|e| e.to_string())?;
-    write_middleware(&executable_path, &host_executable)?;
+    write_middleware(&executable_path, &host_executable, &real_cli_path)?;
+    write_real_cli_cache(&real_cli_path)?;
     let log_path = default_log_path();
     let codex_home = normalize_profile(codex_home);
     let profile = normalize_profile(codex_profile);
@@ -247,12 +265,14 @@ fn resolve_real_cli_path(
     codex_app_executable: &str,
     middleware_path: &Path,
 ) -> Result<PathBuf, String> {
-    let explicit_real_cli = std::env::var(REAL_CLI_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    if let Some(path) = explicit_real_cli {
-        return prepare_real_cli_path(expand_home_path(&path));
+    for key in [REAL_CLI_ENV, BUNDLED_REAL_CLI_ENV] {
+        let explicit_real_cli = std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if let Some(path) = explicit_real_cli {
+            return prepare_real_cli_path(expand_home_path(&path));
+        }
     }
 
     let inherited_cli = std::env::var(CODEX_CLI_PATH_ENV)
@@ -273,6 +293,59 @@ fn resolve_real_cli_path(
             )
         })
         .and_then(prepare_real_cli_path)
+}
+
+fn resolve_runtime_real_cli_path() -> Result<PathBuf, String> {
+    let mut invalid_candidates = Vec::new();
+    for (source, value) in [
+        (REAL_CLI_ENV, std::env::var(REAL_CLI_ENV).ok()),
+        (
+            BUNDLED_REAL_CLI_ENV,
+            std::env::var(BUNDLED_REAL_CLI_ENV).ok(),
+        ),
+        (CODEX_CLI_PATH_ENV, std::env::var(CODEX_CLI_PATH_ENV).ok()),
+        (
+            "cached real CLI path",
+            std::fs::read_to_string(real_cli_cache_path()).ok(),
+        ),
+    ] {
+        let Some(value) = value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let path = expand_home_path(&value);
+        if cli_path_is_middleware(&path) {
+            continue;
+        }
+        match prepare_real_cli_path(path) {
+            Ok(path) => return Ok(path),
+            Err(error) => invalid_candidates.push(format!("{}: {}", source, error)),
+        }
+    }
+
+    if invalid_candidates.is_empty() {
+        Err(format!(
+            "Could not resolve the real Codex CLI; {} and {} are not set and the cached path is missing",
+            REAL_CLI_ENV, BUNDLED_REAL_CLI_ENV
+        ))
+    } else {
+        Err(format!(
+            "Could not resolve the real Codex CLI ({})",
+            invalid_candidates.join("; ")
+        ))
+    }
+}
+
+fn cli_path_is_middleware(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .map(|name| {
+            name.to_ascii_lowercase()
+                .starts_with("codexl-codex-cli-middleware")
+        })
+        .unwrap_or(false)
 }
 
 fn prepare_real_cli_path(path: PathBuf) -> Result<PathBuf, String> {
@@ -397,6 +470,25 @@ fn middleware_path() -> PathBuf {
     codexl_home_dir()
         .join("bin")
         .join(windows_versioned_middleware_file_name())
+}
+
+fn real_cli_cache_path() -> PathBuf {
+    codexl_home_dir().join("bin").join("real-codex-cli-path")
+}
+
+fn write_real_cli_cache(real_cli_path: &Path) -> Result<(), String> {
+    let path = real_cli_cache_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let content = real_cli_path.to_string_lossy();
+    let should_write = std::fs::read_to_string(&path)
+        .map(|existing| existing.trim() != content)
+        .unwrap_or(true);
+    if should_write {
+        std::fs::write(path, content.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -540,7 +632,11 @@ fn env_path_without_home_expansion(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn write_middleware(path: &Path, host_executable: &Path) -> Result<(), String> {
+fn write_middleware(
+    path: &Path,
+    host_executable: &Path,
+    real_cli_path: &Path,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -558,7 +654,7 @@ fn write_middleware(path: &Path, host_executable: &Path) -> Result<(), String> {
 
     #[cfg(not(windows))]
     {
-        let content = middleware_script(host_executable);
+        let content = middleware_script(host_executable, real_cli_path);
         let should_write = std::fs::read_to_string(path)
             .map(|existing| existing != content)
             .unwrap_or(true);
@@ -661,6 +757,40 @@ fn external_stdio_args(args: Vec<OsString>) -> Vec<OsString> {
     }
 }
 
+fn real_cli_command(real_cli: &Path, real_args: &[OsString]) -> Command {
+    #[cfg(target_os = "macos")]
+    if let Some(node) = signed_supervisor_node(real_cli) {
+        // The packaged Browser authorizer checks the connecting process plus its parent and
+        // grandparent. Keep the protocol middleware while putting a signed OpenAI runtime between
+        // CodexL and the main app-server, so node_repl's grandparent is signed `node`, not CodexL.
+        let mut command = Command::new(node);
+        command
+            .arg("-e")
+            .arg(SIGNED_SUPERVISOR_SOURCE)
+            .arg(real_cli)
+            .args(real_args);
+        return command;
+    }
+
+    let mut command = Command::new(real_cli);
+    command.args(real_args);
+    command
+}
+
+#[cfg(target_os = "macos")]
+fn signed_supervisor_node(real_cli: &Path) -> Option<PathBuf> {
+    if let Some(path) =
+        env_path_without_home_expansion(SIGNED_SUPERVISOR_NODE_ENV).filter(|path| path.is_file())
+    {
+        return Some(path);
+    }
+
+    real_cli
+        .parent()
+        .map(|resources| resources.join("cua_node").join("bin").join("node"))
+        .filter(|path| path.is_file())
+}
+
 fn run_stdio_middleware_with_io<R, W>(
     args: Vec<OsString>,
     input: R,
@@ -678,13 +808,7 @@ where
         );
     }
 
-    let real_cli = std::env::var(REAL_CLI_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("{} is not set", REAL_CLI_ENV))
-        .map(|value| expand_home_path(&value))?;
-    validate_cli_path(real_cli.clone())?;
+    let real_cli = resolve_runtime_real_cli_path()?;
 
     let profile = std::env::var(CODEX_PROFILE_ENV)
         .ok()
@@ -713,8 +837,8 @@ where
         &real_args,
     );
 
-    let mut child = Command::new(&real_cli)
-        .args(&real_args)
+    let mut command = real_cli_command(&real_cli, &real_args);
+    let mut child = command
         .env_remove(CODEX_CLI_PATH_ENV)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2702,7 +2826,7 @@ fn slugify_file_segment(value: &str) -> String {
 }
 
 #[cfg(windows)]
-fn middleware_script(host_executable: &Path) -> String {
+fn middleware_script(host_executable: &Path, _real_cli_path: &Path) -> String {
     format!(
         "@echo off\r\n\"{}\" {} %*\r\nexit /b %ERRORLEVEL%\r\n",
         host_executable.to_string_lossy(),
@@ -2731,6 +2855,11 @@ fn stdio_export_script(
         &middleware_path.to_string_lossy(),
     );
     push_cmd_env(&mut script, REAL_CLI_ENV, &real_cli_path.to_string_lossy());
+    push_cmd_env(
+        &mut script,
+        BUNDLED_REAL_CLI_ENV,
+        &real_cli_path.to_string_lossy(),
+    );
     push_cmd_env(&mut script, MIDDLEWARE_LOG_ENV, &log_path.to_string_lossy());
     if let Some(codex_home) = codex_home {
         push_cmd_env(&mut script, CODEX_HOME_ENV, codex_home);
@@ -2785,6 +2914,14 @@ mod tests {
         std::env::temp_dir().join(format!("codexl-{}-{}-{}", name, std::process::id(), nanos))
     }
 
+    fn restore_env(name: &str, value: Option<OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
+
     #[test]
     fn resolves_bundled_cli_from_macos_app_executable() {
         let root = test_dir("bundle-path");
@@ -2804,6 +2941,61 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn main_app_server_uses_signed_node_supervisor_when_bundled_node_exists() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_supervisor = std::env::var_os(SIGNED_SUPERVISOR_NODE_ENV);
+        std::env::remove_var(SIGNED_SUPERVISOR_NODE_ENV);
+
+        let root = test_dir("signed-node-supervisor");
+        let resources = root.join("ChatGPT.app").join("Contents").join("Resources");
+        let real_cli = resources.join("codex");
+        let node = resources.join("cua_node").join("bin").join("node");
+        std::fs::create_dir_all(node.parent().expect("node parent")).expect("create node dir");
+        std::fs::write(&real_cli, "").expect("write fake CLI");
+        std::fs::write(&node, "").expect("write fake node");
+
+        let args = vec![
+            OsString::from("app-server"),
+            OsString::from("--analytics-default-enabled"),
+        ];
+        let command = real_cli_command(&real_cli, &args);
+        assert_eq!(command.get_program(), node.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                OsStr::new("-e"),
+                OsStr::new(SIGNED_SUPERVISOR_SOURCE),
+                real_cli.as_os_str(),
+                OsStr::new("app-server"),
+                OsStr::new("--analytics-default-enabled"),
+            ]
+        );
+
+        restore_env(SIGNED_SUPERVISOR_NODE_ENV, old_supervisor);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn main_app_server_falls_back_to_real_cli_without_signed_node() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_supervisor = std::env::var_os(SIGNED_SUPERVISOR_NODE_ENV);
+        std::env::remove_var(SIGNED_SUPERVISOR_NODE_ENV);
+
+        let real_cli = PathBuf::from("/tmp/codex-without-bundled-node");
+        let args = vec![OsString::from("app-server")];
+        let command = real_cli_command(&real_cli, &args);
+        assert_eq!(command.get_program(), real_cli.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![OsStr::new("app-server")]
+        );
+
+        restore_env(SIGNED_SUPERVISOR_NODE_ENV, old_supervisor);
     }
 
     #[cfg(unix)]
@@ -2872,6 +3064,148 @@ printf ':stdin=%s\n' "$first_line"
             .expect("read middleware log")
             .contains("profile=test-profile model_provider=test-provider args="));
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_middleware_embeds_real_cli_path() {
+        let script = middleware_script(Path::new("/tmp/CodexL Host"), Path::new("/tmp/Real Codex"));
+
+        assert!(script.contains("export CODEXL_REAL_CODEX_CLI_PATH='/tmp/Real Codex'\n"));
+        assert!(script.contains("export CODEXL_BUNDLED_CODEX_CLI_PATH='/tmp/Real Codex'\n"));
+        assert!(script.contains(
+            "if [ \"${1:-}\" = 'sandbox' ] || { [ \"${1:-}\" = 'app-server' ] && [ \"${2:-}\" = '--listen' ] && [ \"${3:-}\" = 'stdio://' ]; }; then\n"
+        ));
+        assert!(script.contains("  unset CODEX_CLI_PATH\n"));
+        assert!(script.contains("  exec '/tmp/Real Codex' \"$@\"\n"));
+        assert!(script.contains("exec '/tmp/CodexL Host' --codexl-cli-middleware \"$@\"\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_middleware_execs_sandbox_with_real_cli() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_dir("sandbox-passthrough");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let real_cli = root.join("Real Codex");
+        let host = root.join("CodexL Host");
+        let middleware = root.join("codexl-codex-cli-middleware");
+        std::fs::write(
+            &real_cli,
+            "#!/bin/sh\nprintf 'real:%s:cli_path=%s\\n' \"$1\" \"${CODEX_CLI_PATH:-}\"\n",
+        )
+        .expect("write fake real CLI");
+        std::fs::write(&host, "#!/bin/sh\nprintf 'middleware-host\\n'\n")
+            .expect("write fake middleware host");
+        std::fs::write(&middleware, middleware_script(&host, &real_cli)).expect("write middleware");
+        for path in [&real_cli, &host, &middleware] {
+            let mut permissions = std::fs::metadata(path)
+                .expect("read executable metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).expect("chmod executable");
+        }
+
+        let output = Command::new(&middleware)
+            .arg("sandbox")
+            .env(CODEX_CLI_PATH_ENV, &middleware)
+            .output()
+            .expect("run middleware sandbox passthrough");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("utf8 stdout"),
+            "real:sandbox:cli_path=\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_middleware_execs_browser_app_server_with_real_cli() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_dir("browser-app-server-passthrough");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let real_cli = root.join("Real Codex");
+        let host = root.join("CodexL Host");
+        let middleware = root.join("codexl-codex-cli-middleware");
+        std::fs::write(
+            &real_cli,
+            "#!/bin/sh\nprintf 'real:%s:%s:%s:cli_path=%s\\n' \"$1\" \"$2\" \"$3\" \"${CODEX_CLI_PATH:-}\"\n",
+        )
+        .expect("write fake real CLI");
+        std::fs::write(&host, "#!/bin/sh\nprintf 'middleware-host\\n'\n")
+            .expect("write fake middleware host");
+        std::fs::write(&middleware, middleware_script(&host, &real_cli)).expect("write middleware");
+        for path in [&real_cli, &host, &middleware] {
+            let mut permissions = std::fs::metadata(path)
+                .expect("read executable metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).expect("chmod executable");
+        }
+
+        let output = Command::new(&middleware)
+            .args(["app-server", "--listen", "stdio://"])
+            .env(CODEX_CLI_PATH_ENV, &middleware)
+            .output()
+            .expect("run middleware browser app-server passthrough");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("utf8 stdout"),
+            "real:app-server:--listen:stdio://:cli_path=\n"
+        );
+
+        let main_output = Command::new(&middleware)
+            .args(["app-server", "--analytics-default-enabled"])
+            .env(CODEX_CLI_PATH_ENV, &middleware)
+            .output()
+            .expect("run middleware main app-server path");
+        assert!(main_output.status.success());
+        assert_eq!(
+            String::from_utf8(main_output.stdout).expect("utf8 stdout"),
+            "middleware-host\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_cli_resolver_uses_cached_path_without_environment() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("runtime-cli-cache");
+        let real_cli = root.join("codex");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        std::fs::write(&real_cli, "#!/bin/sh\nexit 0\n").expect("write fake CLI");
+        let mut permissions = std::fs::metadata(&real_cli)
+            .expect("fake CLI metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&real_cli, permissions).expect("chmod fake CLI");
+
+        let old_home = std::env::var_os("CODEXL_HOME");
+        let old_real = std::env::var_os(REAL_CLI_ENV);
+        let old_bundled = std::env::var_os(BUNDLED_REAL_CLI_ENV);
+        let old_cli_path = std::env::var_os(CODEX_CLI_PATH_ENV);
+        std::env::set_var("CODEXL_HOME", &root);
+        std::env::remove_var(REAL_CLI_ENV);
+        std::env::remove_var(BUNDLED_REAL_CLI_ENV);
+        std::env::remove_var(CODEX_CLI_PATH_ENV);
+        write_real_cli_cache(&real_cli).expect("write real CLI cache");
+
+        let resolved = resolve_runtime_real_cli_path().expect("resolve cached real CLI");
+
+        restore_env("CODEXL_HOME", old_home);
+        restore_env(REAL_CLI_ENV, old_real);
+        restore_env(BUNDLED_REAL_CLI_ENV, old_bundled);
+        restore_env(CODEX_CLI_PATH_ENV, old_cli_path);
+        assert_eq!(resolved, real_cli);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3090,6 +3424,7 @@ printf ':stdin=%s\n' "$first_line"
 
         assert!(script.contains("export CODEX_CLI_PATH='/tmp/codexl-codex-cli-middleware'\n"));
         assert!(script.contains("export CODEXL_REAL_CODEX_CLI_PATH='/tmp/Real Codex'\n"));
+        assert!(script.contains("export CODEXL_BUNDLED_CODEX_CLI_PATH='/tmp/Real Codex'\n"));
         assert!(script.contains("export CODEXL_CLI_MIDDLEWARE_LOG='/tmp/middleware.log'\n"));
         assert!(!script.contains("CODEXL_CLI_MIDDLEWARE_STDIN_LOG"));
         assert!(!script.contains("CODEXL_CLI_MIDDLEWARE_STDOUT_LOG"));
@@ -3659,9 +3994,19 @@ printf ':stdin=%s\n' "$first_line"
 }
 
 #[cfg(not(windows))]
-fn middleware_script(host_executable: &Path) -> String {
+fn middleware_script(host_executable: &Path, real_cli_path: &Path) -> String {
+    // The macOS Browser native-pipe authorizer validates the connecting Node process and its
+    // parent/grandparent signing identities. Keep CodexL out of that chain when node_repl asks the
+    // CLI to launch its sandbox or the Browser's dedicated stdio app-server. The main desktop
+    // app-server does not use `--listen stdio://`, so it still passes through the middleware.
     format!(
-        "#!/bin/sh\nexec {} {} \"$@\"\n",
+        "#!/bin/sh\nexport {}={}\nexport {}={}\nif [ \"${{1:-}}\" = 'sandbox' ] || {{ [ \"${{1:-}}\" = 'app-server' ] && [ \"${{2:-}}\" = '--listen' ] && [ \"${{3:-}}\" = 'stdio://' ]; }}; then\n  unset {}\n  exec {} \"$@\"\nfi\nexec {} {} \"$@\"\n",
+        REAL_CLI_ENV,
+        shell_quote(real_cli_path),
+        BUNDLED_REAL_CLI_ENV,
+        shell_quote(real_cli_path),
+        CODEX_CLI_PATH_ENV,
+        shell_quote(real_cli_path),
         shell_quote(host_executable),
         RUN_MODE_ARG
     )
@@ -3688,6 +4033,11 @@ fn stdio_export_script(
         &middleware_path.to_string_lossy(),
     );
     push_shell_export(&mut script, REAL_CLI_ENV, &real_cli_path.to_string_lossy());
+    push_shell_export(
+        &mut script,
+        BUNDLED_REAL_CLI_ENV,
+        &real_cli_path.to_string_lossy(),
+    );
     push_shell_export(&mut script, MIDDLEWARE_LOG_ENV, &log_path.to_string_lossy());
     if let Some(codex_home) = codex_home {
         push_shell_export(&mut script, CODEX_HOME_ENV, codex_home);

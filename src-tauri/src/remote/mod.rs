@@ -2681,8 +2681,8 @@ impl CliAppBridge {
                 command
                     .arg(cli_middleware::CLAUDE_CODE_APP_SERVER_RUN_MODE_ARG)
                     .arg("--workspace-name")
-                    .arg(&workspace_name)
-                    .env("CODEXL_BUNDLED_CODEX_CLI_PATH", &executable);
+                    .arg(&workspace_name);
+                configure_claude_code_cli_env(&mut command, &executable);
                 command
             }
         };
@@ -4142,6 +4142,12 @@ impl CliAppBridge {
             .map(|message| self.decorate_notification(message))
             .collect()
     }
+}
+
+fn configure_claude_code_cli_env(command: &mut TokioCommand, executable: &str) {
+    command
+        .env("CODEXL_REAL_CODEX_CLI_PATH", executable)
+        .env("CODEXL_BUNDLED_CODEX_CLI_PATH", executable);
 }
 
 fn cli_app_server_value_to_bridge_message(host_id: &str, value: Value) -> Value {
@@ -8427,6 +8433,31 @@ mod tests {
         assert_eq!(bearer_token("bearer   secret"), Some("secret"));
         assert_eq!(bearer_token("Basic secret"), None);
         assert_eq!(bearer_token("Bearer"), None);
+    }
+
+    #[test]
+    fn claude_code_backend_exposes_real_cli_path() {
+        let mut command = TokioCommand::new("codexl");
+        configure_claude_code_cli_env(&mut command, "/tmp/real-codex");
+        let env = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            env.get("CODEXL_REAL_CODEX_CLI_PATH"),
+            Some(&Some("/tmp/real-codex".to_string()))
+        );
+        assert_eq!(
+            env.get("CODEXL_BUNDLED_CODEX_CLI_PATH"),
+            Some(&Some("/tmp/real-codex".to_string()))
+        );
     }
 
     #[test]

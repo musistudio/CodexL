@@ -71,13 +71,8 @@ pub fn resolve_codex_cli_executable(
         return path.to_string();
     }
 
-    for key in ["CODEXL_REAL_CODEX_CLI_PATH", "CODEX_CLI_PATH"] {
-        if let Ok(value) = std::env::var(key) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return value.to_string();
-            }
-        }
+    if let Some(path) = inherited_codex_cli_executable(|key| std::env::var(key).ok()) {
+        return path;
     }
 
     if !configured_codex_path.trim().is_empty() {
@@ -93,6 +88,35 @@ pub fn resolve_codex_cli_executable(
     }
 
     "codex".to_string()
+}
+
+fn inherited_codex_cli_executable<F>(mut env_value: F) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    [
+        "CODEXL_REAL_CODEX_CLI_PATH",
+        "CODEXL_BUNDLED_CODEX_CLI_PATH",
+        "CODEX_CLI_PATH",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        env_value(key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .filter(|value| !codex_cli_path_is_middleware(value))
+    })
+}
+
+fn codex_cli_path_is_middleware(value: &str) -> bool {
+    Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.to_ascii_lowercase()
+                .starts_with("codexl-codex-cli-middleware")
+        })
+        .unwrap_or(false)
 }
 
 pub fn launch_codex(
@@ -136,7 +160,8 @@ pub fn launch_codex(
         cli_stdio_path = Some(middleware.stdio_path.to_string_lossy().to_string());
         command
             .env("CODEX_CLI_PATH", middleware.executable_path)
-            .env("CODEXL_REAL_CODEX_CLI_PATH", middleware.real_cli_path)
+            .env("CODEXL_REAL_CODEX_CLI_PATH", &middleware.real_cli_path)
+            .env("CODEXL_BUNDLED_CODEX_CLI_PATH", &middleware.real_cli_path)
             .env("CODEXL_CLI_MIDDLEWARE_LOG", middleware.log_path);
         if let Some(workspace_name) = middleware.workspace_name {
             command.env(cli_middleware::CODEX_WORKSPACE_NAME_ENV, workspace_name);
@@ -150,6 +175,10 @@ pub fn launch_codex(
         if let Some(core_mode) = middleware.core_mode {
             command.env(cli_middleware::CODEX_CORE_MODE_ENV, core_mode);
         }
+    } else if let Some(real_cli_path) = bundled_cli_path(executable) {
+        command
+            .env("CODEXL_REAL_CODEX_CLI_PATH", &real_cli_path)
+            .env("CODEXL_BUNDLED_CODEX_CLI_PATH", real_cli_path);
     }
 
     configure_bot_gateway_bridge_env(&mut command, stdio_name, bot_config, language);
@@ -1585,6 +1614,26 @@ mod tests {
         let resolved = resolve_codex_cli_executable(None, app_executable);
         assert_ne!(resolved, app_executable);
         assert!(!resolved.contains(".app/Contents/MacOS/"));
+    }
+
+    #[test]
+    fn cli_resolver_prefers_bundled_fallback_over_middleware() {
+        let resolved = inherited_codex_cli_executable(|key| match key {
+            "CODEXL_BUNDLED_CODEX_CLI_PATH" => Some(" /tmp/real-codex ".to_string()),
+            "CODEX_CLI_PATH" => Some("/tmp/codexl-codex-cli-middleware".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(resolved.as_deref(), Some("/tmp/real-codex"));
+    }
+
+    #[test]
+    fn cli_resolver_rejects_middleware_as_real_cli() {
+        let resolved = inherited_codex_cli_executable(|key| {
+            (key == "CODEX_CLI_PATH").then(|| "/tmp/codexl-codex-cli-middleware".to_string())
+        });
+
+        assert_eq!(resolved, None);
     }
 
     #[test]

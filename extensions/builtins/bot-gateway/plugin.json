@@ -2,7 +2,7 @@
   "id": "bot-gateway",
   "name": "Bot",
   "description": "Connect Codex to im platforms through the built-in Bot plugin.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "runtime": "nodejs",
   "entry": "stdio/stdio.js",
   "mode": "builtin"

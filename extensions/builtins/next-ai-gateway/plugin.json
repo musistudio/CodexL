@@ -2,7 +2,7 @@
   "id": "next-ai-gateway",
   "name": "NeXT AI Gateway",
   "description": "Use the built-in Gateway to convert other protocol interfaces for Codex.",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "runtime": "nodejs",
   "entry": "gateway/start.js",
   "mode": "builtin",
