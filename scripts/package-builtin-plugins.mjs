@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -14,10 +13,10 @@ import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 
 const require = createRequire(import.meta.url);
+const { buildSync: esbuildSync } = require("esbuild");
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const builtinPluginsDir = join(repoRoot, "extensions", "builtins");
 const packageDir = join(repoRoot, "src-tauri", "builtin-plugin-packages");
-const esbuildBin = resolveEsbuildBin();
 
 const nextAiGatewayPackage = resolvePackage("@the-next-ai/ai-gateway", "1.0.6");
 const botGatewayPackage = resolvePackage("@the-next-ai/bot-gateway", "1.0.0");
@@ -89,31 +88,25 @@ function bundleNodeEntry({ entryPoint, outputFile, format, target, packageName }
 
   mkdirSync(dirname(outputFile), { recursive: true });
   rmSync(outputFile, { force: true });
-  const args = [
-    entryPoint,
-    "--bundle",
-    "--platform=node",
-    `--target=${target}`,
-    `--format=${format}`,
-    "--minify",
-    "--legal-comments=none",
-    "--log-level=warning",
-    `--outfile=${outputFile}`,
-  ];
-  if (format === "esm") {
-    args.push(
-      '--banner:js=import { createRequire as __codexlCreateRequire } from "node:module";import { fileURLToPath as __codexlFileURLToPath } from "node:url";import { dirname as __codexlDirname } from "node:path";const require = __codexlCreateRequire(import.meta.url);const __filename = __codexlFileURLToPath(import.meta.url);const __dirname = __codexlDirname(__filename);',
-    );
-  }
-
-  execFileSync(
-    esbuildBin,
-    args,
-    {
-      cwd: repoRoot,
-      stdio: "inherit",
-    },
-  );
+  esbuildSync({
+    entryPoints: [entryPoint],
+    bundle: true,
+    platform: "node",
+    target,
+    format,
+    minify: true,
+    legalComments: "none",
+    logLevel: "warning",
+    outfile: outputFile,
+    absWorkingDir: repoRoot,
+    ...(format === "esm"
+      ? {
+          banner: {
+            js: 'import { createRequire as __codexlCreateRequire } from "node:module";import { fileURLToPath as __codexlFileURLToPath } from "node:url";import { dirname as __codexlDirname } from "node:path";const require = __codexlCreateRequire(import.meta.url);const __filename = __codexlFileURLToPath(import.meta.url);const __dirname = __codexlDirname(__filename);',
+          },
+        }
+      : {}),
+  });
 }
 
 function resolvePackage(packageName, expectedVersion) {
@@ -129,15 +122,6 @@ function resolvePackage(packageName, expectedVersion) {
     version: packageJson.version,
     dir: dirname(packageJsonPath),
   };
-}
-
-function resolveEsbuildBin() {
-  const command = process.platform === "win32" ? "esbuild.cmd" : "esbuild";
-  const binPath = join(repoRoot, "node_modules", ".bin", command);
-  if (!existsSync(binPath)) {
-    throw new Error(`esbuild binary not found: ${binPath}. Run pnpm install first.`);
-  }
-  return binPath;
 }
 
 function writeTarGz(archivePath, rootDir, includeEntries) {
